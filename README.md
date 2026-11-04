@@ -159,7 +159,7 @@ IdemA est né comme l'outil quotidien d'un seul développeur et s'ouvre maintena
 
 - L'interface est en français.
 - Apple Silicon uniquement, et pas de notarisation Apple pour l'instant (voir le premier lancement).
-- Quelques intégrations supposent l'outillage de l'auteur : le réseau d'agents IdnmA, qui lance les agents de la configuration par défaut, et la section Bouillon de neurones.
+- Le lanceur par défaut suppose le réseau d'agents IdnmA de l'auteur. La section Bouillon de neurones est masquée tant que `config.toml` n'a pas de section `[ideation]`.
 - La galerie Artifacts est expérimentale : elle lit vos artifacts claude.ai à travers la session du navigateur intégré, par une interface que claude.ai ne documente pas et qui peut changer sans préavis.
 
 ## Sécurité
