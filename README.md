@@ -109,6 +109,8 @@ command = "codex"
 
 `harness` range l'entrée dans un sous-menu ; le logo de la session vient du nom de l'entrée (`claude`, `codex`, `gemini`, `grok`, `deepseek`, `glm`, `kimi`, `mistral`, `qwen`...) ou de `icon`. « Shell seul » est toujours disponible.
 
+La configuration par défaut lance les agents par [IdnmA](https://github.com/eRom/erom-IDNMA) (`command = "idnma run claude"`, etc.). Sans IdnmA installé, seul « Shell seul » fonctionne : installez-le (menu IdemA, « Installer le réseau IDNMA ») ou remplacez ces commandes par les vôtres, comme ci-dessus.
+
 ## Raccourcis essentiels
 
 | Raccourci | Action |
@@ -157,7 +159,8 @@ IdemA est né comme l'outil quotidien d'un seul développeur et s'ouvre maintena
 
 - L'interface est en français.
 - Apple Silicon uniquement, et pas de notarisation Apple pour l'instant (voir le premier lancement).
-- Quelques intégrations supposent l'outillage de l'auteur et restent optionnelles : le réseau d'agents IdnmA (menus IdemA et Aide), la section Bouillon de neurones et la galerie Artifacts, qui lit vos artifacts claude.ai à travers la session du navigateur intégré.
+- Quelques intégrations supposent l'outillage de l'auteur : le réseau d'agents IdnmA, qui lance les agents de la configuration par défaut, et la section Bouillon de neurones.
+- La galerie Artifacts est expérimentale : elle lit vos artifacts claude.ai à travers la session du navigateur intégré, par une interface que claude.ai ne documente pas et qui peut changer sans préavis.
 
 ## Sécurité
 
