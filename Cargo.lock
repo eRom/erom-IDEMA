@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "idema"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "block2 0.6.2",
@@ -2904,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "idema-term"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "idema-tmux",
@@ -2913,7 +2913,7 @@ dependencies = [
 
 [[package]]
 name = "idema-tmux"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "serde",

@@ -4,6 +4,8 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-04
+
 ### Ajouté
 
 - Menu Aide : « IdemA » et « IdnmA » ouvrent leur dépôt GitHub, « Signaler un problème » ouvre la création d'une issue.
