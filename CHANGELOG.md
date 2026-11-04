@@ -4,6 +4,13 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-04
+
+### Modifié
+
+- macOS 26 minimum, au lieu de macOS 14 : la version sur laquelle IdemA est construite et éprouvée.
+- Le README s'ouvre sur une illustration d'IdemA.
+
 ## [0.2.0] - 2026-11-04
 
 Première version publique.

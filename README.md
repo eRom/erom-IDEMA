@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/eRom/erom-IDEMA/releases/latest"><img alt="Dernière version" src="https://img.shields.io/github/v/release/eRom/erom-IDEMA?include_prereleases&label=version&color=4c8bf5"></a>
-  <img alt="macOS 14 et plus, Apple Silicon" src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20Silicon-111111?logo=apple">
+  <img alt="macOS 26 et plus, Apple Silicon" src="https://img.shields.io/badge/macOS-26%2B%20%C2%B7%20Apple%20Silicon-111111?logo=apple">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-GPUI-b7410e?logo=rust">
   <a href="LICENSE"><img alt="Licence MIT" src="https://img.shields.io/badge/licence-MIT-2ea44f"></a>
 </p>
@@ -47,7 +47,7 @@ Quand on n'écrit presque plus de code soi-même, la journée ressemble à ceci 
 
 | | |
 |---|---|
-| Mac | Apple Silicon, macOS 14 ou plus récent |
+| Mac | Apple Silicon, macOS 26 ou plus récent |
 | tmux | 3.8 ou plus récent : `brew install tmux` |
 | Police | une Nerd Font, par défaut Hack Nerd Font Mono : `brew install --cask font-hack-nerd-font` |
 | Agents | les CLI que vous voulez lancer : `claude`, `codex`, `gemini`, `grok`, `opencode`... |
@@ -73,7 +73,7 @@ Menu **IdemA > Installer la commande idema et l'action du Finder**. La commande 
 
 ```sh
 idema ~/dev/mon-projet   # ouvre le dossier comme projet
-idema --version          # IdemA 0.2.0
+idema --version          # IdemA <version>
 ```
 
 IdemA remet la commande à jour toute seule après une nouvelle version.
