@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hello-demo": {
+      "command": "/Users/me/.bun/bin/bun",
+      "args": ["/Users/me/dev/tmp/skills-sh-tests2/hello-mcp/server.ts"]
+    }
+  }
+}

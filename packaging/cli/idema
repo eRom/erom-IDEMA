@@ -1,0 +1,15 @@
+#!/bin/zsh -f
+# idema <dossier> : ouvre le dossier comme projet dans IdemA, lancée au besoin. Même chemin que ⌘O : un dossier hors
+# dépôt Git est initialisé (vide) ou demande confirmation (non vide).
+set -eu
+if [[ $# -ne 1 ]]; then
+  echo "usage: idema <folder>" >&2
+  exit 64
+fi
+if [[ ! -d "$1" ]]; then
+  echo "idema: not a folder: $1" >&2
+  exit 1
+fi
+# Chemin absolu, sans `cd` (zsh lirait `-` ou `+1` comme la pile des dossiers) ; IdemA le résout ensuite comme le disque.
+dir="${1:A}"
+exec /usr/bin/open -b com.erom.idema "$dir"

@@ -1,0 +1,10 @@
+[package]
+name = "idema-tmux"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true

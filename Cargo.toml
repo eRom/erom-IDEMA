@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["crates/idema", "crates/idema-tmux", "crates/idema-term"]
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+idema-tmux = { path = "crates/idema-tmux" }
+idema-term = { path = "crates/idema-term" }
+alacritty_terminal = "=0.26.0"
+# gpui-pre 0.3.9 : la version de GPUI qu'épingle gpui-component 0.7.3 (spec D2).
+# font-kit : sans lui, macOS ne dessine aucun glyphe. runtime_shaders : pas de Metal Toolchain à installer.
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "runtime_shaders"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+toml_edit = "0.25"
+# AppKit pour le badge du Dock et le son : les versions que gpui-pre-macos 0.3.9 tire déjà, sans les
+# features par défaut (qui compileraient tout AppKit et ajouteraient trois crates au lock).
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSFileManager", "NSURL", "NSError", "NSUUID", "NSKeyValueObserving", "NSDictionary", "NSData", "NSURLRequest", "NSURLResponse", "NSValue", "NSGeometry", "NSURLSession", "NSOperation", "NSDate"] }
+# renamex_np (renommage sans écrasement) pour les opérations de fichiers du volet Fichiers ; déjà au lock.
+libc = "0.2"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSResponder", "NSSound", "NSView", "NSWindow", "NSImage", "NSBitmapImageRep", "NSImageRep", "NSOpenPanel", "NSSavePanel", "NSTextField", "NSEvent", "NSPasteboard", "NSWorkspace", "NSAlert", "NSGraphics", "NSGraphicsContext", "NSButton", "NSControl", "block2"] }
+# Éditeur du volet Fichiers (P2) : gpui-component épingle gpui-pre 0.3.9 (spec P2 §3.1).
+# Grammaires tree-sitter : les fichiers de configuration qu'on édite (json est de base), plus les langages de code
+# qu'on relit (spec P2 §4.5).
+gpui-component = { version = "=0.7.3", features = ["tree-sitter-markdown", "tree-sitter-yaml", "tree-sitter-toml", "tree-sitter-html", "tree-sitter-bash", "tree-sitter-rust", "tree-sitter-typescript", "tree-sitter-tsx", "tree-sitter-javascript", "tree-sitter-swift", "tree-sitter-python", "tree-sitter-css"] }
+# Grammaires que le kit livre sans coloration (Swift) ou sans balises (TSX, JSX) : IdemA les réenregistre avec leurs
+# requêtes (files::grammars). Épinglées aux versions que le kit résout, comme lui-même l'est.
+tree-sitter = "=0.26.13"
+tree-sitter-swift = "=0.7.4"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-javascript = "=0.23.1"
+# Icônes SVG de gpui-component (chemins `icons/<nom>.svg`).
+gpui-kit-assets = "=0.7.3"
+# Surveillance du disque ; déjà une dépendance de gpui-component, donc aucun crate de plus.
+notify = "8.2"
+# Recherche dans les fichiers du projet (P2 jalon 3) ; déjà au lock par gpui-base, aucun crate de plus.
+regex = "1.13"
+# Adresses du navigateur (P4) : analyse et encodage ; déjà au lock, aucun crate de plus.
+url = "2"
+# Dates RFC 3339 de la galerie Artifacts : déjà au lock (0.4.45), sans les features par défaut.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# La page web du volet Browser (P4) : objc2-web-kit entre au lock avec bitflags (déjà là).
+# WKHTTPCookieStore : seulement pour relire, au démarrage, les domaines du profil dans le journal (jamais une valeur).
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "bitflags", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKNavigation", "WKNavigationDelegate", "WKNavigationAction", "WKNavigationResponse", "WKUIDelegate", "WKFrameInfo", "WKWindowFeatures", "WKPreferences", "WKSnapshotConfiguration", "WKFindConfiguration", "WKFindResult", "WKDownload", "WKDownloadDelegate", "WKWebpagePreferences", "WKHTTPCookieStore", "WKContentWorld", "WKOpenPanelParameters", "WKUserScript", "WKUserContentController"] }
+block2 = "0.6"
+raw-window-handle = "0.6"

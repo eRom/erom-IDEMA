@@ -1,0 +1,23 @@
+[
+  {
+    "name": "review-animations",
+    "status": "installed",
+    "source": "emilkowalski/skills",
+    "ref": null,
+    "hash": "b1aca2c16876b8f00e2a1eb161714e63ec41099269d5f95c2f307230749b9dcd",
+    "path": "/private/var/folders/tn/47tsq9ys0bq8cn8mt0j651ww0000gn/T/tmp.2BUrQscGJ5/ok/.claude/skills/review-animations",
+    "scope": "project",
+    "agents": [
+      "Claude Code",
+      "Grok Build",
+      "Codex"
+    ],
+    "mode": "copy",
+    "security": {
+      "gen": "safe",
+      "socket": "0 alerts",
+      "snyk": "low",
+      "details": "https://skills.sh/emilkowalski/skills"
+    }
+  }
+]

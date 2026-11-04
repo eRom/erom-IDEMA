@@ -1,0 +1,10 @@
+[package]
+name = "idema-term"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+idema-tmux.workspace = true
+alacritty_terminal.workspace = true
+libc = "0.2"

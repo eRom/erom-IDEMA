@@ -1,0 +1,4 @@
+data: {"candidates": [{"content": {"parts": [{"text": "`docs: add README`"}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 13,"candidatesTokenCount": 6,"totalTokenCount": 19,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 13}],"serviceTier": "standard"},"modelVersion": "gemini-3.5-flash-lite","responseId": "0b3VauOnItPpnsEP_YOjuAg"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "","thoughtSignature": "EmAKXgFpFH0TfOnPchcEg62REW6BsyuGFPRWwmI4Xpl3JX8C/guisNQ7Xvend0tqWfu6WnPwpK/0+DhGVWd/oYR8RDL0msutnpEiL/ntu5YSbsRrMMstHTqMHoy9IazM4fM="}],"role": "model"},"finishReason": "STOP","index": 0}],"usageMetadata": {"promptTokenCount": 13,"candidatesTokenCount": 6,"totalTokenCount": 19,"promptTokensDetails": [{"modality": "TEXT","tokenCount": 13}],"serviceTier": "standard"},"modelVersion": "gemini-3.5-flash-lite","responseId": "0b3VauOnItPpnsEP_YOjuAg"}
+

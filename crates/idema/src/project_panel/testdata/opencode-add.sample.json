@@ -1,0 +1,16 @@
+{
+  "mcp": {
+    "servers": {
+      "hello": {
+        "type": "local",
+        "command": [
+          "/Users/me/.bun/bin/bun",
+          "/Users/me/dev/tmp/skills-sh-tests2/hello-mcp/server.ts"
+        ],
+        "environment": {
+          "FOO": "bar"
+        }
+      }
+    }
+  }
+}

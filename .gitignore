@@ -1,0 +1,17 @@
+# Build
+/target
+
+# Machine locale
+.DS_Store
+.codegraph/
+.worktrees/
+.superpowers/
+
+# Espace de travail de l'auteur, jamais publié : notes, mémoire de session, specs, maquettes, portes d'acceptation
+/.claude/
+/_memory_/
+/CLAUDE.md
+/docs/
+/maquette/
+/tests/
+/scripts/probe-gemini.sh

@@ -1,0 +1,65 @@
+[
+  {
+    "name": "hello-demo",
+    "path": "/private/tmp/scratchpad/skills-probe/.agents/skills/hello-demo",
+    "scope": "project",
+    "agents": [
+      "Antigravity",
+      "Antigravity CLI",
+      "Claude Code",
+      "Cline",
+      "Codex",
+      "Cursor",
+      "Droid",
+      "Gemini CLI",
+      "GitHub Copilot",
+      "Grok Build",
+      "Kilo Code",
+      "Kimi Code CLI",
+      "OpenCode",
+      "Pi",
+      "Warp",
+      "Zed"
+    ],
+    "source": "/private/tmp/scratchpad/local-skills",
+    "sourceUrl": null,
+    "sourceType": "local"
+  },
+  {
+    "name": "review-animations",
+    "path": "/private/tmp/scratchpad/skills-probe/.agents/skills/review-animations",
+    "scope": "project",
+    "agents": [
+      "Antigravity",
+      "Antigravity CLI",
+      "Claude Code",
+      "Cline",
+      "Codex",
+      "Cursor",
+      "Droid",
+      "Gemini CLI",
+      "GitHub Copilot",
+      "Grok Build",
+      "Kilo Code",
+      "Kimi Code CLI",
+      "OpenCode",
+      "Pi",
+      "Warp",
+      "Zed"
+    ],
+    "source": "emilkowalski/skills",
+    "sourceUrl": null,
+    "sourceType": "github"
+  },
+  {
+    "name": "manual-one",
+    "path": "/private/tmp/scratchpad/skills-probe/.claude/skills/manual-one",
+    "scope": "project",
+    "agents": [
+      "Claude Code"
+    ],
+    "source": null,
+    "sourceUrl": null,
+    "sourceType": null
+  }
+]

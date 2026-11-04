@@ -1,0 +1,4 @@
+# MCP projet pour Codex : chargé seulement si ce dossier est « trusted ».
+[mcp_servers.hello-demo]
+command = "/Users/me/.bun/bin/bun"
+args = ["/Users/me/dev/tmp/skills-sh-tests2/hello-mcp/server.ts"]

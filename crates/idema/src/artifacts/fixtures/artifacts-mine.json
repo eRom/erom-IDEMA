@@ -1,0 +1,62 @@
+{
+  "artifacts": [
+    {
+      "id": "art_0001",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Rapport trimestriel",
+      "open_url": "https://claude.ai/artifacts/art_0001",
+      "type_title": "Docs",
+      "type_slug": "docs-fixture-slug",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0001_thumb.img?__frame_t=light",
+      "thumbnail_dark_url": "https://fixture.frame.claudeusercontent.com/0001_dark_thumb.img?__frame_t=dark",
+      "last_viewed_at": "2026-10-25T10:24:31Z",
+      "future_field": { "nested": true }
+    },
+    {
+      "id": "art_0002",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Présentation de lancement",
+      "open_url": "https://claude.ai/artifacts/art_0002",
+      "type_title": "Slides",
+      "type_slug": "slides-fixture-slug",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0002_thumb.img?__frame_t=light",
+      "thumbnail_dark_url": "https://fixture.frame.claudeusercontent.com/0002_dark_thumb.img?__frame_t=dark",
+      "last_viewed_at": "2026-10-24T08:00:00.394313Z"
+    },
+    {
+      "id": "art_0003",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Calculateur de prêt",
+      "open_url": "https://claude.ai/artifacts/art_0003",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0003_thumb.img?__frame_t=light",
+      "thumbnail_dark_url": "https://fixture.frame.claudeusercontent.com/0003_dark_thumb.img?__frame_t=dark",
+      "last_viewed_at": "2026-10-22T09:15:00Z"
+    },
+    {
+      "id": "art_0004",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Jeu de mémoire",
+      "open_url": "https://claude.ai/artifacts/art_0004",
+      "type_title": null,
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0004_thumb.img?__frame_t=light",
+      "last_viewed_at": null
+    },
+    {
+      "id": "art_0005",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Maquette de la page d'accueil",
+      "open_url": "https://claude.ai/design/p/art_0005",
+      "type_title": "Design",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0005_thumb.img?__frame_t=light",
+      "last_viewed_at": "2026-10-20T12:00:00Z"
+    }
+  ],
+  "hosted_total": 5,
+  "empty_total": 0,
+  "sort": "last_viewed"
+}
