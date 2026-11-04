@@ -3,8 +3,9 @@
 //! liaisons de touches sont globales (contexte `None`) pour que la barre de menus affiche leurs équivalents ; les
 //! gestionnaires globaux évitent qu'AppKit grise les entrées du menu « Idema » (`validateMenuItem:`).
 //!
-//! AppKit grise une entrée dont l'action n'a pas de gestionnaire : les lignes de version et « Signaler un problème »
-//! n'en ont pas, et « Installer le réseau IDNMA » n'en a un (posé par `Workspace`) que si l'installation est permise.
+//! AppKit grise une entrée dont l'action n'a pas de gestionnaire : « Installer le réseau IDNMA » n'en a un (posé par
+//! `Workspace`) que si l'installation est permise. « Signaler un problème » ouvre la création d'une issue d'IdemA, et
+//! les lignes de version le dépôt GitHub de leur produit, dans le navigateur par défaut.
 
 use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, actions};
 
@@ -12,10 +13,13 @@ use crate::APP_NAME;
 use crate::idnma::IdnmaStatus;
 use crate::workspace::{InstallIntegrations, OpenConfig};
 
+const IDEMA_REPO_URL: &str = "https://github.com/eRom/erom-IDEMA";
+const IDNMA_REPO_URL: &str = "https://github.com/eRom/erom-IDNMA";
+const NEW_ISSUE_URL: &str = "https://github.com/eRom/erom-IDEMA/issues/new";
+
 actions!(idema, [Quit, Hide, HideOthers, ShowAll, InstallIdnma]);
 actions!(edit, [Cut, Copy, Paste, SelectAll]);
-// Sans gestionnaire, à dessein : ces lignes restent grisées.
-actions!(help, [ReportIssue, VersionInfo]);
+actions!(help, [ReportIssue, OpenIdemaRepo, OpenIdnmaRepo]);
 
 /// « IdemA 0.2.0 » : la version du `Cargo.toml` de l'espace de travail, seule source. `scripts/bundle-app.sh` la
 /// recopie dans l'`Info.plist` du bundle ; `idema --version` (binaire et commande posée) dit la même ligne.
@@ -40,6 +44,9 @@ pub fn install(cx: &mut App) {
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    cx.on_action(|_: &ReportIssue, cx| cx.open_url(NEW_ISSUE_URL));
+    cx.on_action(|_: &OpenIdemaRepo, cx| cx.open_url(IDEMA_REPO_URL));
+    cx.on_action(|_: &OpenIdnmaRepo, cx| cx.open_url(IDNMA_REPO_URL));
     rebuild(cx);
 }
 
@@ -71,8 +78,8 @@ pub fn rebuild(cx: &mut App) {
         Menu::new("Aide").items([
             MenuItem::action("Signaler un problème", ReportIssue),
             MenuItem::separator(),
-            MenuItem::action(version_line(), VersionInfo),
-            MenuItem::action(idnma_label, VersionInfo),
+            MenuItem::action(version_line(), OpenIdemaRepo),
+            MenuItem::action(idnma_label, OpenIdnmaRepo),
         ]),
     ]);
 }
