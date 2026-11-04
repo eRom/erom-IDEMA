@@ -104,10 +104,12 @@ pub struct SessionPlan {
     pub panes: Vec<PanePlan>,
 }
 
-/// Une session sauvegardée peut être restaurée, sauf un bouillon quand la section `[ideation]` est absente de la
-/// config : la fonction est alors masquée, ses sessions ne reviennent pas.
-pub fn ideation_restorable(saved: &SavedSession, enabled: bool) -> bool {
-    !saved.ideation || enabled
+/// Une session sauvegardée peut être restaurée, sauf un bouillon quand la config a été lue sans erreur et n'a pas de
+/// section `[ideation]` : la fonction est alors masquée, ses sessions ne reviennent pas. Une config refusée au
+/// démarrage retombe sur la config par défaut (sans section) : ce n'est pas un choix de masquer la fonction, les
+/// bouillons reviennent avec leurs commandes sauvées.
+pub fn ideation_restorable(saved: &SavedSession, enabled: bool, config_valid: bool) -> bool {
+    !saved.ideation || enabled || !config_valid
 }
 
 /// Le plan d'une session sauvegardée. Garantit ce que la création de tmux ne vérifie pas : un pane dont le dossier a
@@ -296,9 +298,17 @@ mod tests {
         let mut ideation = session(vec![pane("/p")]);
         ideation.ideation = true;
         let project = session(vec![pane("/p")]);
-        assert!(!ideation_restorable(&ideation, false));
-        assert!(ideation_restorable(&ideation, true));
-        assert!(ideation_restorable(&project, false));
+        // Config lue sans erreur et sans section : le bouillon est écarté.
+        assert!(!ideation_restorable(&ideation, false, true));
+        assert!(ideation_restorable(&ideation, true, true));
+        assert!(ideation_restorable(&project, false, true));
+    }
+
+    #[test]
+    fn an_ideation_session_is_restored_when_the_config_was_rejected() {
+        let mut ideation = session(vec![pane("/p")]);
+        ideation.ideation = true;
+        assert!(ideation_restorable(&ideation, false, false));
     }
 
     #[test]

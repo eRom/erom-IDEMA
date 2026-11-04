@@ -125,6 +125,12 @@ pub fn collapsed_project_dot(
     states.into_iter().max()
 }
 
+/// Une session compte pour le badge du Dock et le son d'attente, sauf un bouillon quand la section `[ideation]` est
+/// absente : il n'est alors plus visible.
+pub fn is_alerting_session(is_ideation: bool, ideation_enabled: bool) -> bool {
+    !is_ideation || ideation_enabled
+}
+
 /// Badge du Dock : le nombre de sessions en attente ou en erreur (spec §5.4).
 pub fn badge_count(states: impl IntoIterator<Item = ActivityState>) -> usize {
     states
@@ -278,6 +284,30 @@ mod tests {
         let sessions = vec![ideation_session("b1", 1), session("p1", "/p", 2)];
         let order = navigation_order(&projects, |_| true, false, &sessions);
         assert_eq!(order, ["p1"]);
+    }
+
+    #[test]
+    fn a_hidden_ideation_session_does_not_alert() {
+        assert!(is_alerting_session(false, false));
+        assert!(is_alerting_session(true, true));
+        assert!(!is_alerting_session(true, false));
+        let sessions = [
+            session("p1", "/p", 1),
+            SessionSummary {
+                state: ActivityState::Waiting,
+                ..ideation_session("b1", 2)
+            },
+        ];
+        let count = |enabled| {
+            badge_count(
+                sessions
+                    .iter()
+                    .filter(|s| is_alerting_session(s.ideation, enabled))
+                    .map(|s| s.state),
+            )
+        };
+        assert_eq!(count(true), 1);
+        assert_eq!(count(false), 0);
     }
 
     #[test]

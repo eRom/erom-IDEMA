@@ -101,8 +101,8 @@ use crate::sidebar::{
     AgentMark, SIDEBAR_WIDTH, TITLE_BAND, agent_marks, render_sidebar, state_dot,
 };
 use crate::sidebar_model::{
-    SessionSummary, badge_count, cycle, default_session_name, navigation_order,
-    neighbor_after_close, nth_session, session_order, sort_sessions,
+    SessionSummary, badge_count, cycle, default_session_name, is_alerting_session,
+    navigation_order, neighbor_after_close, nth_session, session_order, sort_sessions,
 };
 use crate::state::{State, StateNotice, StateStore, UiState, rfc3339};
 use crate::terminal_element::{MARGIN_SIDES, TerminalFont, cell_metrics, content_bounds};
@@ -1132,6 +1132,7 @@ impl Workspace {
                 self.refresh_missing(cx);
                 self.server = Some(Arc::clone(&server));
                 self.entries = session_entries(&sessions, &panes);
+                self.drop_hidden_selection();
                 self.bootstrapped = true;
                 self.start_servers(Arc::clone(&server), window, cx);
                 self.start_snapshot(Arc::clone(&server), window, cx);
@@ -1411,8 +1412,13 @@ impl Workspace {
         let mut plans = Vec::new();
         let mut skipped = Vec::new();
         for session in &saved {
-            // Section `[ideation]` absente : le bouillon reste dans l'instantané mais ne revient pas, et sans notice.
-            if !ideation_restorable(session, self.ideation().is_some()) {
+            // Config lue sans erreur et sans section `[ideation]` : le bouillon reste dans l'instantané mais ne revient pas,
+            // et sans notice. Une config refusée ne masque rien : il revient avec ses commandes.
+            if !ideation_restorable(
+                session,
+                self.ideation().is_some(),
+                self.config_error.is_none(),
+            ) {
                 hud::log_event(&format!(
                     "ideation restore skipped name={} reason=disabled",
                     session.name
@@ -1527,6 +1533,7 @@ impl Workspace {
                 }
                 self.entries
                     .sort_by(|a, b| session_order(&a.summary, &b.summary));
+                self.drop_hidden_selection();
                 self.sync_branch(cx);
                 self.attach_sessions(launches, window, cx);
             }
@@ -2009,6 +2016,7 @@ impl Workspace {
                     cx.set_global(TerminalFont::from_config(&config));
                 }
                 self.font_zoom = zoom_after_reload(self.font_zoom, effects);
+                let ideation_was_on = self.ideation().is_some();
                 self.config = config;
                 self.config_error = None;
                 if effects.theme || effects.terminal_font {
@@ -2019,6 +2027,9 @@ impl Workspace {
                     );
                 }
                 self.leave_hidden_ideation(window, cx);
+                if ideation_was_on != self.ideation().is_some() {
+                    self.refresh_badge();
+                }
                 hud::log_event(&format!(
                     "config reloaded theme={} terminal_font={} ideation={}",
                     effects.theme,
@@ -2042,25 +2053,51 @@ impl Workspace {
     /// La section `[ideation]` vient de disparaître alors qu'un bouillon est sélectionné : la première session de l'ordre
     /// de navigation prend la main (comme à la fermeture du dernier bouillon), sinon l'écran vide revient.
     fn leave_hidden_ideation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ideation().is_some() || !self.selected_is_ideation() {
+        let Some(next) = self.fallback_for_hidden_selection() else {
             return;
-        }
-        let next = {
-            let summaries = self.summaries();
-            self.navigation(&summaries)
-                .first()
-                .map(|name| (*name).to_owned())
         };
+        // Comme `remove_entry` : la galerie d'Artefacts reste au centre, la voisine passe derrière elle.
+        let keep_gallery = self.artifacts_shown;
         match next {
-            Some(name) => self.select(&name, window, cx),
+            Some(name) => match neighbor_handoff(keep_gallery) {
+                NeighborHandoff::Select => self.select(&name, window, cx),
+                NeighborHandoff::BehindGallery => self.select_behind_gallery(&name, window, cx),
+            },
             None => {
                 self.menu = None;
                 self.state_mut().ui.selected_session = None;
                 self.save();
-                window.focus(&self.focus_handle, cx);
+                if !keep_gallery {
+                    window.focus(&self.focus_handle, cx);
+                }
                 self.sync_branch(cx);
                 self.sync_right_panel(window, cx);
             }
+        }
+    }
+
+    /// Quand la section `[ideation]` est absente et qu'un bouillon est sélectionné, ce qui doit prendre sa place :
+    /// `Some(Some(nom))` la première session de l'ordre de navigation (comme à la fermeture du dernier bouillon),
+    /// `Some(None)` l'écran vide, `None` rien à corriger.
+    fn fallback_for_hidden_selection(&self) -> Option<Option<String>> {
+        if self.ideation().is_some() || !self.selected_is_ideation() {
+            return None;
+        }
+        let summaries = self.summaries();
+        Some(
+            self.navigation(&summaries)
+                .first()
+                .map(|name| (*name).to_owned()),
+        )
+    }
+
+    /// Au démarrage, `state.json` peut encore désigner un bouillon alors que la section est absente : la sélection
+    /// est corrigée dans `state.json` seulement, avant l'attache des vues (qui affichera la session choisie).
+    fn drop_hidden_selection(&mut self) {
+        if let Some(next) = self.fallback_for_hidden_selection() {
+            hud::log_event("ideation selection dropped reason=disabled");
+            self.state_mut().ui.selected_session = next;
+            self.save();
         }
     }
 
@@ -3797,8 +3834,12 @@ impl Workspace {
 
     /// Le badge du Dock compte les sessions qui attendent ou sont en erreur ; il disparaît à zéro.
     fn refresh_badge(&self) {
+        let enabled = self.ideation().is_some();
         dock::set_badge(badge_count(
-            self.entries.iter().map(|entry| entry.summary.state),
+            self.entries
+                .iter()
+                .filter(|entry| is_alerting_session(entry.summary.ideation, enabled))
+                .map(|entry| entry.summary.state),
         ));
     }
 
@@ -3810,6 +3851,7 @@ impl Workspace {
         current: ActivityState,
         cx: &mut Context<Self>,
     ) {
+        let ideation_enabled = self.ideation().is_some();
         let Some(entry) = self
             .entries
             .iter_mut()
@@ -3819,7 +3861,9 @@ impl Workspace {
         };
         entry.summary.state = current;
         let name = entry.summary.name.clone();
-        if should_chime(previous, current, view.read(cx).is_seen()) {
+        if is_alerting_session(entry.summary.ideation, ideation_enabled)
+            && should_chime(previous, current, view.read(cx).is_seen())
+        {
             self.chime(&format!("session={name}"));
         }
         self.refresh_badge();
@@ -3853,6 +3897,9 @@ impl Workspace {
         else {
             return;
         };
+        if !is_alerting_session(entry.summary.ideation, self.ideation().is_some()) {
+            return;
+        }
         let name = entry.summary.name.clone();
         self.chime(&format!("session={name} pane=%{}", pane.0));
         cx.notify();
