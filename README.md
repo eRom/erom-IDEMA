@@ -1,8 +1,7 @@
-<p align="center">
-  <img src="packaging/icon.svg" width="128" height="128" alt="Icône d'IdemA">
-</p>
 
-<h1 align="center">IdemA</h1>
+<h1>IdemA</h1>
+
+![erom-idema](idema.png)
 
 <p align="center">
   <strong>L'environnement de dev où les agents de code sont la vue principale.</strong><br>
