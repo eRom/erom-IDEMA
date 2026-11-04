@@ -101,8 +101,9 @@ use crate::sidebar::{
     AgentMark, SIDEBAR_WIDTH, TITLE_BAND, agent_marks, render_sidebar, state_dot,
 };
 use crate::sidebar_model::{
-    SessionSummary, badge_count, cycle, default_session_name, is_alerting_session,
-    navigation_order, neighbor_after_close, nth_session, session_order, sort_sessions,
+    SessionSummary, cycle, default_session_name, dock_badge_count, ideation_shown,
+    is_alerting_session, navigation_order, neighbor_after_close, nth_session, session_order,
+    sort_sessions,
 };
 use crate::state::{State, StateNotice, StateStore, UiState, rfc3339};
 use crate::terminal_element::{MARGIN_SIDES, TerminalFont, cell_metrics, content_bounds};
@@ -1412,8 +1413,10 @@ impl Workspace {
         let mut plans = Vec::new();
         let mut skipped = Vec::new();
         for session in &saved {
-            // Config lue sans erreur et sans section `[ideation]` : le bouillon reste dans l'instantané mais ne revient pas,
-            // et sans notice. Une config refusée ne masque rien : il revient avec ses commandes.
+            // Config lue sans erreur et sans section `[ideation]` : le bouillon n'est pas restauré, sans notice. Il quitte
+            // ensuite l'instantané à la prochaine capture (après `snapshot.resume()`, la capture ne le voit plus, et il
+            // disparaît de `snapshot.json` à la fin de la retenue de 10 s) ; sa conversation reste reprenable à la main.
+            // Une config refusée ne masque rien : il revient avec ses commandes.
             if !ideation_restorable(
                 session,
                 self.ideation().is_some(),
@@ -3834,12 +3837,9 @@ impl Workspace {
 
     /// Le badge du Dock compte les sessions qui attendent ou sont en erreur ; il disparaît à zéro.
     fn refresh_badge(&self) {
-        let enabled = self.ideation().is_some();
-        dock::set_badge(badge_count(
-            self.entries
-                .iter()
-                .filter(|entry| is_alerting_session(entry.summary.ideation, enabled))
-                .map(|entry| entry.summary.state),
+        dock::set_badge(dock_badge_count(
+            self.entries.iter().map(|entry| &entry.summary),
+            self.ideation().is_some(),
         ));
     }
 
@@ -4025,7 +4025,7 @@ impl Workspace {
         navigation_order(
             &projects,
             |path| state.is_expanded(path),
-            self.ideation().is_some() && !state.ui.ideation_collapsed,
+            ideation_shown(self.ideation().is_some(), state.ui.ideation_collapsed),
             summaries,
         )
     }
@@ -4039,10 +4039,15 @@ impl Workspace {
             .into_iter()
             .map(|project| project.path.clone())
             .collect();
-        navigation_order(&projects, |_| true, self.ideation().is_some(), summaries)
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
+        navigation_order(
+            &projects,
+            |_| true,
+            ideation_shown(self.ideation().is_some(), false),
+            summaries,
+        )
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
     }
 
     fn on_session_event(

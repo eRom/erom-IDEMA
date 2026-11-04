@@ -139,6 +139,25 @@ pub fn badge_count(states: impl IntoIterator<Item = ActivityState>) -> usize {
         .count()
 }
 
+/// Le badge du Dock sur les sessions données : un bouillon masqué (section `[ideation]` absente) n'y compte pas.
+pub fn dock_badge_count<'a>(
+    sessions: impl IntoIterator<Item = &'a SessionSummary>,
+    ideation_enabled: bool,
+) -> usize {
+    badge_count(
+        sessions
+            .into_iter()
+            .filter(|session| is_alerting_session(session.ideation, ideation_enabled))
+            .map(|session| session.state),
+    )
+}
+
+/// Les bouillons figurent dans l'ordre de navigation quand la section existe (`[ideation]` présente) et qu'elle
+/// est dépliée.
+pub fn ideation_shown(enabled: bool, collapsed: bool) -> bool {
+    enabled && !collapsed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,11 +298,21 @@ mod tests {
     }
 
     #[test]
-    fn disabled_ideation_sessions_are_skipped_in_navigation() {
+    fn ideation_sessions_are_in_navigation_only_when_enabled_and_expanded() {
         let projects = vec![PathBuf::from("/p")];
         let sessions = vec![ideation_session("b1", 1), session("p1", "/p", 2)];
-        let order = navigation_order(&projects, |_| true, false, &sessions);
-        assert_eq!(order, ["p1"]);
+        let order_for = |enabled, collapsed| {
+            navigation_order(
+                &projects,
+                |_| true,
+                ideation_shown(enabled, collapsed),
+                &sessions,
+            )
+        };
+        assert_eq!(order_for(true, false), ["b1", "p1"]);
+        assert_eq!(order_for(true, true), ["p1"]);
+        assert_eq!(order_for(false, false), ["p1"]);
+        assert_eq!(order_for(false, true), ["p1"]);
     }
 
     #[test]
@@ -298,16 +327,8 @@ mod tests {
                 ..ideation_session("b1", 2)
             },
         ];
-        let count = |enabled| {
-            badge_count(
-                sessions
-                    .iter()
-                    .filter(|s| is_alerting_session(s.ideation, enabled))
-                    .map(|s| s.state),
-            )
-        };
-        assert_eq!(count(true), 1);
-        assert_eq!(count(false), 0);
+        assert_eq!(dock_badge_count(&sessions, true), 1);
+        assert_eq!(dock_badge_count(&sessions, false), 0);
     }
 
     #[test]

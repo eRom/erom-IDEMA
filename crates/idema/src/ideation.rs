@@ -39,9 +39,10 @@ pub fn next_remote_name(prefix: &str, taken: &[&str]) -> String {
 }
 
 /// Une valeur passée telle quelle au shell, ou entre apostrophes (chacune doublée en `'\''`) si elle contient autre
-/// chose que `[A-Za-z0-9._,:/=+@%-]`.
+/// chose que `[A-Za-z0-9._,:/=+@%-]` ou si elle commence par `=` (zsh l'élargit en chemin de commande).
 fn shell_quote(value: &str) -> String {
     let plain = !value.is_empty()
+        && !value.starts_with('=')
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._,:/=+@%-".contains(c));
@@ -174,6 +175,7 @@ mod tests {
         };
         assert!(command_with("claude-opus-5-5[1m]").contains("--model 'claude-opus-5-5[1m]' "));
         assert!(command_with("a b").contains("--model 'a b' "));
+        assert!(command_with("=ls").contains("--model '=ls' "));
         assert!(command_with("o'neil").contains("--model 'o'\\''neil' "));
         assert!(command_with("opus-5.5:x/y=1+2@3%4,5").contains("--model opus-5.5:x/y=1+2@3%4,5 "));
     }
