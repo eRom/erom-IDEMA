@@ -104,6 +104,12 @@ pub struct SessionPlan {
     pub panes: Vec<PanePlan>,
 }
 
+/// Une session sauvegardée peut être restaurée, sauf un bouillon quand la section `[ideation]` est absente de la
+/// config : la fonction est alors masquée, ses sessions ne reviennent pas.
+pub fn ideation_restorable(saved: &SavedSession, enabled: bool) -> bool {
+    !saved.ideation || enabled
+}
+
 /// Le plan d'une session sauvegardée. Garantit ce que la création de tmux ne vérifie pas : un pane dont le dossier a
 /// disparu retombe sur le projet (tmux ouvrirait `$HOME` sans rien dire), et la session a exactement un pane visible
 /// et actif (une session toute cachée est refusée à la création).
@@ -275,13 +281,24 @@ mod tests {
 
     #[test]
     fn a_missing_ideation_folder_skips_the_session_too() {
-        let mut saved = session(vec![pane(crate::ideation::IDEATION_DIR)]);
+        const IDEATION_TEST_DIR: &str = "/Users/Shared/erom-ideation";
+        let mut saved = session(vec![pane(IDEATION_TEST_DIR)]);
         saved.ideation = true;
-        saved.project = crate::ideation::IDEATION_DIR.into();
+        saved.project = IDEATION_TEST_DIR.into();
         assert_eq!(
             plan_session(&saved, |_| false).unwrap_err(),
             SkipReason::FolderGone
         );
+    }
+
+    #[test]
+    fn a_disabled_ideation_session_is_not_restorable() {
+        let mut ideation = session(vec![pane("/p")]);
+        ideation.ideation = true;
+        let project = session(vec![pane("/p")]);
+        assert!(!ideation_restorable(&ideation, false));
+        assert!(ideation_restorable(&ideation, true));
+        assert!(ideation_restorable(&project, false));
     }
 
     #[test]
@@ -389,7 +406,13 @@ mod tests {
 
     #[test]
     fn an_ideation_pane_resumes_with_the_ideation_command() {
-        let command = crate::ideation::ideation_command("erom-ideation-3");
+        let config = crate::config::IdeationConfig {
+            dir: "/Users/Shared/erom-ideation".into(),
+            model: Some("fable".into()),
+            effort: Some("max".into()),
+            label: "Fable".into(),
+        };
+        let command = crate::ideation::ideation_command(&config, "erom-ideation-3");
         let mut ideation = pane("/p");
         ideation.command = Some(command.clone());
         ideation.conversation = Some(UUID.into());

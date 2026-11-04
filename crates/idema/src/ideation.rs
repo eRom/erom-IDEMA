@@ -1,31 +1,70 @@
 //! Les règles pures de la section « Bouillon de neurones » : noms Remote Control, commande, barre d'outils.
 
-/// Le dossier fixe où tournent les bouillons.
-pub const IDEATION_DIR: &str = "/Users/Shared/erom-ideation";
-/// Libellé par défaut d'un bouillon, aussi la valeur de `@idema_agent`.
-pub const IDEATION_LABEL: &str = "Fable";
+use std::path::Path;
+
+use crate::config::IdeationConfig;
+
 /// Titre de la section dans la barre.
 pub const SECTION_TITLE: &str = "Bouillon de neurones";
 
-const REMOTE_PREFIX: &str = "erom-ideation-";
+/// Le préfixe des noms Remote Control, tiré du nom du dossier : minuscules, tout caractère hors `[a-z0-9]` devient
+/// `-`, tirets répétés fusionnés, tirets de bord retirés, suivi d'un tiret. Un nom vide donne `ideation-`.
+pub fn remote_prefix(dir: &Path) -> String {
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let slug = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        "ideation-".to_owned()
+    } else {
+        format!("{slug}-")
+    }
+}
 
-/// Le plus petit `erom-ideation-N` (N >= 2) absent de `taken`. Les noms qui n'ont pas cette forme sont ignorés.
-pub fn next_remote_name(taken: &[&str]) -> String {
+/// Le plus petit `<prefix>N` (N >= 2) absent de `taken`. Les noms qui n'ont pas cette forme sont ignorés.
+pub fn next_remote_name(prefix: &str, taken: &[&str]) -> String {
     let used: Vec<u32> = taken
         .iter()
-        .filter_map(|name| name.strip_prefix(REMOTE_PREFIX)?.parse().ok())
+        .filter_map(|name| name.strip_prefix(prefix)?.parse().ok())
         .collect();
     let free = (2u32..)
         .find(|n| !used.contains(n))
         .expect("an unbounded range always has a gap");
-    format!("{REMOTE_PREFIX}{free}")
+    format!("{prefix}{free}")
+}
+
+/// Une valeur passée telle quelle au shell, ou entre apostrophes (chacune doublée en `'\''`) si elle contient autre
+/// chose que `[A-Za-z0-9._,:/=+@%-]`.
+fn shell_quote(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._,:/=+@%-".contains(c));
+    if plain {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 /// La commande lancée dans le pane d'un bouillon ; `remote` est à la fois le nom de session et le nom Remote Control.
-pub fn ideation_command(remote: &str) -> String {
-    format!(
-        "\"$HOME/.local/bin/claude\" --setting-sources project,local --model fable --effort max --name {remote} --remote-control {remote}"
-    )
+/// Il est construit par IdemA (`[a-z0-9-]`) : jamais cité. `--model` et `--effort` n'apparaissent que s'ils sont
+/// configurés.
+pub fn ideation_command(config: &IdeationConfig, remote: &str) -> String {
+    let mut command = String::from("\"$HOME/.local/bin/claude\" --setting-sources project,local");
+    if let Some(model) = &config.model {
+        command.push_str(&format!(" --model {}", shell_quote(model)));
+    }
+    if let Some(effort) = &config.effort {
+        command.push_str(&format!(" --effort {}", shell_quote(effort)));
+    }
+    command.push_str(&format!(" --name {remote} --remote-control {remote}"));
+    command
 }
 
 /// Les boutons de la barre d'outils d'une session.
@@ -69,30 +108,84 @@ pub fn toolbar_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn romain() -> IdeationConfig {
+        IdeationConfig {
+            dir: "/Users/Shared/erom-ideation".into(),
+            model: Some("fable".into()),
+            effort: Some("max".into()),
+            label: "Fable".into(),
+        }
+    }
 
     #[test]
     fn next_remote_name_starts_at_two() {
-        assert_eq!(next_remote_name(&[]), "erom-ideation-2");
+        assert_eq!(next_remote_name("erom-ideation-", &[]), "erom-ideation-2");
     }
 
     #[test]
     fn next_remote_name_fills_the_smallest_gap() {
         assert_eq!(
-            next_remote_name(&["erom-ideation-2", "erom-ideation-4"]),
+            next_remote_name("erom-ideation-", &["erom-ideation-2", "erom-ideation-4"]),
             "erom-ideation-3"
         );
         assert_eq!(
-            next_remote_name(&["erom-ideation", "", "foo", "erom-ideation-2"]),
+            next_remote_name(
+                "erom-ideation-",
+                &["erom-ideation", "", "foo", "erom-ideation-2"]
+            ),
             "erom-ideation-3"
+        );
+        assert_eq!(next_remote_name("idees-", &["erom-ideation-2"]), "idees-2");
+    }
+
+    #[test]
+    fn the_command_of_romain_is_unchanged() {
+        assert_eq!(
+            ideation_command(&romain(), "erom-ideation-2"),
+            "\"$HOME/.local/bin/claude\" --setting-sources project,local --model fable --effort max --name erom-ideation-2 --remote-control erom-ideation-2"
         );
     }
 
     #[test]
-    fn the_command_is_the_one_the_user_wrote() {
+    fn absent_model_and_effort_leave_no_flag() {
+        let mut config = romain();
+        config.model = None;
+        config.effort = None;
         assert_eq!(
-            ideation_command("erom-ideation-2"),
-            "\"$HOME/.local/bin/claude\" --setting-sources project,local --model fable --effort max --name erom-ideation-2 --remote-control erom-ideation-2"
+            ideation_command(&config, "idees-2"),
+            "\"$HOME/.local/bin/claude\" --setting-sources project,local --name idees-2 --remote-control idees-2"
         );
+        config.model = Some("opus".into());
+        assert_eq!(
+            ideation_command(&config, "idees-2"),
+            "\"$HOME/.local/bin/claude\" --setting-sources project,local --model opus --name idees-2 --remote-control idees-2"
+        );
+    }
+
+    #[test]
+    fn values_that_need_it_are_quoted() {
+        let command_with = |model: &str| {
+            let mut config = romain();
+            config.model = Some(model.into());
+            config.effort = None;
+            ideation_command(&config, "idees-2")
+        };
+        assert!(command_with("claude-opus-5-5[1m]").contains("--model 'claude-opus-5-5[1m]' "));
+        assert!(command_with("a b").contains("--model 'a b' "));
+        assert!(command_with("o'neil").contains("--model 'o'\\''neil' "));
+        assert!(command_with("opus-5.5:x/y=1+2@3%4,5").contains("--model opus-5.5:x/y=1+2@3%4,5 "));
+    }
+
+    #[test]
+    fn the_prefix_comes_from_the_folder_name() {
+        let prefix = |dir: &str| remote_prefix(Path::new(dir));
+        assert_eq!(prefix("/Users/Shared/erom-ideation"), "erom-ideation-");
+        assert_eq!(prefix("/h/idees"), "idees-");
+        assert_eq!(prefix("/h/Mes Idées_2"), "mes-id-es-2-");
+        assert_eq!(prefix("/"), "ideation-");
+        assert_eq!(prefix("/h/___"), "ideation-");
     }
 
     #[test]

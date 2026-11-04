@@ -201,8 +201,6 @@ fn default_ideation_label() -> String {
 
 impl IdeationConfig {
     /// Le dossier des sessions, `~` remplacé par `$HOME`.
-    // Branchée par les tâches suivantes (création des sessions) ; en attendant, seuls les tests l'appellent.
-    #[allow(dead_code)]
     pub fn dir_path(&self) -> PathBuf {
         let home = || PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         match self.dir.strip_prefix("~/") {

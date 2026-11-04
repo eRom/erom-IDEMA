@@ -8,7 +8,7 @@ use std::path::Path;
 
 use idema_tmux::server::TmuxServer;
 
-use crate::config::AgentEntry;
+use crate::config::{AgentEntry, IdeationConfig};
 use crate::servers::scan::Process;
 
 pub mod claude;
@@ -30,11 +30,13 @@ pub struct Capture {
 /// en erreur ne change rien »). Un dossier de sessions Claude absent ne donne simplement aucune conversation.
 ///
 /// `processes` est la table de processus du dernier relevé des serveurs (un seul `ps` toutes les 2 s pour les deux).
+/// `ideation` est la section `[ideation]` en mémoire : sans elle, un bouillon est capturé sans commande de lancement.
 pub fn capture_now(
     tmux: &TmuxServer,
     agents: &[AgentEntry],
     sessions_dir: Option<&Path>,
     processes: &HashMap<i32, Process>,
+    ideation: Option<&IdeationConfig>,
 ) -> Result<Capture, String> {
     let (sessions, panes) = tmux.capture().map_err(|error| error.to_string())?;
     let claude_sessions = sessions_dir
@@ -42,7 +44,14 @@ pub fn capture_now(
         .unwrap_or_default();
     let conversations = claude::conversations(&claude_sessions, &panes, processes);
     Ok(Capture {
-        sessions: build_capture(&sessions, &panes, &conversations, agents, processes),
+        sessions: build_capture(
+            &sessions,
+            &panes,
+            &conversations,
+            agents,
+            processes,
+            ideation,
+        ),
         pane_pids: panes.iter().map(|pane| pane.pane_pid).collect(),
     })
 }
@@ -101,8 +110,8 @@ mod tests {
             })
             .expect("session created");
 
-        let captured =
-            capture_now(&test.server, &[], None, &HashMap::new()).expect("the server answers");
+        let captured = capture_now(&test.server, &[], None, &HashMap::new(), None)
+            .expect("the server answers");
 
         // Le `pane_pid` du pane créé, tel que tmux le dit.
         let (_, panes) = test.server.capture().expect("the server answers");
@@ -129,6 +138,6 @@ mod tests {
     fn capture_now_is_an_error_when_no_server_runs() {
         let test = disposable("capture-down");
         // Aucune session créée : le serveur n'a jamais démarré, ce n'est pas « zéro session ».
-        assert!(capture_now(&test.server, &[], None, &HashMap::new()).is_err());
+        assert!(capture_now(&test.server, &[], None, &HashMap::new(), None).is_err());
     }
 }

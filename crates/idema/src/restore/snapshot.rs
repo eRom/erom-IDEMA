@@ -11,7 +11,7 @@ use idema_tmux::server::{CapturedPane, ListedSession};
 use serde::{Deserialize, Serialize};
 
 use super::claude::descends_from;
-use crate::config::AgentEntry;
+use crate::config::{AgentEntry, IdeationConfig};
 use crate::ideation::ideation_command;
 use crate::servers::model::{idnma_entry, is_bare_shell};
 use crate::servers::scan::Process;
@@ -119,14 +119,19 @@ fn saved_pane(
     conversations: &HashMap<(String, PaneId), String>,
     agents: &[AgentEntry],
     processes: &HashMap<i32, Process>,
+    ideation: Option<&IdeationConfig>,
 ) -> SavedPane {
     let conversation = conversations
         .get(&(pane.session.clone(), pane.pane))
         .cloned();
     let resolved = resolve_command(pane, agents);
     let has_agent = has_foreground_agent(pane, resolved, processes);
-    let command = if session.ideation && (conversation.is_some() || has_agent) {
-        Some(ideation_command(&session.remote_name))
+    let ideation_launch = ideation
+        .filter(|_| session.ideation && (conversation.is_some() || has_agent))
+        .map(|config| ideation_command(config, &session.remote_name));
+    // Section `[ideation]` absente : le bouillon est capturé sans commande (jamais celle d'un lanceur de projet).
+    let command = if session.ideation {
+        ideation_launch
     } else if let Some(command) = conversation
         .as_deref()
         .and_then(|id| reclaimed_command(pane, id))
@@ -159,6 +164,7 @@ pub fn build_capture(
     conversations: &HashMap<(String, PaneId), String>,
     agents: &[AgentEntry],
     processes: &HashMap<i32, Process>,
+    ideation: Option<&IdeationConfig>,
 ) -> Vec<SavedSession> {
     let mut saved: Vec<SavedSession> = sessions
         .iter()
@@ -185,7 +191,9 @@ pub fn build_capture(
                 panes: visible
                     .into_iter()
                     .chain(stashed)
-                    .map(|pane| saved_pane(session, pane, conversations, agents, processes))
+                    .map(|pane| {
+                        saved_pane(session, pane, conversations, agents, processes, ideation)
+                    })
                     .collect(),
             })
         })
@@ -575,6 +583,15 @@ mod tests {
         }
     }
 
+    fn romain() -> IdeationConfig {
+        IdeationConfig {
+            dir: "/Users/Shared/erom-ideation".into(),
+            model: Some("fable".into()),
+            effort: Some("max".into()),
+            label: "Fable".into(),
+        }
+    }
+
     fn conversation_map(session: &str, pane: u32, id: &str) -> HashMap<(String, PaneId), String> {
         HashMap::from([((session.to_string(), PaneId(pane)), id.to_string())])
     }
@@ -596,6 +613,7 @@ mod tests {
             &conversation_map("s", 1, CONVERSATION_U),
             &[entry("Claude", "idnma run claude")],
             &HashMap::new(),
+            None,
         );
         let pane = first_pane(&saved);
         assert_eq!(pane.command.as_deref(), Some("idnma run claude"));
@@ -621,6 +639,7 @@ mod tests {
             &conversations,
             &[entry("Opus 5.5", "idnma run claude --model opus")],
             &HashMap::new(),
+            None,
         );
         first_pane(&saved).command.clone()
     }
@@ -679,10 +698,11 @@ mod tests {
             &conversation_map("s", 1, CONVERSATION_U),
             &[entry("Opus 5.5", "idnma run claude --model opus")],
             &HashMap::new(),
+            Some(&romain()),
         );
         assert_eq!(
             first_pane(&saved).command.as_deref(),
-            Some(ideation_command("erom-ideation-3").as_str())
+            Some(ideation_command(&romain(), "erom-ideation-3").as_str())
         );
     }
 
@@ -694,6 +714,7 @@ mod tests {
             &conversation_map("s", 1, CONVERSATION_U),
             &[entry("Claude", "idnma run claude")],
             &HashMap::new(),
+            None,
         );
         assert_eq!(first_pane(&saved).command.as_deref(), Some("claude"));
         assert_eq!(
@@ -716,6 +737,7 @@ mod tests {
             &HashMap::new(),
             &[entry("Codex", "idnma run codex")],
             &processes,
+            None,
         );
         assert_eq!(
             first_pane(&saved).command.as_deref(),
@@ -742,6 +764,7 @@ mod tests {
                 entry("Codex", "idnma run codex"),
             ],
             &processes,
+            None,
         );
         assert_eq!(
             first_pane(&saved).command.as_deref(),
@@ -760,6 +783,7 @@ mod tests {
             &HashMap::new(),
             &[entry("Claude", "idnma run claude")],
             &processes,
+            None,
         );
         assert_eq!(first_pane(&saved).command, None);
         assert_eq!(first_pane(&saved).conversation, None);
@@ -775,6 +799,7 @@ mod tests {
             &HashMap::new(),
             &[],
             &processes,
+            None,
         );
         assert_eq!(first_pane(&saved).command, None);
     }
@@ -791,6 +816,7 @@ mod tests {
             &HashMap::new(),
             &[entry("Codex", "codex --yolo")],
             &processes,
+            None,
         );
         assert_eq!(first_pane(&saved).command.as_deref(), Some("codex --yolo"));
     }
@@ -810,6 +836,7 @@ mod tests {
             &HashMap::new(),
             &[entry("Codex", "codex --yolo")],
             &processes,
+            None,
         );
         assert_eq!(first_pane(&saved).command, None);
     }
@@ -825,11 +852,12 @@ mod tests {
             &conversation_map("s", 1, "Z"),
             &[],
             &HashMap::new(),
+            Some(&romain()),
         );
         let pane = first_pane(&saved);
         assert_eq!(
             pane.command.as_deref(),
-            Some(ideation_command("erom-ideation-3").as_str())
+            Some(ideation_command(&romain(), "erom-ideation-3").as_str())
         );
         assert_eq!(pane.conversation.as_deref(), Some("Z"));
         assert!(saved[0].ideation);
@@ -847,8 +875,28 @@ mod tests {
             &HashMap::new(),
             &[],
             &HashMap::new(),
+            Some(&romain()),
         );
         assert_eq!(first_pane(&saved).command, None);
+    }
+
+    #[test]
+    fn an_ideation_pane_captured_while_disabled_has_no_command() {
+        let mut session = listed("s", 1);
+        session.ideation = true;
+        session.remote_name = "erom-ideation-3".into();
+        let saved = build_capture(
+            &[session],
+            &[captured("s", 1, 10)],
+            &conversation_map("s", 1, "Z"),
+            &[],
+            &HashMap::new(),
+            None,
+        );
+        let pane = first_pane(&saved);
+        assert_eq!(pane.command, None);
+        assert_eq!(pane.conversation.as_deref(), Some("Z"));
+        assert!(saved[0].ideation);
     }
 
     #[test]
@@ -862,6 +910,7 @@ mod tests {
             &HashMap::new(),
             &[],
             &HashMap::new(),
+            None,
         );
         let panes = &saved[0].panes;
         assert_eq!(panes.len(), 3);
@@ -884,6 +933,7 @@ mod tests {
             &HashMap::new(),
             &[],
             &HashMap::new(),
+            None,
         );
         let order: Vec<_> = saved[0].panes.iter().map(|pane| pane.hidden_at).collect();
         assert_eq!(order, vec![Some(300), Some(200), Some(100)]);
@@ -904,6 +954,7 @@ mod tests {
             &HashMap::new(),
             &[],
             &HashMap::new(),
+            None,
         );
         let active: Vec<_> = saved[0].panes.iter().map(|pane| pane.active).collect();
         assert_eq!(active, vec![false, false, true, false]);
@@ -926,6 +977,7 @@ mod tests {
             &HashMap::new(),
             &[],
             &HashMap::new(),
+            None,
         );
         let names: Vec<_> = saved.iter().map(|session| session.name.as_str()).collect();
         assert_eq!(names, vec!["b", "c", "a"]);
@@ -944,6 +996,7 @@ mod tests {
             &HashMap::new(),
             &[],
             &HashMap::new(),
+            None,
         );
         let saved = &saved[0];
         assert_eq!(saved.project, PathBuf::from("/p/alpha"));
@@ -966,6 +1019,7 @@ mod tests {
             &HashMap::new(),
             &[],
             &HashMap::new(),
+            None,
         );
         assert_eq!(saved[0].created, u64::MAX);
         assert_eq!(saved[0].panes[0].hidden_at, Some(u64::MAX));

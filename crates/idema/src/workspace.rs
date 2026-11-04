@@ -42,8 +42,8 @@ use crate::changes::panel::{
 };
 use crate::commit_message::CommitMessageSettings;
 use crate::config::{
-    AgentEntry, Config, ConfigError, FileWatch, ReloadEffects, SHELL_ENTRY, SHELL_SESSION_NAME,
-    ensure_config_file, harness_groups, load_config,
+    AgentEntry, Config, ConfigError, FileWatch, IdeationConfig, ReloadEffects, SHELL_ENTRY,
+    SHELL_SESSION_NAME, ensure_config_file, harness_groups, load_config,
 };
 use crate::dock;
 use crate::errors::{Explained, UNEXPECTED, alert, explain_server, tmux_text};
@@ -57,7 +57,7 @@ use crate::gutter::session_columns;
 use crate::help_bubble::HelpBubble;
 use crate::hud;
 use crate::ideation::{
-    IDEATION_DIR, IDEATION_LABEL, ToolbarItem, ideation_command, next_remote_name, toolbar_items,
+    ToolbarItem, ideation_command, next_remote_name, remote_prefix, toolbar_items,
 };
 use crate::integrations;
 use crate::lifecycle::{AfterClose, REATTACH_ATTEMPTS, after_close, session_sync};
@@ -84,7 +84,8 @@ use crate::rename_field::{self, RenameEvent, RenameField};
 use crate::restore::capture_now;
 use crate::restore::claude::sessions_dir;
 use crate::restore::plan::{
-    SessionPlan, SkipReason, launch_delay, notice_lines, plan_session, resume_delay, should_restore,
+    SessionPlan, SkipReason, ideation_restorable, launch_delay, notice_lines, plan_session,
+    resume_delay, should_restore,
 };
 use crate::restore::snapshot::{
     SavedSession, Snapshot, SnapshotKeeper, SnapshotLoad, SnapshotWriter, load_snapshot,
@@ -1253,13 +1254,15 @@ impl Workspace {
                         .collect();
                     (
                         this.config.agents.clone(),
+                        this.config.ideation.clone(),
                         claude_dir,
                         reclaim_paths(home.as_deref(), config_dir.as_deref()),
                         terminal_shells,
                         processes,
                     )
                 });
-                let Ok((agents, claude_dir, reclaim_dirs, terminal_shells, processes)) = inputs
+                let Ok((agents, ideation, claude_dir, reclaim_dirs, terminal_shells, processes)) =
+                    inputs
                 else {
                     break;
                 };
@@ -1269,15 +1272,21 @@ impl Workspace {
                 };
                 let processes = Arc::new(processes);
                 let reader = Arc::clone(&tmux);
-                let captured =
-                    cx.background_executor()
-                        .spawn({
-                            let processes = Arc::clone(&processes);
-                            async move {
-                                capture_now(&reader, &agents, claude_dir.as_deref(), &processes)
-                            }
-                        })
-                        .await;
+                let captured = cx
+                    .background_executor()
+                    .spawn({
+                        let processes = Arc::clone(&processes);
+                        async move {
+                            capture_now(
+                                &reader,
+                                &agents,
+                                claude_dir.as_deref(),
+                                &processes,
+                                ideation.as_ref(),
+                            )
+                        }
+                    })
+                    .await;
                 let applied = this.update_in(cx, |this, _, cx| match captured {
                     Ok(capture) => {
                         failing = false;
@@ -1402,6 +1411,14 @@ impl Workspace {
         let mut plans = Vec::new();
         let mut skipped = Vec::new();
         for session in &saved {
+            // Section `[ideation]` absente : le bouillon reste dans l'instantané mais ne revient pas, et sans notice.
+            if !ideation_restorable(session, self.ideation().is_some()) {
+                hud::log_event(&format!(
+                    "ideation restore skipped name={} reason=disabled",
+                    session.name
+                ));
+                continue;
+            }
             match plan_session(session, Path::is_dir) {
                 Ok(plan) => plans.push(plan),
                 Err(reason) => skipped.push(skip_session(session, reason)),
@@ -2001,9 +2018,16 @@ impl Workspace {
                         cx,
                     );
                 }
+                self.leave_hidden_ideation(window, cx);
                 hud::log_event(&format!(
-                    "config reloaded theme={} terminal_font={}",
-                    effects.theme, effects.terminal_font
+                    "config reloaded theme={} terminal_font={} ideation={}",
+                    effects.theme,
+                    effects.terminal_font,
+                    if self.ideation().is_some() {
+                        "on"
+                    } else {
+                        "off"
+                    }
                 ));
             }
             Err(error) => {
@@ -2013,6 +2037,31 @@ impl Workspace {
         }
         window.refresh();
         cx.notify();
+    }
+
+    /// La section `[ideation]` vient de disparaître alors qu'un bouillon est sélectionné : la première session de l'ordre
+    /// de navigation prend la main (comme à la fermeture du dernier bouillon), sinon l'écran vide revient.
+    fn leave_hidden_ideation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ideation().is_some() || !self.selected_is_ideation() {
+            return;
+        }
+        let next = {
+            let summaries = self.summaries();
+            self.navigation(&summaries)
+                .first()
+                .map(|name| (*name).to_owned())
+        };
+        match next {
+            Some(name) => self.select(&name, window, cx),
+            None => {
+                self.menu = None;
+                self.state_mut().ui.selected_session = None;
+                self.save();
+                window.focus(&self.focus_handle, cx);
+                self.sync_branch(cx);
+                self.sync_right_panel(window, cx);
+            }
+        }
     }
 
     /// La ligne « Installer la commande idema et l'action du Finder » du menu « IdemA » : pose les deux hors du fil
@@ -3905,6 +3954,11 @@ impl Workspace {
         }
     }
 
+    /// La section `[ideation]` de la config en mémoire : absente, la fonction est masquée.
+    pub(crate) fn ideation(&self) -> Option<&IdeationConfig> {
+        self.config.ideation.as_ref()
+    }
+
     fn summaries(&self) -> Vec<SessionSummary> {
         self.entries
             .iter()
@@ -3924,7 +3978,7 @@ impl Workspace {
         navigation_order(
             &projects,
             |path| state.is_expanded(path),
-            !state.ui.ideation_collapsed,
+            self.ideation().is_some() && !state.ui.ideation_collapsed,
             summaries,
         )
     }
@@ -3938,7 +3992,7 @@ impl Workspace {
             .into_iter()
             .map(|project| project.path.clone())
             .collect();
-        navigation_order(&projects, |_| true, true, summaries)
+        navigation_order(&projects, |_| true, self.ideation().is_some(), summaries)
             .into_iter()
             .map(str::to_owned)
             .collect()
@@ -4924,17 +4978,23 @@ impl Workspace {
         self.spawn_session(server, request, window, cx);
     }
 
-    /// `+` de la section « Bouillon de neurones » et `⌘T` sur un bouillon : une session Fable dans le dossier
-    /// d'idéation, sous un nom Remote Control libre. Le dossier est vérifié ici, avant tout appel tmux. Un bouillon
-    /// n'est pas un projet de `state.json` : la garde de `create_session` ne s'applique pas.
+    /// `+` de la section « Bouillon de neurones » et `⌘T` sur un bouillon : une session dans le dossier de la section
+    /// `[ideation]`, sous un nom Remote Control libre. Sans cette section, rien n'est créé. Le dossier est vérifié ici,
+    /// avant tout appel tmux. Un bouillon n'est pas un projet de `state.json` : la garde de `create_session` ne
+    /// s'applique pas.
     pub(crate) fn new_ideation_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !Path::new(IDEATION_DIR).is_dir() {
+        let Some(config) = self.ideation().cloned() else {
+            hud::log_event("ideation create skipped reason=disabled");
+            return;
+        };
+        let dir = config.dir_path();
+        if !dir.is_dir() {
             hud::log_event("ideation create skipped reason=missing-dir");
             alert(
                 window,
                 cx,
                 "Dossier d'idéation introuvable",
-                Some(IDEATION_DIR),
+                Some(&dir.to_string_lossy()),
             );
             return;
         }
@@ -4947,21 +5007,21 @@ impl Workspace {
             .chain(
                 self.pending_names
                     .iter()
-                    .filter(|(project, _)| project.as_path() == Path::new(IDEATION_DIR))
+                    .filter(|(project, _)| project == &dir)
                     .map(|(_, name)| name.as_str()),
             )
             .collect();
-        let display_name = default_session_name(IDEATION_LABEL, &labels);
+        let display_name = default_session_name(&config.label, &labels);
         let taken = taken_remote_names(
             ideation_sessions().map(|entry| entry.remote_name.as_str()),
             &self.pending_remote_names,
         );
-        let remote_name = next_remote_name(&taken);
+        let remote_name = next_remote_name(&remote_prefix(&dir), &taken);
         let request = SessionRequest {
-            project: PathBuf::from(IDEATION_DIR),
+            project: dir,
             display_name,
-            agent: IDEATION_LABEL.to_owned(),
-            command: Some(ideation_command(&remote_name)),
+            agent: config.label.clone(),
+            command: Some(ideation_command(&config, &remote_name)),
             remote_name: Some(remote_name),
         };
         self.spawn_session(server, request, window, cx);
@@ -7314,11 +7374,13 @@ mod tests {
         assert_eq!(find("plain").remote_name, "");
     }
 
+    const IDEATION_TEST_DIR: &str = "/Users/Shared/erom-ideation";
+
     #[test]
     fn ideation_sessions_are_never_adopted_as_projects() {
         let mut ideation_session = listed_session("ideation-session", 1);
         ideation_session.ideation = true;
-        ideation_session.project = crate::ideation::IDEATION_DIR.into();
+        ideation_session.project = IDEATION_TEST_DIR.into();
         let mut unset = listed_session("unset", 3);
         unset.project = String::new();
         let sessions = [ideation_session, listed_session("plain", 2), unset];
@@ -7327,7 +7389,7 @@ mod tests {
 
     #[test]
     fn a_finished_creation_clears_only_its_own_pending_names() {
-        let ideation = PathBuf::from(crate::ideation::IDEATION_DIR);
+        let ideation = PathBuf::from(IDEATION_TEST_DIR);
         let mut names = vec![
             (ideation.clone(), "Fable".to_owned()),
             (ideation.clone(), "Fable 2".to_owned()),
@@ -7438,13 +7500,16 @@ mod tests {
         let none: [String; 0] = [];
         let first = {
             let taken = taken_remote_names(living.iter().copied(), &none);
-            crate::ideation::next_remote_name(&taken)
+            crate::ideation::next_remote_name("erom-ideation-", &taken)
         };
         assert_eq!(first, "erom-ideation-3");
         // Le premier clic n'a pas fini : son nom attend dans `pending`, le second clic prend le suivant.
         let pending = [first];
         let taken = taken_remote_names(living.iter().copied(), &pending);
-        assert_eq!(crate::ideation::next_remote_name(&taken), "erom-ideation-4");
+        assert_eq!(
+            crate::ideation::next_remote_name("erom-ideation-", &taken),
+            "erom-ideation-4"
+        );
     }
 
     #[test]

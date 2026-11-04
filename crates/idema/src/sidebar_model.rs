@@ -27,17 +27,17 @@ pub fn sort_sessions(sessions: &mut [SessionSummary]) {
     sessions.sort_by(session_order);
 }
 
-/// Les sessions qu'on parcourt au clavier : les bouillons d'abord si leur section est dépliée, puis celles des
-/// projets dépliés, dans l'ordre de la barre.
+/// Les sessions qu'on parcourt au clavier : les bouillons d'abord si leur section est affichée (activée dans la
+/// config et dépliée), puis celles des projets dépliés, dans l'ordre de la barre.
 pub fn navigation_order<'a>(
     projects: &[PathBuf],
     is_expanded: impl Fn(&Path) -> bool,
-    ideation_expanded: bool,
+    ideation_shown: bool,
     sessions: &'a [SessionSummary],
 ) -> Vec<&'a str> {
     let ideation_sessions = sessions
         .iter()
-        .filter(move |session| ideation_expanded && session.ideation)
+        .filter(move |session| ideation_shown && session.ideation)
         .map(|session| session.name.as_str());
     let in_projects = projects
         .iter()
@@ -268,6 +268,14 @@ mod tests {
     fn a_collapsed_section_leaves_keyboard_navigation() {
         let projects = vec![PathBuf::from("/p")];
         let sessions = vec![session("p1", "/p", 1), ideation_session("b1", 2)];
+        let order = navigation_order(&projects, |_| true, false, &sessions);
+        assert_eq!(order, ["p1"]);
+    }
+
+    #[test]
+    fn disabled_ideation_sessions_are_skipped_in_navigation() {
+        let projects = vec![PathBuf::from("/p")];
+        let sessions = vec![ideation_session("b1", 1), session("p1", "/p", 2)];
         let order = navigation_order(&projects, |_| true, false, &sessions);
         assert_eq!(order, ["p1"]);
     }

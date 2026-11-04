@@ -193,7 +193,10 @@ pub fn render_sidebar(
         projects = projects.child(block);
     }
 
-    let ideation = ideation_section(workspace, &theme, cx);
+    let ideation = workspace
+        .ideation()
+        .is_some()
+        .then(|| ideation_section(workspace, &theme, cx));
 
     let notice = workspace.notice().map(|notice| match notice {
         StateNotice::Rebuilt => {
@@ -220,7 +223,7 @@ pub fn render_sidebar(
                 .gap(px(1.))
                 .pt(theme.px(22.))
                 .px(theme.px(10.))
-                .child(ideation)
+                .children(ideation)
                 .child(
                     div()
                         .flex()
