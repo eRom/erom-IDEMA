@@ -4,6 +4,8 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-04
+
 ### Modifié
 
 - La section Bouillon de neurones est masquée par défaut. Elle s'active par une section `[ideation]` dans `config.toml` (dossier obligatoire, modèle, effort et libellé facultatifs) ; un exemple commenté figure dans la config générée. Pour retrouver le comportement d'avant : `dir = "/Users/Shared/erom-ideation"`, `model = "fable"`, `effort = "max"`, `label = "Fable"`.
