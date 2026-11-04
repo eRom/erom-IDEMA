@@ -262,8 +262,8 @@ fn short_id(session_id: &str) -> String {
 mod tests {
     use super::*;
 
-    const ID: &str = "09867987-ad58-491e-9f7e-30011ccd1eb3";
-    const ID2: &str = "41fcfe8c-5366-4562-8bfd-f7b41ce22b51";
+    const ID: &str = "bbbb2222-cccc-4ddd-8eee-ffff00001111";
+    const ID2: &str = "cccc3333-dddd-4eee-8fff-000011112222";
     const START: &str = "Mon Nov  2 18:01:12 2026";
     const PS_DEMO: &str = "/Users/me/.local/bin/claude --dangerously-skip-permissions --remote-control demo-poc-ceres -n demo-poc-ceres";
 
@@ -855,7 +855,7 @@ mod tests {
     fn a_session_without_a_name_shows_its_short_id() {
         let (mut sessions, processes, probe) = world("claude");
         sessions[0].name = None;
-        assert_eq!(run(&sessions, &processes, &probe)[0].name, "09867987");
+        assert_eq!(run(&sessions, &processes, &probe)[0].name, "bbbb2222");
         sessions[0].name = Some("demo".to_string());
         assert_eq!(run(&sessions, &processes, &probe)[0].name, "demo");
     }

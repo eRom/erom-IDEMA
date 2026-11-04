@@ -209,8 +209,8 @@ mod tests {
     #[test]
     fn two_sessions_with_one_name_keep_their_own_id() {
         let sessions = [
-            session("id-1", "claude-flora", "/a/x"),
-            session("id-2", "claude-flora", "/a/x"),
+            session("id-1", "claude-alpha", "/a/x"),
+            session("id-2", "claude-alpha", "/a/x"),
         ];
         let found = groups(&sessions, "/a/x", true);
         assert_eq!(found.len(), 1);

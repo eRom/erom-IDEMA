@@ -456,7 +456,11 @@ pub fn api_base() -> String {
 pub fn search(base: &str, query: &str) -> Result<Vec<SearchHit>, String> {
     let result = fetch(&search_url(base, query)).and_then(|body| parse_search(&body));
     match &result {
-        Ok(hits) => log_event(&format!("skills search q={query} hits={}", hits.len())),
+        Ok(hits) => log_event(&format!(
+            "skills search query_len={} hits={}",
+            query.chars().count(),
+            hits.len()
+        )),
         Err(reason) => log_event(&format!("skills search failed reason={reason}")),
     }
     result

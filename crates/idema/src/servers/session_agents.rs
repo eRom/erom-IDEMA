@@ -216,7 +216,7 @@ mod tests {
             (
                 11,
                 10,
-                "claude --model glm-5.3-flash:cloud[1m] --effort max --name glm-hera-ab12",
+                "claude --model glm-5.3-flash:cloud[1m] --effort max --name glm-gamma-ab12",
             ),
             (12, 11, "zsh -c npm test"),
             (20, 1, "-zsh"),

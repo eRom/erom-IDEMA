@@ -12,7 +12,7 @@ IdemA n'a ni télémétrie, ni statistiques d'usage, ni compte.
 
 ### Réseau
 
-Au lancement, une seule requête part sans geste de votre part : un `git ls-remote` vers le dépôt public d'IdnmA, pour afficher sa dernière version dans le menu Aide. Elle ne transmet rien d'autre que ce que transmet un `git ls-remote`.
+Au lancement, pour la ligne IdnmA du menu Aide, IdemA lance `idnma --version` dans un shell de connexion (local ; il charge votre configuration de shell) et un `git ls-remote` vers le dépôt public d'IdnmA, la seule requête réseau partie sans geste de votre part.
 
 Tout le reste part d'un geste :
 
@@ -22,7 +22,7 @@ Tout le reste part d'un geste :
 | Installer le réseau IDNMA (menu IdemA) | téléchargement puis exécution d'un script d'installation | `erom.cloud` |
 | Chercher ou ajouter une compétence (volet Projet) | la recherche, le paquet `skills` | skills.sh et le registre npm, via `bunx skills` |
 | Ouvrir la galerie Artifacts | une requête avec votre session claude.ai | claude.ai |
-| Naviguer dans le volet Browser | ce qu'envoie n'importe quel navigateur | les sites visités |
+| Naviguer dans le volet Browser, onglets rouverts compris | ce qu'envoie n'importe quel navigateur | les sites visités |
 
 ### Secrets
 
@@ -33,7 +33,7 @@ Tout le reste part d'un geste :
 
 ### Git
 
-IdemA ne lance que des commandes Git d'une liste blanche, et aucune commande destructive : ni `reset`, ni `checkout`, ni `clean`, ni push forcé.
+Le volet Changes ne lance que des commandes Git d'une liste blanche, et aucune commande destructive : ni `reset`, ni `checkout`, ni `clean`, ni push forcé.
 
 ### Distribution
 

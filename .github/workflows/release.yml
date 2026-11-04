@@ -1,6 +1,6 @@
 # Release d'IdemA pour macOS Apple Silicon. Un tag v<version> construit l'app, l'emballe en DMG et l'attache à une
 # release brouillon, publiée ensuite à la main. Un tag v<version>-<suffixe> (v0.3.0-rc.1) donne une pré-version.
-# Lancé à la main (workflow_dispatch), le DMG sort en artefact, sans release.
+# Lancé à la main (workflow_dispatch) depuis une branche, le DMG sort en artefact, sans release.
 name: Release
 
 on:
@@ -21,6 +21,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Avant tout build : le tag porte la version de Cargo.toml et CHANGELOG.md a sa section.
       - name: Tag, version et notes

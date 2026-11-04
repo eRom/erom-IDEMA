@@ -7371,7 +7371,7 @@ mod tests {
 
     #[test]
     fn restored_launches_pair_ids_with_commands_and_continue_the_queue() {
-        const UUID: &str = "44a13315-a76d-4dba-9be9-4b275aba8388";
+        const UUID: &str = "aaaa1111-bbbb-4ccc-8ddd-eeeeffff0000";
         let saved = SavedSession {
             name: "idema-a".into(),
             project: "/p".into(),

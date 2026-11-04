@@ -120,7 +120,10 @@ fn digit_shortcuts(mapper: &dyn PlatformKeyboardMapper) -> Vec<KeyBinding> {
 fn main() {
     // `idema --version` répond sans ouvrir de fenêtre : c'est ainsi que le pipeline de release lit la version du
     // binaire livré.
-    if std::env::args().nth(1).as_deref() == Some("--version") {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version")
+    {
         println!("{}", menus::version_line());
         return;
     }
@@ -150,8 +153,11 @@ fn main() {
         // Pas de journal ne doit pas empêcher d'ouvrir le terminal.
         eprintln!("cannot open the journal: {error}");
     }
-    // Après une mise à jour de l'app, la commande `idema` déjà posée reprend la version de ce binaire.
-    if let Some(home) = files::panel::home_dir() {
+    // Après une mise à jour de l'app, la commande `idema` déjà posée reprend la version de ce binaire. Une instance
+    // isolée (`IDEMA_HOME`, tests d'acceptation) ne touche pas à la commande de l'utilisateur.
+    if std::env::var_os("IDEMA_HOME").is_none()
+        && let Some(home) = files::panel::home_dir()
+    {
         match integrations::refresh_cli(&home) {
             Ok(true) => hud::log_event("integrations cli refreshed"),
             Ok(false) => {}

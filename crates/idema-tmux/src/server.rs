@@ -1700,7 +1700,7 @@ mod tests {
 
     #[test]
     fn parse_capture_panes_reads_a_resume_value_with_spaces_and_quotes() {
-        let resume = "44a13315-a76d-4dba-9be9-4b275aba8388 idnma run 'claude' --model 'haiku' --remote-control 'it'\\''s me'";
+        let resume = "aaaa1111-bbbb-4ccc-8ddd-eeeeffff0000 idnma run 'claude' --model 'haiku' --remote-control 'it'\\''s me'";
         let listing = format!("idema-1\t@2\t1\t\t%5\t1\t4242\t\tOpus\tclaude\t{resume}\t/p/a b\n");
         let panes = parse_capture_panes(&listing);
         assert_eq!(panes.len(), 1);

@@ -277,9 +277,9 @@ mod tests {
 
     use super::*;
 
-    const ID: &str = "09867987-ad58-491e-9f7e-30011ccd1eb3";
+    const ID: &str = "bbbb2222-cccc-4ddd-8eee-ffff00001111";
     const START: &str = "Mon Nov  2 10:00:00 2026";
-    const CLAUDE: &str = "/usr/local/bin/claude --resume 09867987-ad58-491e-9f7e-30011ccd1eb3";
+    const CLAUDE: &str = "/usr/local/bin/claude --resume bbbb2222-cccc-4ddd-8eee-ffff00001111";
 
     fn target() -> OutsideSession {
         OutsideSession {

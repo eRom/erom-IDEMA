@@ -152,9 +152,9 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    const ID: &str = "e0dfc540-e15f-4a04-8d36-36059c2501aa";
-    const PS_FLORA: &str = "claude --model opus --name claude-flora --session-id e0dfc540-e15f-4a04-8d36-36059c2501aa --effort medium --dangerously-skip-permissions --remote-control";
-    const PS_IDEATION: &str = "claude --setting-sources project,local --model fable --effort max --name erom-ideation-2 --remote-control erom-ideation-2 --resume 62e4b16e-fadf-4b5c-bd1c-703d84c7441c";
+    const ID: &str = "dddd4444-eeee-4fff-8000-111122223333";
+    const PS_FLORA: &str = "claude --model opus --name claude-alpha --session-id dddd4444-eeee-4fff-8000-111122223333 --effort medium --dangerously-skip-permissions --remote-control";
+    const PS_IDEATION: &str = "claude --setting-sources project,local --model fable --effort max --name erom-ideation-2 --remote-control erom-ideation-2 --resume eeee5555-ffff-4000-8111-222233334444";
     const PS_DEMO: &str = "/Users/me/.local/bin/claude --dangerously-skip-permissions --remote-control demo-poc-ceres -n demo-poc-ceres";
 
     fn spec(cwd: &Path) -> ResumeSpec<'_> {
@@ -422,7 +422,7 @@ mod tests {
             "",
             "abc",
             "$(id)",
-            "e0dfc540-e15f-4a04-8d36-36059c2501aa; x",
+            "dddd4444-eeee-4fff-8000-111122223333; x",
         ] {
             let refused = ResumeSpec {
                 session_id: id,

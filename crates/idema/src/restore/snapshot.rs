@@ -524,7 +524,7 @@ mod tests {
     use super::*;
     use idema_tmux::protocol::WindowId;
 
-    const CONVERSATION_U: &str = "44a13315-a76d-4dba-9be9-4b275aba8388";
+    const CONVERSATION_U: &str = "aaaa1111-bbbb-4ccc-8ddd-eeeeffff0000";
 
     fn listed(name: &str, created: u128) -> ListedSession {
         ListedSession {

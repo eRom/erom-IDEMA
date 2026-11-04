@@ -321,7 +321,7 @@ fn the_capture_reads_the_resume_option_of_a_pane() {
     let test = disposable("resume-option");
     let with_option = shell_session(&test);
     let without_option = shell_session(&test);
-    let value = "44a13315-a76d-4dba-9be9-4b275aba8388 idnma run 'claude' --model 'haiku' --remote-control 'it'\\''s me'";
+    let value = "aaaa1111-bbbb-4ccc-8ddd-eeeeffff0000 idnma run 'claude' --model 'haiku' --remote-control 'it'\\''s me'";
     test.server
         .set_pane_option(with_option.pane, "@idema_resume", value)
         .unwrap();
@@ -336,7 +336,7 @@ fn the_capture_reads_the_resume_option_of_a_pane() {
 #[test]
 fn restore_session_writes_the_resume_option_of_each_pane_that_has_one() {
     let test = disposable("restore-resume");
-    let value = "44a13315-a76d-4dba-9be9-4b275aba8388 idnma run 'claude' --model 'haiku'";
+    let value = "aaaa1111-bbbb-4ccc-8ddd-eeeeffff0000 idnma run 'claude' --model 'haiku'";
     let panes = [
         RestorePane {
             resume: Some(value),

@@ -187,9 +187,9 @@ mod tests {
     use super::*;
     use idema_tmux::protocol::WindowId;
 
-    const SAMPLE: &str = r#"{"pid":2886,"sessionId":"44a13315-a76d-4dba-9be9-4b275aba8388","cwd":"/Users/me/dev/erom-tool-idema","startedAt":1793184343878,"procStart":"Wed Oct 28 10:45:42 2026","version":"2.1.312","peerProtocol":1,"kind":"interactive","entrypoint":"cli","tmux":"idema-054bcf18:@8.%8","messagingSocketPath":"/tmp/cc-socks/2886.sock","name":"claude-vulcain-o66q","nameSource":"user","status":"busy"}"#;
+    const SAMPLE: &str = r#"{"pid":2886,"sessionId":"aaaa1111-bbbb-4ccc-8ddd-eeeeffff0000","cwd":"/Users/me/dev/erom-tool-idema","startedAt":1793184343878,"procStart":"Wed Oct 28 10:45:42 2026","version":"2.1.312","peerProtocol":1,"kind":"interactive","entrypoint":"cli","tmux":"idema-054bcf18:@8.%8","messagingSocketPath":"/tmp/cc-socks/2886.sock","name":"claude-beta-o66q","nameSource":"user","status":"busy"}"#;
 
-    const ID_A: &str = "44a13315-a76d-4dba-9be9-4b275aba8388";
+    const ID_A: &str = "aaaa1111-bbbb-4ccc-8ddd-eeeeffff0000";
     const ID_B: &str = "11111111-2222-3333-4444-555555555555";
 
     fn session_json(session_id: &str, tmux: &str) -> String {
@@ -288,11 +288,11 @@ mod tests {
         let with_newline = format!("{ID_A}\\n");
         for id in [
             "x; rm -rf ~",
-            "44a13315",
+            "aaaa1111",
             &with_trailing_space,
             &with_newline,
-            "44a13315-a76d-4dba-9be9-4b275abaZ388",
-            "44a13315a76d4dba9be94b275aba8388",
+            "aaaa1111-bbbb-4ccc-8ddd-eeeeffffZ388",
+            "aaaa1111bbbb4ccc8dddeeeeffff0000",
             "",
         ] {
             assert_eq!(
@@ -473,7 +473,7 @@ mod tests {
             process_with(
                 11,
                 10,
-                "/Users/x/.local/bin/claude --resume 44a13315-a76d-4dba-9be9-4b275aba8388",
+                "/Users/x/.local/bin/claude --resume aaaa1111-bbbb-4ccc-8ddd-eeeeffff0000",
             ),
             process_with(20, 1, "zsh"),
             process_with(21, 20, "node /Users/x/.nvm/bin/claude --model opus"),

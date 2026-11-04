@@ -289,7 +289,7 @@ pub fn parse_idnma_agents(text: &str) -> IdnmaAgents {
 mod tests {
     use super::*;
 
-    const ID: &str = "09867987-ad58-491e-9f7e-30011ccd1eb3";
+    const ID: &str = "bbbb2222-cccc-4ddd-8eee-ffff00001111";
 
     fn session_json(extra: &str) -> String {
         format!(
@@ -299,12 +299,12 @@ mod tests {
 
     #[test]
     fn a_cli_session_file_gives_a_live_session() {
-        let text = r#"{"pid":16728,"sessionId":"09867987-ad58-491e-9f7e-30011ccd1eb3","cwd":"/Users/x/dev/demo","name":"tot-le-petit-robot","kind":"interactive","entrypoint":"cli","procStart":"Mon Nov  2 18:01:12 2026","bridgeSessionId":"session_01x","status":"idle"}"#;
+        let text = r#"{"pid":16728,"sessionId":"bbbb2222-cccc-4ddd-8eee-ffff00001111","cwd":"/Users/x/dev/demo","name":"demo-robot","kind":"interactive","entrypoint":"cli","procStart":"Mon Nov  2 18:01:12 2026","bridgeSessionId":"session_01x","status":"idle"}"#;
         let session = parse_live_session(text, Some(16728)).unwrap();
         assert_eq!(session.pid, 16728);
         assert_eq!(session.session_id, ID);
         assert_eq!(session.cwd, PathBuf::from("/Users/x/dev/demo"));
-        assert_eq!(session.name.as_deref(), Some("tot-le-petit-robot"));
+        assert_eq!(session.name.as_deref(), Some("demo-robot"));
         assert_eq!(session.proc_start, "Mon Nov  2 18:01:12 2026");
     }
 
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn a_manifest_reads_agent_engine_model_and_state() {
-        let open = r#"{"session_id":"41fcfe8c-5366-4562-8bfd-f7b41ce22b51","agent":"glm","engine":"default","model":"glm-5.3-flash:cloud[1m]","harness":"claude","name":"glm-vulcain-xyot","cwd":"/x","pid":9186,"ended_at":null}"#;
+        let open = r#"{"session_id":"cccc3333-dddd-4eee-8fff-000011112222","agent":"glm","engine":"default","model":"glm-5.3-flash:cloud[1m]","harness":"claude","name":"glm-beta-xyot","cwd":"/x","pid":9186,"ended_at":null}"#;
         let manifest = parse_manifest(open).unwrap();
         assert_eq!(manifest.agent, "glm");
         assert_eq!(manifest.engine.as_deref(), Some("default"));

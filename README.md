@@ -32,11 +32,11 @@ Quand on n'écrit presque plus de code soi-même, la journée ressemble à ceci 
 
 **Un lanceur d'agents.** Le `+` d'un projet lance l'agent par défaut ; un clic droit ouvre la liste, rangée par moteur, avec les logos. Chaque entrée est une simple commande dans le fichier de réglages.
 
-**Les fichiers, juste ce qu'il faut.** Arbre du projet, éditeur à onglets avec coloration, sauvegarde automatique et rechargement quand un agent réécrit le fichier, recherche et remplacement dans tout le projet. « Copier vers l'agent » colle `chemin:Ldébut-Lfin` dans le prompt de la session.
+**Les fichiers, juste ce qu'il faut.** Arbre du projet, éditeur à onglets avec coloration, sauvegarde automatique et rechargement quand un agent réécrit le fichier, recherche et remplacement dans tout le projet. « Copier vers l'agent » colle dans le prompt de la session la référence du passage sélectionné, chemin et lignes.
 
 **Le diff avant le commit.** Le volet Changes montre ce qui a bougé par rapport à la branche principale, worktrees compris : cases à cocher, commit, push. Aucune commande Git destructive, jamais. Un message de commit peut être proposé par un modèle (option, éteinte par défaut).
 
-**Un navigateur intégré.** Onglets WebKit, serveurs de dev détectés (`.claude/launch.json`, script `dev` du `package.json`, ports ouverts par les sessions), démarrage, arrêt et journal de chacun. Un ⌘-clic sur une URL dans un terminal l'ouvre ici.
+**Un navigateur intégré.** Onglets WebKit, serveurs de dev détectés (`.claude/launch.json`, à défaut le script `dev` du `package.json`, et les ports ouverts par les sessions), démarrage, arrêt et journal de chacun. Un ⌘-clic sur une URL dans un terminal l'ouvre ici.
 
 **La configuration des agents, par projet.** Le volet Projet édite `AGENTS.md`, ajoute ou retire des skills et des serveurs MCP pour cinq harnais à la fois (Claude Code, Codex, Grok, OpenCode, Antigravity), et signale les fichiers qui ont divergé.
 
@@ -154,7 +154,7 @@ IdemA est né comme l'outil quotidien d'un seul développeur et s'ouvre maintena
 
 ## Sécurité
 
-IdemA ne collecte rien et n'envoie rien sans geste de votre part, à une exception près détaillée dans [SECURITY.md](SECURITY.md), avec la façon de signaler une vulnérabilité.
+IdemA ne collecte rien. Ce qui part sur le réseau, et quand, est détaillé dans [SECURITY.md](SECURITY.md), avec la façon de signaler une vulnérabilité.
 
 ## Licence
 

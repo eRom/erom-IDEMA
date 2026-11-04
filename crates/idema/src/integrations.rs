@@ -53,10 +53,16 @@ pub fn install(home: &Path) -> io::Result<Installed> {
 }
 
 /// Au lancement : une commande `idema` déjà posée par IdemA, mais d'une autre version (ou d'un autre contenu), est
-/// réécrite avec celle de ce binaire. Absente ou écrite par quelqu'un d'autre, elle n'est pas touchée. Vrai si elle a
-/// été réécrite.
+/// réécrite avec celle de ce binaire. Absente, écrite par quelqu'un d'autre ou lien symbolique (sa cible peut être un
+/// fichier suivi ailleurs, `packaging/cli/idema` compris), elle n'est pas touchée. Vrai si elle a été réécrite.
 pub fn refresh_cli(home: &Path) -> io::Result<bool> {
     let cli = cli_path(home);
+    match fs::symlink_metadata(&cli) {
+        Ok(meta) if meta.file_type().is_symlink() => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
     let current = match fs::read_to_string(&cli) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -167,6 +173,19 @@ mod tests {
             fs::read_to_string(home.join(".local/bin/idema")).unwrap(),
             foreign
         );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_symlinked_cli_is_never_written_through() {
+        let home = scratch_home("refresh-link");
+        // La cible ressemble à la source du dépôt : une commande d'IdemA, repère de version compris.
+        let target = home.join("packaging-idema");
+        fs::write(&target, CLI).unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".local/bin/idema")).unwrap();
+
+        assert!(!refresh_cli(&home).unwrap());
+        assert_eq!(fs::read_to_string(&target).unwrap(), CLI);
         let _ = fs::remove_dir_all(&home);
     }
 }

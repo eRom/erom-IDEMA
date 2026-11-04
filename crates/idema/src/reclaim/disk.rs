@@ -358,7 +358,7 @@ mod tests {
 
     use super::*;
 
-    const ID: &str = "09867987-ad58-491e-9f7e-30011ccd1eb3";
+    const ID: &str = "bbbb2222-cccc-4ddd-8eee-ffff00001111";
     /// Un `pid` qui n'est dans aucune table de test : IdemA n'y descend d'aucune session.
     const NOT_IDEMA: i32 = 999_999;
 
@@ -432,7 +432,7 @@ mod tests {
         };
 
         assert!(probe.has_transcript(ID));
-        assert!(!probe.has_transcript("41fcfe8c-5366-4562-8bfd-f7b41ce22b51"));
+        assert!(!probe.has_transcript("cccc3333-dddd-4eee-8fff-000011112222"));
         // Un identifiant qui n'est pas un UUID ne sert jamais à construire un chemin.
         assert!(!probe.has_transcript("../-x-y/anything"));
     }
@@ -902,7 +902,7 @@ mod tests {
             );
             cache
                 .transcripts
-                .insert("41fcfe8c-5366-4562-8bfd-f7b41ce22b51".to_string());
+                .insert("cccc3333-dddd-4eee-8fff-000011112222".to_string());
         }
 
         scan(&paths, &[], &[], NOT_IDEMA, &processes, &[], &cache);
