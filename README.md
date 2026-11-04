@@ -52,6 +52,14 @@ Quand on n'écrit presque plus de code soi-même, la journée ressemble à ceci 
 | Police | une Nerd Font, par défaut Hack Nerd Font Mono : `brew install --cask font-hack-nerd-font` |
 | Agents | les CLI que vous voulez lancer : `claude`, `codex`, `gemini`, `grok`, `opencode`... |
 
+### En une commande
+
+```sh
+curl -fsSL https://erom.cloud/install_idema.sh | bash
+```
+
+Le script télécharge le DMG de la dernière release, vérifie son empreinte et copie IdemA dans `/Applications`, puis propose d'installer [IdnmA](https://github.com/eRom/erom-IDNMA), le lanceur d'agents des menus d'IdemA. Relancé, il met IdemA à jour. Variables utiles : `IDEMA_VERSION=v0.2.1` pour une version précise, `IDEMA_APP_DIR=~/Applications` pour un autre dossier, `IDEMA_IDNMA=y` ou `n` pour répondre d'avance.
+
 ### Depuis la release
 
 1. Téléchargez `IdemA-<version>-arm64.dmg` depuis la [dernière release](https://github.com/eRom/erom-IDEMA/releases/latest).
