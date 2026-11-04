@@ -2279,10 +2279,7 @@ mod tests {
     fn tilde_path_only_abbreviates_inside_home() {
         let home = Path::new("/Users/me");
         assert_eq!(tilde_path(Path::new("/Users/me"), Some(home)), "~");
-        assert_eq!(
-            tilde_path(Path::new("/Users/me/a/b"), Some(home)),
-            "~/a/b"
-        );
+        assert_eq!(tilde_path(Path::new("/Users/me/a/b"), Some(home)), "~/a/b");
         // Un dossier voisin qui commence par le même texte n'est pas sous le dossier personnel.
         assert_eq!(
             tilde_path(Path::new("/Users/me2/a"), Some(home)),

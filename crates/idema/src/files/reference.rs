@@ -78,10 +78,7 @@ mod tests {
             display_path(Path::new("/Users/mex/a"), Some(home)),
             "/Users/mex/a"
         );
-        assert_eq!(
-            display_path(spec, None),
-            "/Users/me/dev/idema/docs/spec.md"
-        );
+        assert_eq!(display_path(spec, None), "/Users/me/dev/idema/docs/spec.md");
     }
 
     #[test]

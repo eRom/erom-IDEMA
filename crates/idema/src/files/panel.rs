@@ -2424,11 +2424,7 @@ pub(crate) mod tests {
     fn long_outside_paths_keep_their_file_name_and_stay_distinct() {
         let root = Path::new("/work/project");
         let home = Some(Path::new("/Users/me"));
-        let config = tab_title(
-            Path::new("/Users/me/.config/idema/config.toml"),
-            root,
-            home,
-        );
+        let config = tab_title(Path::new("/Users/me/.config/idema/config.toml"), root, home);
         let employees = tab_title(
             Path::new("/Users/me/dev/erom-tool-idema/outside/caserne/employees.yml"),
             root,
