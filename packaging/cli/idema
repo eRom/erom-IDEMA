@@ -1,9 +1,15 @@
 #!/bin/zsh -f
 # idema <dossier> : ouvre le dossier comme projet dans IdemA, lancée au besoin. Même chemin que ⌘O : un dossier hors
 # dépôt Git est initialisé (vide) ou demande confirmation (non vide).
+# idema --version : la version d'IdemA qui a posé cette commande (IdemA la repose à chaque lancement après une mise à
+# jour). Le repère de version de la ligne `echo` est remplacé à la pose.
 set -eu
+if [[ $# -eq 1 && "$1" == "--version" ]]; then
+  echo "IdemA @IDEMA_VERSION@"
+  exit 0
+fi
 if [[ $# -ne 1 ]]; then
-  echo "usage: idema <folder>" >&2
+  echo "usage: idema <folder> | idema --version" >&2
   exit 64
 fi
 if [[ ! -d "$1" ]]; then

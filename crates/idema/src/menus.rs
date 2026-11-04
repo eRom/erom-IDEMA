@@ -17,20 +17,10 @@ actions!(edit, [Cut, Copy, Paste, SelectAll]);
 // Sans gestionnaire, à dessein : ces lignes restent grisées.
 actions!(help, [ReportIssue, VersionInfo]);
 
-/// L'`Info.plist` du bundle, seule source de la version affichée : `Cargo.toml` n'en porte pas (resté à 0.1.0).
-const BUNDLE_INFO: &str = include_str!("../../../packaging/Info.plist");
-
-/// La valeur de `CFBundleShortVersionString` dans un `Info.plist` XML.
-fn short_version(plist: &str) -> Option<&str> {
-    let (_, after_key) = plist.split_once("<key>CFBundleShortVersionString</key>")?;
-    let (_, after_open) = after_key.split_once("<string>")?;
-    let (value, _) = after_open.split_once("</string>")?;
-    Some(value.trim()).filter(|value| !value.is_empty())
-}
-
-/// La version d'IdemA, celle que le Finder lit dans le bundle.
-fn app_version() -> &'static str {
-    short_version(BUNDLE_INFO).unwrap_or(env!("CARGO_PKG_VERSION"))
+/// « IdemA 0.2.0 » : la version du `Cargo.toml` de l'espace de travail, seule source. `scripts/bundle-app.sh` la
+/// recopie dans l'`Info.plist` du bundle ; `idema --version` (binaire et commande posée) dit la même ligne.
+pub fn version_line() -> String {
+    format!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Lie les touches, branche les gestionnaires globaux puis pose la barre de menus. À appeler après les autres
@@ -81,26 +71,8 @@ pub fn rebuild(cx: &mut App) {
         Menu::new("Aide").items([
             MenuItem::action("Signaler un problème", ReportIssue),
             MenuItem::separator(),
-            MenuItem::action(format!("{APP_NAME} {}", app_version()), VersionInfo),
+            MenuItem::action(version_line(), VersionInfo),
             MenuItem::action(idnma_label, VersionInfo),
         ]),
     ]);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_short_version_is_read_from_an_info_plist() {
-        let plist =
-            "<dict>\n\t<key>CFBundleShortVersionString</key>\n\t<string>1.2.3</string>\n</dict>";
-        assert_eq!(short_version(plist), Some("1.2.3"));
-        assert_eq!(short_version("<dict></dict>"), None);
-    }
-
-    #[test]
-    fn the_bundle_plist_declares_a_version() {
-        assert!(short_version(BUNDLE_INFO).is_some());
-    }
 }

@@ -118,6 +118,12 @@ fn digit_shortcuts(mapper: &dyn PlatformKeyboardMapper) -> Vec<KeyBinding> {
 }
 
 fn main() {
+    // `idema --version` répond sans ouvrir de fenêtre : c'est ainsi que le pipeline de release lit la version du
+    // binaire livré.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("{}", menus::version_line());
+        return;
+    }
     hud::mark_process_start();
     let Some(dir) = instance::config_dir(std::env::var_os("HOME"), std::env::var_os("IDEMA_HOME"))
     else {
@@ -143,6 +149,14 @@ fn main() {
     if let Err(error) = hud::init_journal(&dir) {
         // Pas de journal ne doit pas empêcher d'ouvrir le terminal.
         eprintln!("cannot open the journal: {error}");
+    }
+    // Après une mise à jour de l'app, la commande `idema` déjà posée reprend la version de ce binaire.
+    if let Some(home) = files::panel::home_dir() {
+        match integrations::refresh_cli(&home) {
+            Ok(true) => hud::log_event("integrations cli refreshed"),
+            Ok(false) => {}
+            Err(error) => hud::log_event(&format!("integrations cli refresh failed: {error}")),
+        }
     }
     let socket = instance::tmux_socket(std::env::var_os("IDEMA_TMUX_SOCKET"));
     // tmux est interrogé pendant que GPUI crée la fenêtre (P-1) : la barre n'attend plus que lui.
