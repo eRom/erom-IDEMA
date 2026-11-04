@@ -7,6 +7,7 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 ### Ajouté
 
 - Menu Aide : « IdemA » et « IdnmA » ouvrent leur dépôt GitHub, « Signaler un problème » ouvre la création d'une issue.
+- Installation en une commande : `curl -fsSL https://erom.cloud/install_idema.sh | bash` télécharge la dernière release, vérifie son empreinte, installe IdemA dans `/Applications` et propose d'installer IdnmA. Relancée, elle met IdemA à jour.
 
 ## [0.2.1] - 2026-11-04
 
