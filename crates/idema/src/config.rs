@@ -68,6 +68,15 @@ command = "idnma run codex"
 name = "Grok"
 harness = "Grok Build"
 command = "idnma run grok"
+
+# Bouillon de neurones : des sessions Claude Code d'idéation, hors projet, pilotables depuis l'app mobile (Remote
+# Control). La section est masquée tant que [ideation] est absente. `dir` est obligatoire ; `model` et `effort`
+# passent à claude tels quels ; `label` nomme les bouillons (« Claude » par défaut).
+# [ideation]
+# dir = "~/ideation"
+# model = "opus"
+# effort = "high"
+# label = "Claude"
 "#;
 
 /// Nom de l'entrée intégrée « Shell seul », et nom par défaut de ses sessions.
@@ -164,6 +173,44 @@ pub struct Config {
     /// Section `[browser]` : les favoris de la page d'accueil du navigateur. Absente, aucun favori.
     #[serde(default)]
     pub browser: Option<BrowserConfig>,
+    /// Section `[ideation]` : les sessions d'idéation (bouillon de neurones). Absente, la fonction est masquée.
+    #[serde(default)]
+    pub ideation: Option<IdeationConfig>,
+}
+
+/// Section `[ideation]` : où vivent les sessions d'idéation et comment `claude` y est lancé.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdeationConfig {
+    /// Dossier des sessions : absolu, `~` ou `~/...`.
+    pub dir: String,
+    /// Le modèle passé à `claude`, tel quel.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// L'effort passé à `claude`, tel quel.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Le nom des bouillons dans l'interface.
+    #[serde(default = "default_ideation_label")]
+    pub label: String,
+}
+
+fn default_ideation_label() -> String {
+    "Claude".into()
+}
+
+impl IdeationConfig {
+    /// Le dossier des sessions, `~` remplacé par `$HOME`.
+    // Branchée par les tâches suivantes (création des sessions) ; en attendant, seuls les tests l'appellent.
+    #[allow(dead_code)]
+    pub fn dir_path(&self) -> PathBuf {
+        let home = || PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        match self.dir.strip_prefix("~/") {
+            Some(rest) => home().join(rest),
+            None if self.dir == "~" => home(),
+            None => PathBuf::from(&self.dir),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -429,6 +476,30 @@ fn validate(config: &Config, text: &str) -> Result<(), ConfigError> {
             "un seul agent par défaut ({})",
             defaults.join(", ")
         )));
+    }
+    if let Some(ideation) = &config.ideation {
+        let dir = ideation.dir.as_str();
+        if !(dir.starts_with('/') || dir == "~" || dir.starts_with("~/")) {
+            return Err(invalid(
+                "[ideation] dir doit être un chemin absolu ou commencer par ~/",
+            ));
+        }
+        for (key, value) in [
+            ("dir", Some(dir)),
+            ("model", ideation.model.as_deref()),
+            ("effort", ideation.effort.as_deref()),
+            ("label", Some(ideation.label.as_str())),
+        ] {
+            let Some(value) = value else { continue };
+            if value.trim().is_empty() {
+                return Err(invalid(format!("[ideation] {key} ne peut pas être vide")));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(invalid(format!(
+                    "[ideation] {key} contient un caractère de contrôle"
+                )));
+            }
+        }
     }
     let favorites = config.browser.iter().flat_map(|browser| &browser.favorites);
     for (index, favorite) in favorites.enumerate() {
@@ -927,6 +998,69 @@ mod tests {
         // Une ligne qui n'est qu'un commentaire ou une valeur de chaîne n'est pas un en-tête.
         let decoy = parse_config("# [[browser.favorites]]\n[[browser.favorites]]\nname = \"[[browser.favorites]]\"\nurl = \"nope\"\n").unwrap_err();
         assert_eq!(decoy.line, Some(2));
+    }
+
+    #[test]
+    fn ideation_is_off_without_its_section() {
+        assert_eq!(parse_config(DEFAULT_CONFIG).unwrap().ideation, None);
+        assert!(DEFAULT_CONFIG.contains("# [ideation]"));
+    }
+
+    #[test]
+    fn romain_ideation_section_parses() {
+        let text = "[ideation]\ndir = \"/Users/Shared/erom-ideation\"\nmodel = \"fable\"\neffort = \"max\"\nlabel = \"Fable\"\n";
+        let section = parse_config(text).unwrap().ideation.unwrap();
+        assert_eq!(section.dir, "/Users/Shared/erom-ideation");
+        assert_eq!(section.model.as_deref(), Some("fable"));
+        assert_eq!(section.effort.as_deref(), Some("max"));
+        assert_eq!(section.label, "Fable");
+    }
+
+    #[test]
+    fn ideation_label_defaults_to_claude() {
+        let section = parse_config("[ideation]\ndir = \"/x\"\n")
+            .unwrap()
+            .ideation
+            .unwrap();
+        assert_eq!(section.label, "Claude");
+        assert_eq!(section.model, None);
+        assert_eq!(section.effort, None);
+    }
+
+    #[test]
+    fn ideation_refusals() {
+        let cases = [
+            ("dir = \"rel/x\"", ConfigErrorKind::Invalid),
+            ("dir = \"\"", ConfigErrorKind::Invalid),
+            ("dir = \"  \"", ConfigErrorKind::Invalid),
+            ("dir = \"/x\"\nmodel = \"\"", ConfigErrorKind::Invalid),
+            (
+                "dir = \"/x\"\nmodel = \"a\\u0007b\"",
+                ConfigErrorKind::Invalid,
+            ),
+            ("dir = \"/x\"\neffort = \"\\n\"", ConfigErrorKind::Invalid),
+            ("dir = \"/x\"\nlabel = \"\"", ConfigErrorKind::Invalid),
+            ("dir = \"/x\"\ncolour = \"x\"", ConfigErrorKind::Syntax),
+        ];
+        for (body, kind) in cases {
+            let error = parse_config(&format!("[ideation]\n{body}\n")).unwrap_err();
+            assert_eq!(error.kind, kind, "{body}: {error}");
+        }
+    }
+
+    #[test]
+    fn ideation_dir_expands_the_home() {
+        let home = std::env::var("HOME").expect("HOME is set");
+        let dir_path = |dir: &str| {
+            parse_config(&format!("[ideation]\ndir = \"{dir}\"\n"))
+                .unwrap()
+                .ideation
+                .unwrap()
+                .dir_path()
+        };
+        assert_eq!(dir_path("~/idees"), PathBuf::from(&home).join("idees"));
+        assert_eq!(dir_path("~"), PathBuf::from(&home));
+        assert_eq!(dir_path("/abs"), PathBuf::from("/abs"));
     }
 
     #[test]

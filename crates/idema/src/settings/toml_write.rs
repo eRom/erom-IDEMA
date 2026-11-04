@@ -422,6 +422,16 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_keeps_the_ideation_section() {
+        let base = format!("{DEFAULT_CONFIG}\n# bouillon\n[ideation]\ndir = \"/x\" # dossier\n");
+        let (text, config) = apply_edit(&base, &ConfigEdit::UiFontSize(22.)).unwrap();
+        assert!(text.contains("# bouillon"), "{text}");
+        assert!(text.contains("[ideation]"), "{text}");
+        assert!(text.contains("dir = \"/x\" # dossier"), "{text}");
+        assert_eq!(config.ideation.unwrap().dir, "/x");
+    }
+
+    #[test]
     fn a_trailing_comment_on_the_edited_line_survives() {
         let (text, _) =
             apply_edit("ui_font_size = 20 # taille\n", &ConfigEdit::UiFontSize(22.)).unwrap();
