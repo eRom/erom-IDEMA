@@ -22,7 +22,7 @@ sound_on_wait = true
 # Entrées du lanceur. Le menu les range par `harness` (le moteur qui fait tourner le modèle), puis par nom, chaque
 # harness en sous-menu ; une entrée sans `harness` reste au premier niveau. « Shell seul » est intégré à IdemA. Le logo
 # d'une session qui fait tourner une entrée est celui de son nom en minuscules (claude, codex, deepseek, gemini, glm,
-# grok, kimi, mistral, muse, nvidia, qwen), ou celui de `icon`.
+# grok, kimi, mistral, muse, nvidia, qwen, xiaomi), ou celui de `icon`.
 [[agents]]
 name = "Gemini"
 harness = "Antigravity"

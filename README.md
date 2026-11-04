@@ -107,7 +107,7 @@ harness = "Codex"
 command = "codex"
 ```
 
-`harness` range l'entrée dans un sous-menu ; le logo de la session vient du nom de l'entrée (`claude`, `codex`, `gemini`, `grok`, `deepseek`, `glm`, `kimi`, `mistral`, `qwen`...) ou de `icon`. « Shell seul » est toujours disponible.
+`harness` range l'entrée dans un sous-menu ; le logo de la session vient du nom de l'entrée (`claude`, `codex`, `gemini`, `grok`, `deepseek`, `glm`, `kimi`, `mistral`, `qwen`, `xiaomi`...) ou de `icon`. « Shell seul » est toujours disponible.
 
 La configuration par défaut lance les agents par [IdnmA](https://github.com/eRom/erom-IDNMA) (`command = "idnma run claude"`, etc.). Sans IdnmA installé, seul « Shell seul » fonctionne : installez-le (menu IdemA, « Installer le réseau IDNMA ») ou remplacez ces commandes par les vôtres, comme ci-dessus.
 

@@ -348,6 +348,11 @@ const LOGOS: &[(&str, &str, &[u8])] = &[
         "mistral",
         include_bytes!("../assets/logos/mistral.png"),
     ),
+    (
+        "logos/xiaomi.png",
+        "xiaomi",
+        include_bytes!("../assets/logos/xiaomi.png"),
+    ),
 ];
 
 /// Le chemin à donner à `img()` pour le logo `name` (« claude »), s'il existe.
