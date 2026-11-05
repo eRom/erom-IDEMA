@@ -845,30 +845,15 @@ mod tests {
         assert_eq!(empty.json()["events"], serde_json::json!([]));
 
         let at = SystemTime::now();
+        // L'espace de travail range les transitions dans la chronologie du contrôleur, que le service lit.
         for (from, to) in [(Idle, Running), (Running, Waiting)] {
             service
-                .events
-                .send(ServiceEvent::Transition {
-                    session: "idema-aaaaaaaa".into(),
-                    from,
-                    to,
-                    at,
-                })
-                .unwrap();
+                .timeline
+                .lock()
+                .unwrap()
+                .record("idema-aaaaaaaa", from, to, at);
         }
-        // Le service range les transitions de façon asynchrone : on attend qu'elles se voient.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let events = loop {
-            let events = get("").json()["events"].clone();
-            if events.as_array().is_some_and(|list| !list.is_empty()) {
-                break events;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no transition recorded"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let events = get("").json()["events"].clone();
         let shown = unix_millis(at);
         assert_eq!(
             events,

@@ -107,8 +107,8 @@ pub enum SessionEvent {
         previous: ActivityState,
         current: ActivityState,
     },
-    /// L'état d'un de ses panes a changé, que celui de la session change ou non : le compagnon republie la flotte, qui
-    /// porte l'état de chaque pane.
+    /// L'état d'un de ses panes a changé, ou un pane est apparu ou a disparu, que l'état de la session change ou non :
+    /// le compagnon republie la flotte, qui porte la liste des panes et l'état de chacun.
     PanesChanged,
     /// Le focus GPUI d'un de ses panes a changé : l'espace de travail recalcule qui tient le clavier.
     FocusChanged,
@@ -1086,6 +1086,8 @@ impl SessionView {
         let present: Vec<PaneId> = rects.iter().map(|rect| rect.pane).collect();
         let had_focus = self.has_focus(window, cx);
         let change = self.roster.update(&present, Instant::now());
+        // Un pane ajouté ou retiré change la liste que le compagnon montre, même si le pane actif reste le même.
+        let panes_changed = !change.added.is_empty() || !change.removed.is_empty();
 
         let mut focus_lost = false;
         for removed in change.removed {
@@ -1154,6 +1156,9 @@ impl SessionView {
             self.focus_active(window, cx);
         }
         self.refresh_state(cx);
+        if panes_changed {
+            cx.emit(SessionEvent::PanesChanged);
+        }
         cx.notify();
     }
 

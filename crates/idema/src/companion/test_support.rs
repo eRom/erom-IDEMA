@@ -39,7 +39,7 @@ impl RngCore for SeededRng {
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::fleet::Fleet;
 use super::service::{self, ServiceDeps, ServiceHandle};
+use super::timeline::Timeline;
 use super::{ListenState, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
 
@@ -122,6 +123,7 @@ pub fn deps_in(
         commands,
         status,
         fleet,
+        timeline: Arc::new(Mutex::new(Timeline::new(std::time::SystemTime::now()))),
         previous,
         test_routes,
     };
@@ -165,6 +167,8 @@ pub struct Harness {
     pub status: watch::Receiver<ServiceStatus>,
     /// De quoi publier la flotte comme le fait l'espace de travail.
     pub fleet: watch::Sender<Arc<Fleet>>,
+    /// La chronologie du service, que l'espace de travail alimente en vrai.
+    pub timeline: Arc<Mutex<Timeline>>,
     handle: Option<ServiceHandle>,
 }
 
@@ -177,6 +181,7 @@ impl Harness {
     pub fn start_in(home: TempDir, test_routes: bool) -> Self {
         let port = free_port();
         let (deps, events, mut status, fleet) = deps_in(port, home.0.clone(), None, test_routes);
+        let timeline = Arc::clone(&deps.timeline);
         let handle = service::start(deps).expect("the service thread spawns");
         wait_for(&mut status, |state| {
             *state == ListenState::Listening { port }
@@ -187,6 +192,7 @@ impl Harness {
             events,
             status,
             fleet,
+            timeline,
             handle: Some(handle),
         }
     }

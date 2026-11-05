@@ -2,18 +2,22 @@
 //! service en conséquence. Rien ici ne bloque le fil d'interface.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::SystemTime;
 
 use futures::channel::mpsc;
+use idema_term::activity::ActivityState;
 use idema_tmux::server::TmuxServer;
 use tokio::sync::watch;
 
 use super::auth::test_routes_enabled;
 use super::fleet::Fleet;
 use super::service::{self, ServiceDeps, ServiceHandle};
+use super::timeline::Timeline;
 use super::{PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
+use crate::hud;
 
 /// Un service qui tourne (ou démarre), avec la config qui l'a lancé.
 struct Running {
@@ -25,18 +29,38 @@ struct Running {
     fleet: watch::Sender<Arc<Fleet>>,
 }
 
-#[derive(Default)]
 pub struct CompanionController {
     running: Option<Running>,
+    /// La chronologie des transitions qui comptent. Elle appartient au contrôleur, donc à IdemA : un service qui
+    /// redémarre (port changé) la retrouve, et son instant de démarrage est celui du process. Perdue avec lui.
+    timeline: Arc<Mutex<Timeline>>,
     /// Le fil d'un service arrêté que personne n'a encore joint. Il n'existe que tant que rien ne tourne : un
     /// service qui démarre le reçoit comme `previous` et le joint avant de lier sa prise, donc une réactivation
     /// rapide ne dispute jamais le port à l'ancien fil.
     stopping: Option<JoinHandle<()>>,
 }
 
+impl Default for CompanionController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CompanionController {
     pub fn new() -> Self {
-        Self::default()
+        // Le démarrage d'IdemA : maintenant, moins le temps écoulé depuis le début de `main`.
+        let started_at = SystemTime::now()
+            .checked_sub(hud::since_process_start())
+            .unwrap_or_else(SystemTime::now);
+        Self::with_start(started_at)
+    }
+
+    fn with_start(started_at: SystemTime) -> Self {
+        Self {
+            running: None,
+            timeline: Arc::new(Mutex::new(Timeline::new(started_at))),
+            stopping: None,
+        }
     }
 
     /// Démarre, arrête ou redémarre selon `config` ; ne démarre qu'avec `tmux` présent. Rend la file de commandes du
@@ -76,6 +100,7 @@ impl CompanionController {
             commands,
             status,
             fleet: fleet_receiver,
+            timeline: Arc::clone(&self.timeline),
             previous,
             test_routes: test_routes_enabled(
                 std::env::var_os("IDEMA_HOME").as_deref(),
@@ -116,7 +141,34 @@ impl CompanionController {
         });
     }
 
+    /// Une session a changé d'état. Rangée dans la chronologie tant que le compagnon est allumé (même si son service
+    /// redémarre ou n'a pas pu lier sa prise) ; éteint, rien n'est gardé.
+    pub fn record_transition(
+        &self,
+        session: &str,
+        from: ActivityState,
+        to: ActivityState,
+        at: SystemTime,
+    ) {
+        if self.running.is_some() {
+            self.lock_timeline().record(session, from, to, at);
+        }
+    }
+
+    /// Une session perd son état suivi (vue remplacée ou perdue, session fermée) : voir `Timeline::reset`.
+    pub fn record_reset(&self, session: &str, from: ActivityState, at: SystemTime) {
+        if self.running.is_some() {
+            self.lock_timeline().reset(session, from, at);
+        }
+    }
+
+    fn lock_timeline(&self) -> std::sync::MutexGuard<'_, Timeline> {
+        // Un panique pendant qu'on tenait le verrou ne rend pas la chronologie incohérente (chaque ajout est atomique).
+        self.timeline.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Envoie un événement au service ; sans effet éteint.
+    #[allow(dead_code, reason = "premier émetteur : Personnaliser (tâche 11)")]
     pub fn send(&self, event: ServiceEvent) {
         if let Some(running) = &self.running {
             let _ = running.events.send(event);
@@ -145,6 +197,52 @@ mod tests {
             "/nonexistent/tmux.conf".into(),
             Vec::new(),
         ))
+    }
+
+    /// La chronologie est celle d'IdemA : un service qui redémarre (port changé) la garde, avec le même instant de
+    /// démarrage ; éteint, le contrôleur ne garde rien.
+    #[test]
+    fn the_timeline_lives_as_long_as_idema_not_as_long_as_a_service() {
+        use idema_term::activity::ActivityState::{Idle, Running, Waiting};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let home = super::super::test_support::TempDir::new("controller-timeline");
+        let scratchpad = home.0.join("scratchpad.md");
+        let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let mut controller = CompanionController::with_start(start);
+        let events = |controller: &CompanionController| controller.lock_timeline().since(0);
+
+        controller.record_transition("a", Running, Waiting, at(1));
+        assert!(events(&controller).is_empty(), "off: nothing is kept");
+
+        let first = super::super::test_support::free_port();
+        controller.sync(Some(&config(first)), Some(tmux()), &home.0, &scratchpad);
+        controller.record_transition("a", Running, Waiting, at(10));
+
+        // Le port change : l'ancien service s'arrête, un nouveau démarre, la chronologie reste.
+        let second = super::super::test_support::free_port();
+        assert_ne!(first, second);
+        controller.sync(Some(&config(second)), Some(tmux()), &home.0, &scratchpad);
+        controller.record_transition("a", Waiting, Idle, at(20));
+        controller.record_reset("b", Waiting, at(30));
+
+        let kept: Vec<_> = events(&controller)
+            .into_iter()
+            .map(|event| (event.session, event.from, event.to))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("a".into(), "running", "waiting"),
+                ("a".into(), "waiting", "idle"),
+                ("b".into(), "waiting", "idle"),
+            ]
+        );
+        assert_eq!(controller.lock_timeline().started_at(), 1_800_000_000_000);
+
+        controller.sync(None, Some(tmux()), &home.0, &scratchpad);
+        controller.stopping.take().unwrap().join().unwrap();
     }
 
     /// Éteint, publier ne fait rien ; allumé, seul un instantané qui change quelque chose réveille les abonnés.

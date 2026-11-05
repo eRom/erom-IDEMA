@@ -68,9 +68,29 @@ impl Timeline {
         let waiting_or_error = [from, to]
             .iter()
             .any(|state| matches!(state, Waiting | Error));
-        if !(waiting_or_error || finished) {
-            return;
+        if waiting_or_error || finished {
+            self.push(session, from, to, at, finished);
         }
+    }
+
+    /// Une session cesse d'avoir un état à suivre : sa vue est remplacée ou perdue (retour au repos), ou la session est
+    /// fermée. Ce n'est jamais la fin d'une période « en cours » (rien n'a fini). Une attente ou une erreur ouverte est
+    /// close (vers le repos), sinon elle resterait ouverte pour toujours ; l'horloge « en cours » est oubliée.
+    pub fn reset(&mut self, session: &str, from: ActivityState, at: SystemTime) {
+        self.running_since.remove(session);
+        if matches!(from, ActivityState::Waiting | ActivityState::Error) {
+            self.push(session, from, ActivityState::Idle, at, false);
+        }
+    }
+
+    fn push(
+        &mut self,
+        session: &str,
+        from: ActivityState,
+        to: ActivityState,
+        at: SystemTime,
+        finished: bool,
+    ) {
         if self.events.len() == CAPACITY {
             self.events.pop_front();
         }
@@ -187,6 +207,44 @@ mod tests {
         // IdemA a démarré pendant que la session tournait : on ne sait pas depuis quand.
         timeline.record("a", Running, Idle, at(500));
         assert!(timeline.since(0).is_empty());
+    }
+
+    #[test]
+    fn a_reset_closes_an_open_wait_but_is_never_a_finished_run() {
+        let mut timeline = timeline();
+        timeline.record("a", Idle, Running, at(0));
+        timeline.record("a", Running, Waiting, at(100));
+        // La vue de la session est remplacée pendant l'attente : l'attente est close, sans « a fini ».
+        timeline.reset("a", Waiting, at(200));
+        // Une période « en cours » de 5 minutes interrompue de même ne compte pas comme une fin.
+        timeline.record("b", Idle, Running, at(0));
+        timeline.reset("b", Running, at(300));
+        let kept: Vec<_> = timeline
+            .since(0)
+            .into_iter()
+            .map(|event| (event.session, event.from, event.to, event.finished))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("a".into(), "running", "waiting", false),
+                ("a".into(), "waiting", "idle", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reset_forgets_the_running_clock() {
+        let mut timeline = timeline();
+        timeline.record("a", Idle, Running, at(0));
+        timeline.reset("a", Running, at(10));
+        // La vue suivante part de zéro : sans nouveau départ « en cours », une sortie 500 s plus tard n'est pas une fin.
+        timeline.record("a", Running, Idle, at(500));
+        assert!(timeline.since(0).is_empty());
+        assert!(
+            timeline.running_since.is_empty(),
+            "nothing is kept for the session"
+        );
     }
 
     #[test]

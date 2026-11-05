@@ -42,11 +42,8 @@ use crate::changes::panel::{
     render_panel as render_changes_panel, target_menu,
 };
 use crate::commit_message::CommitMessageSettings;
-use crate::companion::fleet::{
-    Fleet, FleetAgent, FleetPane, FleetSession, fleet_agents, mac_name, project_of, state_label,
-    unix_millis,
-};
-use crate::companion::{CompanionController, PaneCommand, ServiceEvent};
+use crate::companion::fleet::{FleetPane, SessionInput, compose_fleet, mac_name, state_label};
+use crate::companion::{CompanionController, PaneCommand};
 use crate::config::{
     AgentEntry, Config, ConfigError, FileWatch, IdeationConfig, ReloadEffects, SHELL_ENTRY,
     SHELL_SESSION_NAME, ensure_config_file, harness_groups, load_config,
@@ -2359,7 +2356,8 @@ impl Workspace {
             .enter_state(ActivityState::Idle, now)
             .map(|previous| (entry.summary.name.clone(), previous));
         if let Some((session, previous)) = left {
-            self.report_transition(session, previous, ActivityState::Idle, now);
+            // La vue neuve repart au repos : ce n'est pas la fin d'une période « en cours ».
+            self.companion.record_reset(&session, previous, now);
         }
         self.refresh_badge(cx);
         Ok(())
@@ -3949,97 +3947,56 @@ impl Workspace {
         if !self.companion.is_on() {
             return;
         }
-        let ideation = self.ideation();
-        let summaries = self.summaries();
         let sessions = self
-            .full_order(&summaries)
+            .entries
             .iter()
-            .filter_map(|name| {
-                self.entries
-                    .iter()
-                    .find(|entry| entry.summary.name == *name)
+            .map(|entry| {
+                let view = entry.view.as_ref().map(|view| view.read(cx));
+                SessionInput {
+                    summary: entry.summary.clone(),
+                    state_since: entry.state_since,
+                    seen: view.is_some_and(SessionView::is_seen),
+                    agent_names: self.servers.as_ref().map_or_else(Vec::new, |servers| {
+                        servers.read(cx).agents_of(&entry.summary.name).to_vec()
+                    }),
+                    panes: view.map_or_else(Vec::new, |view| {
+                        view.pane_states(cx)
+                            .into_iter()
+                            .map(|(pane, active, state)| FleetPane {
+                                id: pane.0,
+                                active,
+                                state: state_label(state),
+                            })
+                            .collect()
+                    }),
+                }
             })
-            .map(|entry| self.fleet_session(entry, cx))
             .collect();
-        self.companion.publish(Fleet {
-            mac: mac_name().to_owned(),
-            generated_at: unix_millis(SystemTime::now()),
-            badge: dock_badge_count(
-                self.entries.iter().map(|entry| &entry.summary),
-                ideation.is_some(),
-            ),
-            ideation_label: ideation.map(|ideation| ideation.label.clone()),
-            projects: self
-                .state()
-                .ordered_projects()
-                .iter()
-                .map(|project| project_of(&project.path))
-                .collect(),
+        let projects: Vec<PathBuf> = self
+            .state()
+            .ordered_projects()
+            .iter()
+            .map(|project| project.path.clone())
+            .collect();
+        self.companion.publish(compose_fleet(
+            mac_name(),
+            SystemTime::now(),
+            self.ideation().map(|ideation| ideation.label.as_str()),
+            &projects,
+            &self.config.agents,
             sessions,
-        });
+        ));
     }
 
-    /// Une session telle que le téléphone la montre.
-    fn fleet_session(&self, entry: &SessionEntry, cx: &App) -> FleetSession {
-        let summary = &entry.summary;
-        let agents = if summary.ideation {
-            // Un bouillon porte toujours l'astérisque de Claude, sous le libellé de la section (comme la barre).
-            vec![FleetAgent {
-                label: self
-                    .ideation()
-                    .map_or_else(String::new, |ideation| ideation.label.clone()),
-                logo: Some("claude".into()),
-            }]
-        } else {
-            self.servers.as_ref().map_or_else(Vec::new, |servers| {
-                fleet_agents(
-                    servers.read(cx).agents_of(&summary.name),
-                    &self.config.agents,
-                )
-            })
-        };
-        let view = entry.view.as_ref().map(|view| view.read(cx));
-        FleetSession {
-            name: summary.name.clone(),
-            display_name: summary.display_name.clone(),
-            // Un bouillon n'a pas de projet : son dossier d'idéation n'a rien à faire sur le téléphone.
-            project: if summary.ideation {
-                String::new()
-            } else {
-                summary.project.to_string_lossy().into_owned()
-            },
-            ideation: summary.ideation,
-            state: state_label(summary.state),
-            state_since: unix_millis(entry.state_since),
-            seen: view.is_some_and(SessionView::is_seen),
-            agents,
-            panes: view.map_or_else(Vec::new, |view| {
-                view.pane_states(cx)
-                    .into_iter()
-                    .map(|(pane, active, state)| FleetPane {
-                        id: pane.0,
-                        active,
-                        state: state_label(state),
-                    })
-                    .collect()
-            }),
-        }
-    }
-
-    /// Dit au service du compagnon qu'une session a changé d'état (sans effet compagnon éteint).
+    /// Range dans la chronologie du compagnon le changement d'état d'une session (sans effet compagnon éteint).
     fn report_transition(
         &self,
-        session: String,
+        session: &str,
         from: ActivityState,
         to: ActivityState,
         at: SystemTime,
     ) {
-        self.companion.send(ServiceEvent::Transition {
-            session,
-            from,
-            to,
-            at,
-        });
+        self.companion.record_transition(session, from, to, at);
     }
 
     /// Une session change d'état : la barre, le badge et, au passage en « attend » d'une session non vue, le son.
@@ -4066,7 +4023,7 @@ impl Workspace {
         {
             self.chime(&format!("session={name}"));
         }
-        self.report_transition(name, previous, current, now);
+        self.report_transition(&name, previous, current, now);
         self.refresh_badge(cx);
         cx.notify();
     }
@@ -4411,7 +4368,7 @@ impl Workspace {
         let left = entry.enter_state(ActivityState::Idle, now);
         entry.unreachable = Some(raw);
         if let Some(previous) = left {
-            self.report_transition(name.to_owned(), previous, ActivityState::Idle, now);
+            self.companion.record_reset(name, previous, now);
         }
         self.refresh_badge(cx);
         if self.selected_name() == Some(name) {
@@ -4437,6 +4394,11 @@ impl Workspace {
                 neighbor_after_close(&order, name).map(str::to_owned)
             })
             .flatten();
+        // Une attente ou une erreur ouverte se clôt dans la chronologie : la session n'existe plus.
+        if let Some(entry) = self.entries.iter().find(|entry| entry.summary.name == name) {
+            self.companion
+                .record_reset(name, entry.summary.state, SystemTime::now());
+        }
         self.entries.retain(|entry| entry.summary.name != name);
         self.refresh_badge(cx);
         if was_selected {

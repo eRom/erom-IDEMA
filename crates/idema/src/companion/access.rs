@@ -155,8 +155,6 @@ impl Access {
             ServiceEvent::ForgetDevice { id } => {
                 self.forget(&id);
             }
-            // Les transitions vont à la chronologie (`service::control_loop`), pas à l'accès.
-            ServiceEvent::Transition { .. } => {}
         }
     }
 

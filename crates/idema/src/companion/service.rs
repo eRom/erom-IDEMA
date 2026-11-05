@@ -4,9 +4,9 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::{Either, select};
@@ -50,6 +50,9 @@ pub struct ServiceDeps {
     pub status: watch::Sender<ServiceStatus>,
     /// Le dernier instantané de la flotte, publié par l'espace de travail (`CompanionController::publish`).
     pub fleet: watch::Receiver<Arc<Fleet>>,
+    /// La chronologie, qui appartient au contrôleur : elle vit autant qu'IdemA, pas autant que ce service (un
+    /// redémarrage du service sur un autre port la garde). Le service la lit ; l'espace de travail y écrit.
+    pub timeline: Arc<Mutex<Timeline>>,
     /// Le fil du service précédent, quand celui-ci le remplace : le nouveau le joint (sur son propre fil, jamais celui
     /// de l'interface) avant de lier la prise, pour ne pas la trouver encore occupée.
     pub previous: Option<JoinHandle<()>>,
@@ -109,6 +112,7 @@ struct Serving {
     test_routes: bool,
     bind_retry: Duration,
     fleet: watch::Receiver<Arc<Fleet>>,
+    timeline: Arc<Mutex<Timeline>>,
 }
 
 /// Le corps du fil.
@@ -120,6 +124,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         events,
         status,
         fleet,
+        timeline,
         previous,
         test_routes,
         ..
@@ -174,6 +179,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
             Duration::ZERO
         },
         fleet,
+        timeline,
     };
     let served = runtime.block_on(serve(serving, &status, access, events, stop));
     // Le runtime est abandonné ici : ses tâches restantes (flux en retard, appel bloquant) ne retiennent plus le fil.
@@ -201,6 +207,7 @@ async fn serve(
         test_routes,
         bind_retry,
         fleet,
+        timeline,
     } = serving;
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = match bind(address, bind_retry).await {
@@ -216,15 +223,8 @@ async fn serve(
     if test_routes {
         hud::log_event("companion test routes active");
     }
-    // La chronologie vit autant que le service : elle est perdue à son arrêt, et son instant de démarrage est celui-ci.
-    let timeline = Arc::new(Mutex::new(Timeline::new(SystemTime::now())));
-    // Les gestes de Personnaliser (code, oubli), les transitions et l'échéance du code : une tâche du runtime, qui
-    // s'arrête avec lui.
-    tokio::spawn(control_loop(
-        events,
-        Arc::clone(&access),
-        Arc::clone(&timeline),
-    ));
+    // Les gestes de Personnaliser (code, oubli) et l'échéance du code : une tâche du runtime, qui s'arrête avec lui.
+    tokio::spawn(control_loop(events, Arc::clone(&access)));
     let state = AppState {
         version,
         stop: stop.clone(),
@@ -265,14 +265,10 @@ async fn serve(
     }
 }
 
-/// Applique les événements de l'espace de travail : les transitions à la chronologie, les gestes de Personnaliser à
-/// l'état d'accès. Fait aussi disparaître le code d'appairage à son échéance. S'arrête quand l'espace de travail
-/// ferme la file (service retiré). Sans code en cours, la tâche dort sur la file : aucune minuterie.
-async fn control_loop(
-    mut events: UnboundedReceiver<ServiceEvent>,
-    access: Arc<Access>,
-    timeline: Arc<Mutex<Timeline>>,
-) {
+/// Applique les gestes de Personnaliser à l'état d'accès, et fait disparaître le code d'appairage à son échéance.
+/// S'arrête quand l'espace de travail ferme la file (service retiré). Sans code en cours, la tâche dort sur la file :
+/// aucune minuterie.
+async fn control_loop(mut events: UnboundedReceiver<ServiceEvent>, access: Arc<Access>) {
     loop {
         let event = match access.pairing_deadline() {
             Some(deadline) => {
@@ -294,20 +290,6 @@ async fn control_loop(
         let Some(event) = event else {
             return;
         };
-        if let ServiceEvent::Transition {
-            session,
-            from,
-            to,
-            at,
-        } = event
-        {
-            // Une insertion en mémoire : pas de disque, donc pas de `spawn_blocking`.
-            timeline
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .record(&session, from, to, at);
-            continue;
-        }
         let access = Arc::clone(&access);
         // L'oubli d'un appareil écrit sur disque : hors du runtime.
         let _ = tokio::task::spawn_blocking(move || access.handle(event)).await;

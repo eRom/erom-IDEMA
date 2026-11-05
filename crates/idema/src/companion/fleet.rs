@@ -2,7 +2,7 @@
 //! par session, son état, l'instant où elle y est entrée, ses agents et ses panes. Les clés JSON sont les noms des
 //! champs. Rien ici ne dépend de GPUI : l'espace de travail remplit les structures, le service les sert.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::assets::logo_path;
 use crate::config::AgentEntry;
+use crate::sidebar_model::{SessionSummary, dock_badge_count, navigation_order};
 
 /// La flotte entière, telle que `GET fleet` la rend et que le flux `events` la pousse.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -152,6 +153,77 @@ pub fn fleet_agents(names: &[String], launchers: &[AgentEntry]) -> Vec<FleetAgen
     agents
 }
 
+/// Ce que l'espace de travail sait d'une session, avant d'en faire une ligne de l'instantané.
+pub struct SessionInput {
+    pub summary: SessionSummary,
+    pub state_since: SystemTime,
+    pub seen: bool,
+    /// Les noms des agents reconnus dans ses panes (relevé des serveurs) ; ignorés pour un bouillon.
+    pub agent_names: Vec<String>,
+    pub panes: Vec<FleetPane>,
+}
+
+/// Compose l'instantané : les sessions dans l'ordre de la barre avec tous les projets dépliés (les bouillons en tête
+/// quand `[ideation]` est présente, donc `ideation_label` est `Some`), le badge du Dock, et pour chaque session ses
+/// agents. Un bouillon porte toujours le logo de Claude sous le libellé de la section, et n'a pas de projet. Sans
+/// `[ideation]`, les bouillons n'y figurent pas.
+pub fn compose_fleet(
+    mac: &str,
+    now: SystemTime,
+    ideation_label: Option<&str>,
+    projects: &[PathBuf],
+    launchers: &[AgentEntry],
+    sessions: Vec<SessionInput>,
+) -> Fleet {
+    let summaries: Vec<SessionSummary> = sessions
+        .iter()
+        .map(|session| session.summary.clone())
+        .collect();
+    let order = navigation_order(projects, |_| true, ideation_label.is_some(), &summaries);
+    let sessions = order
+        .iter()
+        .filter_map(|name| {
+            sessions
+                .iter()
+                .find(|session| session.summary.name == *name)
+        })
+        .map(|session| {
+            let summary = &session.summary;
+            let agents = if summary.ideation {
+                vec![FleetAgent {
+                    label: ideation_label.unwrap_or_default().to_owned(),
+                    logo: Some("claude".into()),
+                }]
+            } else {
+                fleet_agents(&session.agent_names, launchers)
+            };
+            FleetSession {
+                name: summary.name.clone(),
+                display_name: summary.display_name.clone(),
+                project: if summary.ideation {
+                    String::new()
+                } else {
+                    summary.project.to_string_lossy().into_owned()
+                },
+                ideation: summary.ideation,
+                state: state_label(summary.state),
+                state_since: unix_millis(session.state_since),
+                seen: session.seen,
+                agents,
+                panes: session.panes.clone(),
+            }
+        })
+        .collect();
+    Fleet {
+        mac: mac.to_owned(),
+        generated_at: unix_millis(now),
+        badge: dock_badge_count(summaries.iter(), ideation_label.is_some()),
+        ideation_label: ideation_label.map(str::to_owned),
+        projects: projects.iter().map(|path| project_of(path)).collect(),
+        sessions,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +276,100 @@ mod tests {
             agents.len(),
             crate::sidebar::agent_marks(&names, &launchers).len()
         );
+    }
+
+    fn input(name: &str, project: &str, ideation: bool, state: ActivityState) -> SessionInput {
+        SessionInput {
+            summary: SessionSummary {
+                name: name.into(),
+                project: PathBuf::from(project),
+                display_name: name.to_uppercase(),
+                created: 0,
+                state,
+                ideation,
+            },
+            state_since: UNIX_EPOCH + std::time::Duration::from_secs(100),
+            seen: false,
+            agent_names: vec!["Faux".into()],
+            panes: vec![FleetPane {
+                id: 1,
+                active: true,
+                state: state_label(state),
+            }],
+        }
+    }
+
+    fn compose(label: Option<&str>, sessions: Vec<SessionInput>) -> Fleet {
+        let projects = [PathBuf::from("/b"), PathBuf::from("/a")];
+        let launchers = [entry("Faux", Some("gemini"))];
+        compose_fleet(
+            "Mac",
+            UNIX_EPOCH + std::time::Duration::from_secs(200),
+            label,
+            &projects,
+            &launchers,
+            sessions,
+        )
+    }
+
+    #[test]
+    fn the_fleet_follows_the_bar_with_ideation_first() {
+        let fleet = compose(
+            Some("Fable"),
+            vec![
+                input("in-a", "/a", false, ActivityState::Idle),
+                input("in-b", "/b", false, ActivityState::Running),
+                input("brew", "/ideation", true, ActivityState::Waiting),
+            ],
+        );
+        // Les bouillons d'abord, puis les projets dans l'ordre de la barre (/b avant /a), pas l'ordre des entrées.
+        let names: Vec<_> = fleet.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["brew", "in-b", "in-a"]);
+        assert_eq!(fleet.ideation_label.as_deref(), Some("Fable"));
+        assert_eq!(fleet.generated_at, 200_000);
+        assert_eq!(fleet.mac, "Mac");
+        let projects: Vec<_> = fleet.projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(projects, ["b", "a"]);
+
+        let brew = &fleet.sessions[0];
+        assert!(brew.ideation);
+        assert_eq!(brew.project, "", "a brew has no project");
+        assert_eq!(
+            brew.agents,
+            [FleetAgent {
+                label: "Fable".into(),
+                logo: Some("claude".into())
+            }],
+            "the section label and the claude logo, whatever the process scan says"
+        );
+        assert_eq!((brew.state, brew.state_since), ("waiting", 100_000));
+        assert_eq!(fleet.badge, 1, "the waiting brew counts in the badge");
+
+        let in_b = &fleet.sessions[1];
+        assert_eq!(in_b.project, "/b");
+        assert_eq!(
+            in_b.agents,
+            [FleetAgent {
+                label: "Faux".into(),
+                logo: Some("gemini".into())
+            }]
+        );
+        assert_eq!(in_b.panes.len(), 1);
+    }
+
+    #[test]
+    fn without_ideation_the_brews_are_not_in_the_fleet() {
+        let fleet = compose(
+            None,
+            vec![
+                input("in-a", "/a", false, ActivityState::Error),
+                input("brew", "/ideation", true, ActivityState::Waiting),
+            ],
+        );
+        let names: Vec<_> = fleet.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["in-a"]);
+        assert_eq!(fleet.ideation_label, None);
+        assert_eq!(fleet.badge, 1, "only the project session counts");
     }
 
     #[test]
