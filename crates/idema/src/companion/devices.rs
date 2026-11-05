@@ -191,7 +191,6 @@ impl DeviceStore {
     }
 
     /// Pose l'abonnement de l'appareil. Un `endpoint` n'appartient qu'à un appareil : il est retiré des autres.
-    #[allow(dead_code, reason = "lu par la tâche 7 (abonnement)")]
     pub fn set_subscription(&mut self, id: &str, sub: Subscription) -> io::Result<()> {
         let written = self.mutate(|devices| {
             devices.iter().position(|device| device.id == id)?;
@@ -213,7 +212,6 @@ impl DeviceStore {
     }
 
     /// Retire l'abonnement qui porte cet `endpoint`, chez qui qu'il soit. Rend faux s'il n'y en avait pas.
-    #[allow(dead_code, reason = "lu par la tâche 7 (désabonnement)")]
     pub fn remove_endpoint(&mut self, endpoint: &str) -> io::Result<bool> {
         Ok(self
             .mutate(|devices| {

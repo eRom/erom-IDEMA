@@ -62,7 +62,7 @@ pub fn request_body(prompt: &str) -> String {
 /// Une valeur entre guillemets dans une configuration curl : `\` doublé, `"` échappé. Les retours à la ligne et
 /// tabulations réels sont écrits en échappements : une clé collée avec un saut de ligne ne doit pas pouvoir ouvrir
 /// une directive de plus.
-fn escape_value(value: &str) -> String {
+pub(crate) fn escape_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {

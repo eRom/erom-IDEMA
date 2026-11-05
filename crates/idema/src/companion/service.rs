@@ -16,6 +16,7 @@ use tokio::sync::{mpsc::UnboundedReceiver, watch};
 use super::access::Access;
 use super::devices::DeviceStore;
 use super::fleet::Fleet;
+use super::push_send::{PushSender, override_host};
 use super::server::{AppState, router, stopped};
 use super::timeline::Timeline;
 use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
@@ -55,6 +56,9 @@ pub struct ServiceDeps {
     pub previous: Option<JoinHandle<()>>,
     /// Les routes de test existent-elles ? Décidé par le contrôleur (`auth::test_routes_enabled`).
     pub test_routes: bool,
+    /// L'adresse qui remplace celle de chaque abonnement à l'envoi, décidée par le contrôleur
+    /// (`push_send::override_endpoint`) : toujours `None` hors instance d'acceptation.
+    pub push_override: Option<String>,
 }
 
 /// La poignée que garde le contrôleur : de quoi demander l'arrêt, puis joindre le fil.
@@ -107,6 +111,8 @@ struct Serving {
     version: &'static str,
     known_origin: Option<String>,
     test_routes: bool,
+    push: Option<Arc<PushSender>>,
+    push_override: Option<String>,
     bind_retry: Duration,
     fleet: watch::Receiver<Arc<Fleet>>,
     timeline: Arc<Mutex<Timeline>>,
@@ -128,6 +134,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         timeline,
         previous,
         test_routes,
+        push_override,
         ..
     } = deps;
     let status = Arc::new(status);
@@ -154,6 +161,17 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         }
     };
     let access = Arc::new(Access::new(devices, Arc::clone(&status)));
+    // Une clé VAPID illisible ne prive pas le téléphone de la flotte : seules les routes push répondent 503.
+    let push = match PushSender::open(&dir, push_override.clone()) {
+        Ok(push) => Some(Arc::new(push)),
+        Err(error) => {
+            hud::log_event(&format!(
+                "companion push failed kind=setup reason=key_unavailable io_kind={:?}",
+                error.kind()
+            ));
+            None
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -174,6 +192,8 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         version,
         known_origin: config.public_url,
         test_routes,
+        push,
+        push_override,
         bind_retry: if restarted {
             RESTART_BIND_RETRY
         } else {
@@ -208,6 +228,8 @@ async fn serve(
         version,
         known_origin,
         test_routes,
+        push,
+        push_override,
         bind_retry,
         fleet,
         timeline,
@@ -228,6 +250,12 @@ async fn serve(
     if test_routes {
         hud::log_event("companion test routes active");
     }
+    if let Some(url) = &push_override {
+        hud::log_event(&format!(
+            "companion push override active endpoint_host={}",
+            override_host(url)
+        ));
+    }
     // Les gestes de Personnaliser (code, oubli) et l'échéance du code : une tâche du runtime, qui s'arrête avec lui.
     tokio::spawn(control_loop(events, Arc::clone(&access)));
     let state = AppState {
@@ -241,6 +269,7 @@ async fn serve(
         timeline,
         tmux,
         commands,
+        push,
     };
     let server = axum::serve(listener, router(state))
         .with_graceful_shutdown(stopped(stop.clone()))

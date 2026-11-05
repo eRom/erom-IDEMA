@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use idema_tmux::server::TmuxServer;
@@ -22,12 +22,15 @@ use tokio::sync::{oneshot, watch};
 
 use super::access::{Access, Caller};
 use super::auth::{COOKIE_NAME, cookie_header, origin_allowed};
+use super::devices::Subscription;
 use super::fleet::Fleet;
 use super::input::{self, HTTP_WAIT};
+use super::push_send::{Delivery, PushSender, endpoint_allowed};
 use super::screen;
 use super::sse::{self, COALESCE};
 use super::timeline::Timeline;
 use super::web_assets;
+use super::webpush::UaKeys;
 use super::{AckOrigin, InputOutcome, PaneCommand, PaneProbe, ServiceEvent};
 use crate::hud;
 
@@ -69,6 +72,8 @@ pub struct AppState {
     pub tmux: Arc<TmuxServer>,
     /// La file des commandes sur un pane, traitées par l'espace de travail sur le fil d'interface.
     pub commands: UnboundedSender<PaneCommand>,
+    /// L'envoi des notifications. `None` : la clé VAPID est illisible, les routes push répondent 503.
+    pub push: Option<Arc<PushSender>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -85,7 +90,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/idema-api/sessions/{name}/panes/{pane}/input", post(input))
         .route("/idema-api/sessions/{name}/panes/{pane}/ack", post(ack))
-        .route("/idema-api/client-metrics", post(client_metrics));
+        .route("/idema-api/client-metrics", post(client_metrics))
+        .route("/idema-api/push/key", get(push_key))
+        .route(
+            "/idema-api/push/subscription",
+            put(push_subscribe).delete(push_unsubscribe),
+        )
+        .route("/idema-api/push/test", post(push_test));
     if state.test_routes {
         router = router
             .route(TEST_PAIRING_CODE_PATH, post(test_pairing_code))
@@ -590,6 +601,158 @@ async fn client_metrics(body: Bytes) -> Response {
     };
     hud::log_event(&format!("companion client metric name={name} ms={ms}"));
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// La notification de test (spec §3.7) : un titre et un corps fixes, pour l'appareil qui la demande.
+const TEST_TITLE: &str = "Notification de test";
+const TEST_BODY: &str = "IdemA peut te joindre.";
+
+fn push_unavailable() -> Response {
+    error_reply(StatusCode::SERVICE_UNAVAILABLE, "push_unavailable")
+}
+
+/// `GET push/key` : la clé publique VAPID, que la page compare à celle de son abonnement.
+async fn push_key(State(state): State<AppState>) -> Response {
+    let Some(push) = state.push.as_ref() else {
+        return push_unavailable();
+    };
+    json_reply(
+        StatusCode::OK,
+        serde_json::json!({ "key": push.public_key() }).to_string(),
+    )
+}
+
+/// Le corps de `PUT push/subscription` : ce que `PushSubscription.toJSON()` donne (le reste est ignoré).
+#[derive(Deserialize)]
+struct SubscriptionBody {
+    endpoint: String,
+    keys: SubscriptionKeys,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionKeys {
+    p256dh: String,
+    auth: String,
+}
+
+/// `PUT push/subscription` : l'abonnement de l'appareil qui appelle. Un même `endpoint` n'est gardé qu'une fois.
+async fn push_subscribe(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    body: Bytes,
+) -> Response {
+    if state.push.is_none() {
+        return push_unavailable();
+    }
+    let Ok(SubscriptionBody { endpoint, keys }) = serde_json::from_slice(&body) else {
+        return error_reply(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    if !endpoint_allowed(&endpoint) {
+        return error_reply(StatusCode::BAD_REQUEST, "endpoint_not_allowed");
+    }
+    let subscription = Subscription {
+        endpoint,
+        p256dh: keys.p256dh,
+        auth: keys.auth,
+    };
+    // Les clés du navigateur sont contrôlées ici : un abonnement qu'on ne saurait pas chiffrer ne servirait à rien.
+    if UaKeys::from_subscription(&subscription).is_err() {
+        return error_reply(StatusCode::BAD_REQUEST, "bad_subscription");
+    }
+    let access = Arc::clone(&state.access);
+    let written =
+        tokio::task::spawn_blocking(move || access.set_subscription(&caller.id, subscription))
+            .await;
+    match written {
+        Ok(Ok(())) => json_reply(
+            StatusCode::OK,
+            serde_json::json!({ "ok": true }).to_string(),
+        ),
+        // L'appareil a été oublié entre la garde et l'écriture.
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            error_reply(StatusCode::UNAUTHORIZED, "unpaired")
+        }
+        _ => error_reply(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+/// `DELETE push/subscription` : retire l'abonnement de l'appareil qui appelle, sans toucher aux autres.
+async fn push_unsubscribe(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    let access = Arc::clone(&state.access);
+    let removed = tokio::task::spawn_blocking(move || access.clear_subscription(&caller.id)).await;
+    match removed {
+        Ok(Ok(removed)) => {
+            if removed {
+                hud::log_event("companion subscription removed reason=unsubscribed");
+            }
+            json_reply(
+                StatusCode::OK,
+                serde_json::json!({ "ok": true }).to_string(),
+            )
+        }
+        _ => error_reply(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+/// `POST push/test` : envoie « Notification de test » à l'appareil qui demande, et à lui seul. La réponse dit ce que
+/// le service push a répondu ; un abonnement qu'il déclare mort est retiré, comme à un vrai envoi.
+async fn push_test(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> Response {
+    let Some(push) = state.push.clone() else {
+        return push_unavailable();
+    };
+    let Some(subscription) = state.access.subscription_of(&caller.id) else {
+        return error_reply(StatusCode::CONFLICT, "not_subscribed");
+    };
+    let access = Arc::clone(&state.access);
+    let sent = tokio::task::spawn_blocking(move || {
+        let payload = serde_json::json!({
+            "title": TEST_TITLE,
+            "body": TEST_BODY,
+            "type": "test",
+            "url": "/",
+        })
+        .to_string();
+        let (delivery, status) = push.deliver(&subscription, "test", payload.as_bytes());
+        let status_text = status.map_or_else(|| "none".to_owned(), |code| code.to_string());
+        if delivery == Delivery::Sent {
+            hud::log_event("companion push sent kind=test");
+        } else {
+            hud::log_event(&format!(
+                "companion push failed kind=test reason={} status={status_text}",
+                delivery.as_str()
+            ));
+        }
+        if delivery == Delivery::Gone {
+            // L'abonnement est mort ou n'est plus le nôtre : le retirer, la page se réabonnera.
+            match access.remove_endpoint(&subscription.endpoint) {
+                Ok(true) => hud::log_event(&format!(
+                    "companion subscription removed reason=http_{status_text}"
+                )),
+                Ok(false) => {}
+                Err(_) => {} // `remove_endpoint` a déjà écrit l'échec au journal
+            }
+        }
+        delivery
+    })
+    .await;
+    match sent {
+        Ok(Delivery::Sent) => json_reply(
+            StatusCode::OK,
+            serde_json::json!({ "result": "sent" }).to_string(),
+        ),
+        Ok(other) => json_reply(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({ "error": format!("push_{}", other.as_str()), "result": other.as_str() })
+                .to_string(),
+        ),
+        Err(_) => error_reply(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
 }
 
 /// Les routes de test ne servent que des requêtes locales : tout ce qui porte un en-tête de relais du tailnet est refusé.
@@ -1772,5 +1935,301 @@ mod tests {
             assert_eq!(wrong_type.status, 415);
             assert!(received.try_recv().is_err());
         }
+    }
+
+    // ---- push : clé, abonnements, notification de test ----
+
+    use crate::companion::test_support::FakePush;
+
+    const KEY: &str = "/idema-api/push/key";
+    const SUBSCRIPTION: &str = "/idema-api/push/subscription";
+    const TEST_PUSH: &str = "/idema-api/push/test";
+    const IPAD: &str = "Mozilla/5.0 (iPad; CPU OS 19_0 like Mac OS X)";
+
+    /// Le corps de `PushSubscription.toJSON()` d'un téléphone, avec de vraies clés (point valide de la courbe).
+    fn subscription_body(endpoint: &str) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let private = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let public = private.public_key().to_encoded_point(false);
+        serde_json::json!({
+            "endpoint": endpoint,
+            "expirationTime": null,
+            "keys": { "p256dh": B64.encode(public.as_bytes()), "auth": B64.encode([5u8; 16]) },
+        })
+        .to_string()
+    }
+
+    fn put_subscription(service: &Harness, cookie: &str, endpoint: &str) -> Reply {
+        service.request(
+            "PUT",
+            SUBSCRIPTION,
+            &[JSON, ("Cookie", cookie)],
+            Some(&subscription_body(endpoint)),
+        )
+    }
+
+    fn me(service: &Harness, cookie: &str) -> serde_json::Value {
+        service
+            .request("GET", "/idema-api/me", &[("Cookie", cookie)], None)
+            .json()
+    }
+
+    /// Les `endpoint` que `devices.json` garde, appareil par appareil (`None` : sans abonnement).
+    fn stored_endpoints(service: &Harness) -> Vec<Option<String>> {
+        let file = std::fs::read(service.home.0.join("companion/devices.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&file).unwrap();
+        json["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|device| {
+                device["subscription"]["endpoint"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_push_key_is_the_vapid_public_key_and_asks_for_a_cookie() {
+        let service = Harness::start(true);
+        assert_eq!(service.request("GET", KEY, &[], None).status, 401);
+        let cookie = service.pair(IPHONE);
+        let reply = service.request("GET", KEY, &[("Cookie", &cookie)], None);
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        let key = reply.json()["key"].as_str().unwrap().to_owned();
+        assert_eq!(key.len(), 87, "an uncompressed P-256 point in base64url");
+        let stored = crate::companion::webpush::Vapid::load_or_create(&service.home.0).unwrap();
+        assert_eq!(key, stored.public_key_b64url());
+        assert_hardened(&reply, "push key");
+    }
+
+    #[test]
+    fn a_subscription_is_checked_then_kept_once_whatever_the_device() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let tablet = service.pair(IPAD);
+        let put = |cookie: &str, body: &str| {
+            service.request("PUT", SUBSCRIPTION, &[JSON, ("Cookie", cookie)], Some(body))
+        };
+
+        // Refus : rien n'est gardé.
+        assert_eq!(put(&phone, "not json").status, 400);
+        assert_eq!(put(&phone, "{}").status, 400);
+        let refused = put_subscription(&service, &phone, "https://evil.example/x");
+        assert_eq!(refused.status, 400);
+        assert_eq!(refused.json()["error"], "endpoint_not_allowed");
+        let http = put_subscription(&service, &phone, "http://web.push.apple.com/x");
+        assert_eq!(http.json()["error"], "endpoint_not_allowed");
+        let bad_keys = serde_json::json!({
+            "endpoint": "https://web.push.apple.com/QXX",
+            "keys": { "p256dh": "AAAA", "auth": "AAAA" },
+        })
+        .to_string();
+        let bad = put(&phone, &bad_keys);
+        assert_eq!(bad.status, 400);
+        assert_eq!(bad.json()["error"], "bad_subscription");
+        assert_eq!(stored_endpoints(&service), [None, None]);
+        let no_type = service.request(
+            "PUT",
+            SUBSCRIPTION,
+            &[("Cookie", &phone)],
+            Some(&subscription_body("https://web.push.apple.com/QXX")),
+        );
+        assert_eq!(no_type.status, 415);
+        let no_cookie = service.request(
+            "PUT",
+            SUBSCRIPTION,
+            &[JSON],
+            Some(&subscription_body("https://web.push.apple.com/QXX")),
+        );
+        assert_eq!(no_cookie.status, 401);
+
+        // Le même endpoint donné deux fois par le même appareil : un seul abonnement.
+        let endpoint = "https://web.push.apple.com/QXX-shared";
+        assert_eq!(put_subscription(&service, &phone, endpoint).status, 200);
+        assert_eq!(put_subscription(&service, &phone, endpoint).status, 200);
+        assert_eq!(
+            stored_endpoints(&service)
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            [endpoint]
+        );
+        assert_eq!(me(&service, &phone)["subscribed"], true);
+        service.wait(|status| status.devices.iter().any(|device| device.subscribed));
+
+        // Le même endpoint donné par un autre appareil : il n'appartient plus qu'à lui.
+        assert_eq!(put_subscription(&service, &tablet, endpoint).status, 200);
+        assert_eq!(
+            stored_endpoints(&service),
+            [None, Some(endpoint.to_owned())]
+        );
+        assert_eq!(me(&service, &phone)["subscribed"], false);
+        assert_eq!(me(&service, &tablet)["subscribed"], true);
+    }
+
+    #[test]
+    fn unsubscribing_removes_the_callers_subscription_only() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let tablet = service.pair(IPAD);
+        let tablet_endpoint = "https://web.push.apple.com/QXX-tablet";
+        put_subscription(&service, &phone, "https://web.push.apple.com/QXX-phone");
+        put_subscription(&service, &tablet, tablet_endpoint);
+
+        let removed = service.request("DELETE", SUBSCRIPTION, &[JSON, ("Cookie", &phone)], None);
+        assert_eq!(removed.status, 200, "{}", removed.text());
+        assert_eq!(
+            stored_endpoints(&service),
+            [None, Some(tablet_endpoint.to_owned())],
+            "the tablet keeps its own"
+        );
+        assert_eq!(me(&service, &phone)["subscribed"], false);
+        assert_eq!(me(&service, &tablet)["subscribed"], true);
+        // Retirer deux fois ne casse rien.
+        let again = service.request("DELETE", SUBSCRIPTION, &[JSON, ("Cookie", &phone)], None);
+        assert_eq!(again.status, 200);
+        let stranger = service.request("DELETE", SUBSCRIPTION, &[JSON], None);
+        assert_eq!(stranger.status, 401);
+    }
+
+    #[test]
+    fn the_test_push_goes_to_the_asking_device_only() {
+        let fake = FakePush::start(201, "");
+        let service = Harness::start_with_push(TempDir::new("push-test"), fake.url());
+        let phone = service.pair(IPHONE);
+        let tablet = service.pair(IPAD);
+        put_subscription(&service, &phone, "https://web.push.apple.com/QXX-phone");
+        put_subscription(&service, &tablet, "https://web.push.apple.com/QXX-tablet");
+
+        let sent = service.request("POST", TEST_PUSH, &[JSON, ("Cookie", &phone)], Some("{}"));
+        assert_eq!(sent.status, 200, "{}", sent.text());
+        assert_eq!(sent.json()["result"], "sent");
+        let requests = fake.wait_for(1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(fake.requests().len(), 1, "one request for one device");
+        assert_eq!(requests[0].path, "/QXX-phone");
+        assert_eq!(requests[0].header("Topic").unwrap().len(), 32);
+        assert!(
+            requests[0]
+                .header("Authorization")
+                .unwrap()
+                .starts_with("vapid t=")
+        );
+        assert_eq!(requests[0].header("Content-Encoding"), Some("aes128gcm"));
+
+        // L'autre appareil a sa propre notification, chiffrée pour lui.
+        let sent = service.request("POST", TEST_PUSH, &[JSON, ("Cookie", &tablet)], Some("{}"));
+        assert_eq!(sent.status, 200);
+        let requests = fake.wait_for(2);
+        assert_eq!(requests[1].path, "/QXX-tablet");
+        assert_ne!(
+            requests[0].body, requests[1].body,
+            "each device gets its own ciphertext"
+        );
+        // Le message de test ne retire rien.
+        assert_eq!(stored_endpoints(&service).iter().flatten().count(), 2);
+    }
+
+    #[test]
+    fn the_test_push_needs_a_subscription_and_a_cookie() {
+        let fake = FakePush::start(201, "");
+        let service = Harness::start_with_push(TempDir::new("push-none"), fake.url());
+        let stranger = service.request("POST", TEST_PUSH, &[JSON], Some("{}"));
+        assert_eq!(stranger.status, 401);
+        let phone = service.pair(IPHONE);
+        let reply = service.request("POST", TEST_PUSH, &[JSON, ("Cookie", &phone)], Some("{}"));
+        assert_eq!(reply.status, 409);
+        assert_eq!(reply.json()["error"], "not_subscribed");
+        assert!(
+            fake.requests().is_empty(),
+            "nothing is sent without a subscription"
+        );
+    }
+
+    #[test]
+    fn the_answers_of_the_push_service_decide_what_happens_to_the_subscription() {
+        // (code, corps, résultat, l'abonnement reste-t-il ?)
+        let cases = [
+            (410, "", "gone", false),
+            (404, "", "gone", false),
+            (403, "VapidPkHashMismatch", "gone", false),
+            (403, "BadVapidPublicKey", "gone", false),
+            (403, "ExpiredJwt", "failed", true),
+            (413, "", "too_large", true),
+            (429, "", "retry_later", true),
+            (503, "", "retry_later", true),
+            (400, "", "failed", true),
+        ];
+        for (status, body, result, kept) in cases {
+            let fake = FakePush::start(status, body);
+            let service = Harness::start_with_push(TempDir::new("push-answers"), fake.url());
+            let phone = service.pair(IPHONE);
+            let endpoint = "https://web.push.apple.com/QXX-answers";
+            put_subscription(&service, &phone, endpoint);
+
+            let reply = service.request("POST", TEST_PUSH, &[JSON, ("Cookie", &phone)], Some("{}"));
+
+            let label = format!("{status} {body}");
+            assert_eq!(reply.status, 502, "{label}");
+            assert_eq!(reply.json()["result"], result, "{label}");
+            assert_eq!(
+                stored_endpoints(&service),
+                [kept.then(|| endpoint.to_owned())],
+                "{label}"
+            );
+            assert_eq!(me(&service, &phone)["subscribed"], kept, "{label}");
+            // Le message de test n'est jamais renvoyé de lui-même, même sur un 429.
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(fake.requests().len(), 1, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_push_service_that_hangs_up_ends_the_test_push_as_retry_later() {
+        // La coupure à 10 s de curl se joue en VM (ac103) ; ici, un service qui ferme la connexion sans répondre.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                drop(stream);
+            }
+        });
+        let service = Harness::start_with_push(
+            TempDir::new("push-closed"),
+            format!("http://127.0.0.1:{port}"),
+        );
+        let phone = service.pair(IPHONE);
+        put_subscription(&service, &phone, "https://web.push.apple.com/QXX-closed");
+        let reply = service.request("POST", TEST_PUSH, &[JSON, ("Cookie", &phone)], Some("{}"));
+        assert_eq!(reply.status, 502);
+        assert_eq!(reply.json()["result"], "retry_later");
+        assert_eq!(me(&service, &phone)["subscribed"], true, "kept for a retry");
+    }
+
+    #[test]
+    fn an_unreadable_vapid_key_closes_the_push_routes_but_not_the_service() {
+        let home = TempDir::new("push-badkey");
+        std::fs::create_dir_all(home.0.join("companion")).unwrap();
+        std::fs::write(home.0.join("companion/vapid.key"), b"short").unwrap();
+        let service = Harness::start_in(home, true);
+        let phone = service.pair(IPHONE);
+        let cookie = ("Cookie", phone.as_str());
+        assert_eq!(service.request("GET", KEY, &[cookie], None).status, 503);
+        let subscribed = put_subscription(&service, &phone, "https://web.push.apple.com/QXX");
+        assert_eq!(subscribed.status, 503);
+        let test = service.request("POST", TEST_PUSH, &[JSON, cookie], Some("{}"));
+        assert_eq!(test.status, 503);
+        assert_eq!(test.json()["error"], "push_unavailable");
+        let fleet = service.request("GET", "/idema-api/fleet", &[cookie], None);
+        assert_eq!(fleet.status, 200);
+        assert_eq!(
+            std::fs::read(service.home.0.join("companion/vapid.key")).unwrap(),
+            b"short",
+            "a damaged key is never replaced"
+        );
     }
 }

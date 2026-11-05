@@ -18,7 +18,7 @@ use p256::ecdsa::signature::Signer;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use super::devices::Subscription;
 
@@ -49,6 +49,8 @@ pub enum PushError {
     BadRecordSize,
     /// Dérivation ou chiffrement refusé par la bibliothèque.
     Crypto,
+    /// Le point d'accès n'est pas une URL HTTP(S) : aucune origine à signer.
+    BadEndpoint,
 }
 
 impl std::fmt::Display for PushError {
@@ -58,6 +60,7 @@ impl std::fmt::Display for PushError {
             Self::PayloadTooLarge => f.write_str("payload does not fit one record"),
             Self::BadRecordSize => f.write_str("record size too small"),
             Self::Crypto => f.write_str("encryption failed"),
+            Self::BadEndpoint => f.write_str("endpoint is not an http(s) url"),
         }
     }
 }
@@ -214,16 +217,16 @@ impl Vapid {
     }
 
     /// L'en-tête `Authorization: vapid t=<jwt>, k=<clé>` pour l'origine de `endpoint`. Le jeton signé est gardé 12 h
-    /// par origine. Un `endpoint` sans origine HTTP(S) est signé tel quel et le service push le refusera : la forme
-    /// de l'abonnement se contrôle en amont, à son enregistrement.
-    pub fn authorization(&mut self, endpoint: &str, now: SystemTime) -> String {
-        let audience = push_origin(endpoint).unwrap_or_else(|| endpoint.to_string());
+    /// par origine. Un `endpoint` sans origine HTTP(S) est refusé (`BadEndpoint`) : signer une audience bidon
+    /// produirait un jeton que le service push rejetterait, sans que personne ne sache pourquoi.
+    pub fn authorization(&mut self, endpoint: &str, now: SystemTime) -> Result<String, PushError> {
+        let audience = push_origin(endpoint).ok_or(PushError::BadEndpoint)?;
         if let Some((issued, header)) = self.cache.get(&audience)
             && now
                 .duration_since(*issued)
                 .is_ok_and(|age| age < TOKEN_REUSE)
         {
-            return header.clone();
+            return Ok(header.clone());
         }
         let expires = now
             .checked_add(TOKEN_LIFETIME)
@@ -247,39 +250,69 @@ impl Vapid {
                 .is_ok_and(|age| age < TOKEN_REUSE)
         });
         self.cache.insert(audience, (now, value.clone()));
-        value
+        Ok(value)
     }
 }
 
-/// Crée `vapid.key` d'un coup : la clé est écrite et synchronisée dans un fichier voisin 0600 au nom unique (un reste
-/// d'un process mort ne gêne jamais), puis liée sous son nom définitif. Le lien échoue si la cible existe : le premier
-/// arrivé gagne et l'appel suivant lit sa clé. Jamais de `vapid.key` vide ou à demi écrit, même si le process meurt
-/// ou si le disque se remplit en route.
+/// Combien de noms voisins `publish_new_key` essaie avant de renoncer : un reste d'un process mort de même pid en
+/// occupe au plus quelques-uns, huit couvrent tous les cas réalistes sans boucler indéfiniment.
+const TEMPORARY_ATTEMPTS: usize = 8;
+
+/// Le nom du fichier voisin de la création de `vapid.key` pour un compteur donné.
+fn temporary_name(counter: u32) -> String {
+    format!("vapid.key.{}.{counter}.tmp", std::process::id())
+}
+
+/// Crée `vapid.key` d'un coup : la clé est écrite et synchronisée dans un fichier voisin 0600 au nom unique, puis liée
+/// sous son nom définitif. Le lien échoue si la cible existe : le premier arrivé gagne et l'appel suivant lit sa clé.
+/// Jamais de `vapid.key` vide ou à demi écrit, même si le process meurt ou si le disque se remplit en route.
+/// Un nom voisin déjà pris (reste d'un process mort de même pid, pid réutilisé) passe au compteur suivant, huit fois
+/// au plus ; le reste d'un autre process n'est jamais touché.
 fn publish_new_key(folder: &Path, path: &Path) -> io::Result<()> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(0);
-    let temporary = folder.join(format!(
-        "vapid.key.{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let linked = (|| {
-        let bytes = p256::SecretKey::random(&mut OsRng).to_bytes();
-        let mut file = fs::OpenOptions::new()
+    publish_new_key_with(
+        folder,
+        path,
+        (0..TEMPORARY_ATTEMPTS).map(|_| NEXT.fetch_add(1, Ordering::Relaxed)),
+    )
+}
+
+/// `publish_new_key` avec les compteurs à essayer, dans l'ordre : les tests y jouent une collision.
+fn publish_new_key_with(
+    folder: &Path,
+    path: &Path,
+    counters: impl Iterator<Item = u32>,
+) -> io::Result<()> {
+    let bytes = p256::SecretKey::random(&mut OsRng).to_bytes();
+    for counter in counters {
+        let temporary = folder.join(temporary_name(counter));
+        let mut file = match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        match fs::hard_link(&temporary, path) {
-            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
-            _ => Ok(()),
-        }
-    })();
-    // Le fichier voisin ne doit pas rester : l'échec d'origine, s'il y en a un, est celui qu'on rend.
-    let _ = fs::remove_file(&temporary);
-    linked
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let linked = (|| {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            match fs::hard_link(&temporary, path) {
+                Err(error) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
+                _ => Ok(()),
+            }
+        })();
+        // Le fichier voisin ne doit pas rester : l'échec d'origine, s'il y en a un, est celui qu'on rend.
+        let _ = fs::remove_file(&temporary);
+        return linked;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free temporary name for vapid.key",
+    ))
 }
 
 /// L'origine (`https://hôte[:port]`) d'un point d'accès push, ou `None` si ce n'est pas une URL HTTP(S).
@@ -288,13 +321,24 @@ fn push_origin(endpoint: &str) -> Option<String> {
     matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
 }
 
-/// Les en-têtes de l'envoi : durée de vie d'une heure, urgence haute, `Topic` pour que le service push remplace une
-/// notification pas encore livrée.
-pub fn headers(topic: &str) -> [(&'static str, String); 5] {
+/// Le `Topic` d'une session : les 32 premiers caractères du base64url du SHA-256 de son nom tmux. Le RFC 8030 §5.4
+/// limite le `Topic` à 32 caractères de l'alphabet base64url, et une session créée hors d'IdemA peut porter n'importe
+/// quel nom (point, espace, 80 caractères) : le nom brut ferait refuser l'envoi (400). Le condensé est stable, donc le
+/// service push remplace bien la notification pas encore livrée de la même session.
+pub fn topic(session: &str) -> String {
+    let digest = Sha256::digest(session.as_bytes());
+    let mut encoded = B64.encode(digest);
+    encoded.truncate(32);
+    encoded
+}
+
+/// Les en-têtes de l'envoi : durée de vie d'une heure, urgence haute, `Topic` de la session pour que le service push
+/// remplace une notification pas encore livrée.
+pub fn headers(session: &str) -> [(&'static str, String); 5] {
     [
         ("TTL", "3600".to_string()),
         ("Urgency", "high".to_string()),
-        ("Topic", topic.to_string()),
+        ("Topic", topic(session)),
         ("Content-Encoding", "aes128gcm".to_string()),
         ("Content-Type", "application/octet-stream".to_string()),
     ]
@@ -498,7 +542,11 @@ mod tests {
         let (_home, mut vapid) = vapid_in("vapid-claims");
         let now = at(1_800_000_000);
 
-        let (token, key) = token_of(&vapid.authorization("https://web.push.apple.com/QXX", now));
+        let (token, key) = token_of(
+            &vapid
+                .authorization("https://web.push.apple.com/QXX", now)
+                .unwrap(),
+        );
 
         assert_eq!(key, vapid.public_key_b64url());
         let public = decode(&key);
@@ -539,7 +587,7 @@ mod tests {
         let (_home, mut vapid) = vapid_in("vapid-aud");
         let now = at(1_800_000_000);
         let audience = |vapid: &mut Vapid, endpoint: &str| {
-            let (token, _) = token_of(&vapid.authorization(endpoint, now));
+            let (token, _) = token_of(&vapid.authorization(endpoint, now).unwrap());
             let claims: serde_json::Value =
                 serde_json::from_slice(&decode(token.split('.').nth(1).unwrap())).unwrap();
             claims["aud"].as_str().unwrap().to_string()
@@ -563,13 +611,19 @@ mod tests {
         let start = at(1_800_000_000);
         let endpoint = "https://web.push.apple.com/QXX";
 
-        let first = vapid.authorization(endpoint, start);
-        let almost = vapid.authorization(
-            "https://web.push.apple.com/another-device",
-            start + Duration::from_secs(12 * 3600 - 60),
-        );
-        let after = vapid.authorization(endpoint, start + Duration::from_secs(12 * 3600));
-        let other_origin = vapid.authorization("https://fcm.googleapis.com/fcm/send/x", start);
+        let first = vapid.authorization(endpoint, start).unwrap();
+        let almost = vapid
+            .authorization(
+                "https://web.push.apple.com/another-device",
+                start + Duration::from_secs(12 * 3600 - 60),
+            )
+            .unwrap();
+        let after = vapid
+            .authorization(endpoint, start + Duration::from_secs(12 * 3600))
+            .unwrap();
+        let other_origin = vapid
+            .authorization("https://fcm.googleapis.com/fcm/send/x", start)
+            .unwrap();
 
         assert_eq!(first, almost, "same origin, 11 h 59: same header");
         assert_ne!(first, after, "12 h: a new token");
@@ -671,8 +725,92 @@ mod tests {
         };
         assert_eq!(get("TTL"), Some("3600"));
         assert_eq!(get("Urgency"), Some("high"));
-        assert_eq!(get("Topic"), Some("claude-1"));
+        assert_eq!(get("Topic"), Some(topic("claude-1").as_str()));
         assert_eq!(get("Content-Encoding"), Some("aes128gcm"));
         assert_eq!(get("Content-Type"), Some("application/octet-stream"));
+    }
+
+    /// Le `Topic` est le condensé du nom tmux, jamais le nom : 32 caractères base64url, stable, propre à la session.
+    #[test]
+    fn the_topic_is_a_stable_hash_of_the_session_name() {
+        // base64url(SHA-256("test")) = n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg, calculé hors du code.
+        assert_eq!(topic("test"), "n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is");
+        assert_eq!(topic("claude-1"), "wmrw42vmMBYQ84R-TLPcCxuSA1cuuXjR");
+        let hostile = "ma session.v2 \u{e9}t\u{e9}/with spaces and a very long name that tmux would still accept";
+        let hashed = topic(hostile);
+        assert_eq!(hashed.len(), 32);
+        assert!(
+            hashed
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+            "{hashed}"
+        );
+        assert_eq!(hashed, topic(hostile), "same name, same topic");
+        assert_ne!(hashed, topic("another"), "another session, another topic");
+        assert!(!hashed.contains("session"));
+    }
+
+    #[test]
+    fn a_non_http_endpoint_is_refused_instead_of_signed() {
+        let (_home, mut vapid) = vapid_in("vapid-bad-endpoint");
+        for endpoint in [
+            "",
+            "not a url",
+            "ftp://web.push.apple.com/x",
+            "data:text/plain,x",
+        ] {
+            assert_eq!(
+                vapid.authorization(endpoint, at(1_800_000_000)),
+                Err(PushError::BadEndpoint),
+                "{endpoint:?}"
+            );
+        }
+    }
+
+    /// Un reste de `vapid.key.<pid>.<n>.tmp` (process mort, pid réutilisé) ne bloque pas la création : le compteur
+    /// suivant est essayé, et le reste n'est jamais touché.
+    #[test]
+    fn a_taken_temporary_name_moves_on_to_the_next_counter() {
+        let home = TempDir::new("vapid-collision");
+        let folder = home.0.join("companion");
+        std::fs::create_dir_all(&folder).unwrap();
+        let pid = std::process::id();
+        let stale: Vec<_> = (40..42)
+            .map(|counter| folder.join(format!("vapid.key.{pid}.{counter}.tmp")))
+            .collect();
+        for path in &stale {
+            std::fs::write(path, b"left by a dead process").unwrap();
+        }
+        let target = folder.join("vapid.key");
+
+        publish_new_key_with(&folder, &target, 40..44).unwrap();
+
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 32);
+        for path in &stale {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                b"left by a dead process",
+                "{path:?} is another process's file"
+            );
+        }
+        assert!(
+            !folder.join(format!("vapid.key.{pid}.42.tmp")).exists(),
+            "our own temporary is removed"
+        );
+    }
+
+    #[test]
+    fn running_out_of_temporary_names_is_an_error_not_a_loop() {
+        let home = TempDir::new("vapid-exhausted");
+        let folder = home.0.join("companion");
+        std::fs::create_dir_all(&folder).unwrap();
+        let pid = std::process::id();
+        for counter in 0..3 {
+            std::fs::write(folder.join(format!("vapid.key.{pid}.{counter}.tmp")), b"x").unwrap();
+        }
+        let target = folder.join("vapid.key");
+        let error = publish_new_key_with(&folder, &target, 0..3).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!target.exists());
     }
 }

@@ -12,7 +12,7 @@ use rand::rngs::OsRng;
 use tokio::sync::watch;
 
 use super::auth::{PairOutcome, PairingCodes, new_token, token_hash};
-use super::devices::{Device, DeviceStore, device_name};
+use super::devices::{Device, DeviceStore, Subscription, device_name};
 use super::{DeviceSummary, PairingDisplay, ServiceEvent, ServiceStatus};
 use crate::hud;
 
@@ -263,6 +263,47 @@ impl Access {
                 false
             }
         }
+    }
+
+    /// L'abonnement push de l'appareil, s'il en a un.
+    pub fn subscription_of(&self, id: &str) -> Option<Subscription> {
+        self.lock()
+            .devices
+            .devices()
+            .iter()
+            .find(|device| device.id == id)
+            .and_then(|device| device.subscription.clone())
+    }
+
+    /// Pose l'abonnement de l'appareil (un `endpoint` n'est gardé qu'une fois, chez le dernier qui l'a donné). Écrit
+    /// hors du verrou d'état. `NotFound` si l'appareil a été oublié entre-temps.
+    pub fn set_subscription(&self, id: &str, subscription: Subscription) -> io::Result<()> {
+        self.write_devices(|store| store.set_subscription(id, subscription))
+            .inspect_err(|error| log_write_failure("subscribe", error))
+    }
+
+    /// Retire l'abonnement de cet appareil, s'il en avait un. Rend vrai s'il y en avait un.
+    pub fn clear_subscription(&self, id: &str) -> io::Result<bool> {
+        self.write_devices(|store| {
+            let held = store
+                .devices()
+                .iter()
+                .find(|device| device.id == id)
+                .and_then(|device| device.subscription.as_ref())
+                .map(|subscription| subscription.endpoint.clone());
+            match held {
+                Some(endpoint) => store.remove_endpoint(&endpoint),
+                None => Ok(false),
+            }
+        })
+        .inspect_err(|error| log_write_failure("unsubscribe", error))
+    }
+
+    /// Retire l'abonnement qui porte cet `endpoint`, chez qui qu'il soit (le service push l'a déclaré mort). Rend
+    /// vrai s'il y en avait un.
+    pub fn remove_endpoint(&self, endpoint: &str) -> io::Result<bool> {
+        self.write_devices(|store| store.remove_endpoint(endpoint))
+            .inspect_err(|error| log_write_failure("remove_endpoint", error))
     }
 
     /// Change la liste des appareils et l'écrit, hors du verrou d'état (voir `writer`).

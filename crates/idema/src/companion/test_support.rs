@@ -126,6 +126,7 @@ pub fn deps_in(
         timeline: Arc::new(Mutex::new(Timeline::new(std::time::SystemTime::now()))),
         previous,
         test_routes,
+        push_override: None,
     };
     (deps, events_sender, status_receiver, fleet_sender)
 }
@@ -187,12 +188,27 @@ impl Harness {
 
     /// Démarre avec un serveur tmux de remplacement (`fake_tmux`) : l'écran d'un pane se capture alors sans tmux.
     pub fn start_with(home: TempDir, test_routes: bool, tmux: Option<Arc<TmuxServer>>) -> Self {
+        Self::start_full(home, test_routes, tmux, None)
+    }
+
+    /// Démarre avec les routes de test et un faux service push à la place de chaque point d'accès.
+    pub fn start_with_push(home: TempDir, push_override: String) -> Self {
+        Self::start_full(home, true, None, Some(push_override))
+    }
+
+    fn start_full(
+        home: TempDir,
+        test_routes: bool,
+        tmux: Option<Arc<TmuxServer>>,
+        push_override: Option<String>,
+    ) -> Self {
         let port = free_port();
         let (mut deps, events, mut status, fleet) =
             deps_in(port, home.0.clone(), None, test_routes);
         if let Some(tmux) = tmux {
             deps.tmux = tmux;
         }
+        deps.push_override = push_override;
         let (commands, commands_receiver) = futures::channel::mpsc::unbounded();
         deps.commands = commands;
         let timeline = Arc::clone(&deps.timeline);
@@ -514,4 +530,203 @@ pub fn serve_commands(harness: &mut Harness, mut handle: impl FnMut(PaneCommand)
             handle(command);
         }
     });
+}
+
+/// Une requête reçue par le faux service push.
+#[derive(Debug, Clone)]
+pub struct Recorded {
+    pub method: String,
+    /// Chemin et requête, tels que curl les a envoyés.
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// Les fichiers (nom, droits) du dossier surveillé au moment où la requête est arrivée.
+    pub watched: Vec<(String, u32)>,
+}
+
+impl Recorded {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Un faux service push sur `127.0.0.1` : il note chaque requête, et répond ce qu'on lui a dit (`None` : ne répond
+/// jamais, la connexion reste ouverte jusqu'à sa chute).
+pub struct FakePush {
+    pub port: u16,
+    requests: Arc<Mutex<Vec<Recorded>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl FakePush {
+    pub fn start(status: u16, body: &str) -> Self {
+        Self::start_watching(Some((status, body.to_owned())), None)
+    }
+
+    /// `reply` : le code et le corps à rendre, ou `None` pour se taire. `watched` : un dossier dont on note le contenu
+    /// à chaque requête.
+    pub fn start_watching(reply: Option<(u16, String)>, watched: Option<PathBuf>) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let reply = Arc::new(Mutex::new(reply));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (requests, reply, stop) =
+                (Arc::clone(&requests), Arc::clone(&reply), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let (requests, reply, stop, watched) = (
+                                Arc::clone(&requests),
+                                Arc::clone(&reply),
+                                Arc::clone(&stop),
+                                watched.clone(),
+                            );
+                            std::thread::spawn(move || {
+                                serve_one(stream, &requests, &reply, &stop, watched.as_deref());
+                            });
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Self {
+            port,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    pub fn requests(&self) -> Vec<Recorded> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// Attend d'avoir reçu `count` requêtes au moins, et les rend.
+    pub fn wait_for(&self, count: usize) -> Vec<Recorded> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let seen = self.requests();
+            if seen.len() >= count {
+                return seen;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {} request(s) reached the fake push service",
+                seen.len()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for FakePush {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Lit une requête entière (en-têtes puis `Content-Length` octets), la note, puis répond.
+fn serve_one(
+    mut stream: TcpStream,
+    requests: &Mutex<Vec<Recorded>>,
+    reply: &Mutex<Option<(u16, String)>>,
+    stop: &std::sync::atomic::AtomicBool,
+    watched: Option<&std::path::Path>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(at) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(read) => raw.extend_from_slice(&chunk[..read]),
+        }
+    };
+    let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
+    let mut lines = head.lines();
+    let mut first = lines.next().unwrap_or_default().split_whitespace();
+    let method = first.next().unwrap_or_default().to_owned();
+    let path = first.next().unwrap_or_default().to_owned();
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+        .collect();
+    let length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = raw[head_end + 4..].to_vec();
+    while body.len() < length {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
+        }
+    }
+    let listing = watched
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let mode = entry.metadata().ok()?.permissions().mode() & 0o777;
+                    Some((entry.file_name().to_string_lossy().into_owned(), mode))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Un service push ne reçoit que des POST : le reste est le sondage d'un autre programme de la machine, qui visite
+    // chaque port qui s'ouvre (`HEAD /` observé le 05/11) et ne doit pas fausser les comptes des tests.
+    if method == "POST" {
+        requests.lock().unwrap().push(Recorded {
+            method,
+            path,
+            headers,
+            body,
+            watched: listing,
+        });
+    }
+    let answer = reply.lock().unwrap().clone();
+    match answer {
+        Some((status, text)) => {
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+        // Le silence : la connexion reste ouverte tant que le faux service vit.
+        None => {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
