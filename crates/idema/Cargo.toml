@@ -38,3 +38,4 @@ axum.workspace = true
 sha2.workspace = true
 rand.workspace = true
 base64.workspace = true
+flate2.workspace = true

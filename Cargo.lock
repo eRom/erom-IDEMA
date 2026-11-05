@@ -2932,6 +2932,7 @@ dependencies = [
  "base64",
  "block2 0.6.2",
  "chrono",
+ "flate2",
  "futures",
  "gpui-component",
  "gpui-kit-assets",

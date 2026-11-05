@@ -155,6 +155,8 @@ impl Access {
             ServiceEvent::ForgetDevice { id } => {
                 self.forget(&id);
             }
+            // La présence de Romain (tâche 8) consomme ce geste ; l'accès n'a rien à en faire.
+            ServiceEvent::PhoneInteraction { .. } => {}
         }
     }
 

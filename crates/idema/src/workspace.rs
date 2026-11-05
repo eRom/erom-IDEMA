@@ -43,7 +43,10 @@ use crate::changes::panel::{
 };
 use crate::commit_message::CommitMessageSettings;
 use crate::companion::fleet::{FleetPane, SessionInput, compose_fleet, mac_name, state_label};
-use crate::companion::{CompanionController, PaneCommand};
+use crate::companion::input::{ENTER_DELAY, Gate, RemoteInput, gate, is_expired};
+use crate::companion::{
+    AckOrigin, CompanionController, InputOutcome, PaneCommand, PaneProbe, ServiceEvent,
+};
 use crate::config::{
     AgentEntry, Config, ConfigError, FileWatch, IdeationConfig, ReloadEffects, SHELL_ENTRY,
     SHELL_SESSION_NAME, ensure_config_file, harness_groups, load_config,
@@ -677,6 +680,16 @@ const SESSIONS_POLL: Duration = Duration::from_secs(1);
 
 /// Le brut d'un arrêt du client sans raison de tmux (`%exit` nu).
 const NO_EXIT_REASON: &str = "control client exited";
+
+/// Une saisie du téléphone, telle que le service l'a transmise, et l'instant où le fil d'interface la prend.
+struct RemoteRequest {
+    session: String,
+    pane: u32,
+    input: RemoteInput,
+    command_id: String,
+    received_at: Instant,
+    started: Instant,
+}
 
 /// Une session d'Idema telle que l'espace de travail la tient : ce que la barre montre, et la vue attachée.
 pub(crate) struct SessionEntry {
@@ -2135,9 +2148,158 @@ impl Workspace {
         }
     }
 
-    /// Une commande du service du compagnon, traitée sur le fil d'interface. `PaneCommand` n'a pas encore de variante.
-    fn on_companion_command(&mut self, command: PaneCommand, _cx: &mut Context<Self>) {
-        match command {}
+    /// Une commande du service du compagnon, traitée sur le fil d'interface.
+    fn on_companion_command(&mut self, command: PaneCommand, cx: &mut Context<Self>) {
+        let started = Instant::now();
+        match command {
+            PaneCommand::Input {
+                session,
+                pane,
+                input,
+                command_id,
+                received_at,
+                reply,
+            } => self.on_remote_input(
+                RemoteRequest {
+                    session,
+                    pane,
+                    input,
+                    command_id,
+                    received_at,
+                    started,
+                },
+                reply,
+                cx,
+            ),
+            PaneCommand::Ack {
+                session,
+                pane,
+                origin,
+                reply,
+            } => {
+                let found = match self.remote_pane(&session, pane, cx) {
+                    Some((_, view)) => {
+                        view.update(cx, |pane, cx| pane.acknowledge(cx));
+                        true
+                    }
+                    None => false,
+                };
+                if found && origin == AckOrigin::Phone {
+                    self.companion.send(ServiceEvent::PhoneInteraction {
+                        session: session.clone(),
+                    });
+                }
+                hud::log_event(&format!(
+                    "companion ack session={session} pane={pane} main_thread_us={}",
+                    started.elapsed().as_micros()
+                ));
+                let _ = reply.send(found);
+            }
+            PaneCommand::Probe {
+                session,
+                pane,
+                reply,
+            } => {
+                let probe = self.remote_pane(&session, pane, cx).map(|(_, view)| {
+                    let view = view.read(cx);
+                    PaneProbe {
+                        accepts_input: view.accepts_remote_input(),
+                        state: state_label(view.state()),
+                    }
+                });
+                let _ = reply.send(probe);
+            }
+        }
+    }
+
+    /// La session `session` (nom tmux) et son pane `pane`, dans ses `slots` : pas seulement l'actif, cachés compris.
+    fn remote_pane(
+        &self,
+        session: &str,
+        pane: u32,
+        cx: &App,
+    ) -> Option<(Entity<SessionView>, Entity<PaneView>)> {
+        let view = self.entry_view(session)?;
+        let pane_view = view.read(cx).remote_pane(PaneId(pane))?;
+        Some((view, pane_view))
+    }
+
+    /// Une saisie du téléphone. Les refus se prennent dans l'ordre de `input::gate` ; seule une saisie qui passe tout est
+    /// retenue comme tapée (un refus ne fait pas passer le même `command_id` rejoué pour un succès). Le texte ou la
+    /// touche partent d'abord, l'Entrée demandée 80 ms plus tard par une tâche : la réponse attend l'Entrée.
+    fn on_remote_input(
+        &mut self,
+        request: RemoteRequest,
+        reply: tokio::sync::oneshot::Sender<InputOutcome>,
+        cx: &mut Context<Self>,
+    ) {
+        let RemoteRequest {
+            session,
+            pane,
+            input,
+            command_id,
+            received_at,
+            started,
+        } = request;
+        let (outcome, delayed_enter) = match self.entry_view(&session) {
+            None => (InputOutcome::UnknownSession, None),
+            Some(view) => match view.read(cx).remote_pane(PaneId(pane)) {
+                None => (InputOutcome::NoPane, None),
+                Some(pane_view) => {
+                    let client_exited = view.read(cx).control_client_exited();
+                    let (read_only, command_running) = {
+                        let pane = pane_view.read(cx);
+                        (pane.is_read_only(), pane.command_running())
+                    };
+                    let refused = gate(Gate {
+                        client_exited,
+                        expired: is_expired(received_at, started),
+                        duplicate: self.companion.command_typed_recently(&command_id, started),
+                        read_only,
+                        command_running,
+                    });
+                    match refused {
+                        Some(outcome) => (outcome, None),
+                        None => {
+                            self.companion.remember_command(&command_id, started);
+                            let (sent, enter) = pane_view.update(cx, |pane, _| match &input {
+                                RemoteInput::Key { key, enter } => {
+                                    (pane.send_remote_key(*key), *enter)
+                                }
+                                RemoteInput::Text { text, enter } => {
+                                    (pane.send_remote_text(text), *enter)
+                                }
+                            });
+                            if sent {
+                                (InputOutcome::Sent, enter.then_some(pane_view))
+                            } else {
+                                (InputOutcome::NoProgram, None)
+                            }
+                        }
+                    }
+                }
+            },
+        };
+        hud::log_event(&format!(
+            "companion input session={session} pane={pane} outcome={} main_thread_us={}",
+            outcome.as_str(),
+            started.elapsed().as_micros()
+        ));
+        if outcome == InputOutcome::Sent {
+            self.companion
+                .send(ServiceEvent::PhoneInteraction { session });
+        }
+        let Some(pane_view) = delayed_enter else {
+            let _ = reply.send(outcome);
+            return;
+        };
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(ENTER_DELAY).await;
+            // Le programme a pu finir pendant ces 80 ms : `send_remote_enter` refuse alors, rien n'est tapé.
+            let _ = pane_view.update(cx, |pane, _| pane.send_remote_enter());
+            let _ = reply.send(outcome);
+        })
+        .detach();
     }
 
     /// La section `[ideation]` vient de disparaître alors qu'un bouillon est sélectionné : la première session de l'ordre

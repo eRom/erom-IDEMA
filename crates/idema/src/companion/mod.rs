@@ -8,6 +8,8 @@ mod auth;
 pub mod controller;
 mod devices;
 pub mod fleet;
+pub mod input;
+pub mod screen;
 mod server;
 pub mod service;
 mod sse;
@@ -16,9 +18,12 @@ mod test_support;
 mod timeline;
 mod web_assets;
 
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
+
+use tokio::sync::oneshot;
 
 pub use controller::CompanionController;
+use input::RemoteInput;
 
 /// Ce que le service dit de lui à l'espace de travail (et, plus tard, à Personnaliser).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -75,8 +80,86 @@ pub enum ServiceEvent {
     CancelPairing,
     /// Oublier un appareil et son abonnement : sa requête suivante prend 401.
     ForgetDevice { id: String },
+    /// Une saisie ou un acquittement venus du téléphone ont touché cette session : Romain agit depuis l'iPhone
+    /// (consommé par la présence, tâche 8).
+    PhoneInteraction { session: String },
 }
 
-/// Ce que le service demande au fil d'interface. Les tâches suivantes ajoutent les variantes.
+/// Ce que le service demande au fil d'interface : une commande sur un pane, avec sa réponse `oneshot`.
 #[derive(Debug)]
-pub enum PaneCommand {}
+pub enum PaneCommand {
+    /// Taper une touche ou un texte. `received_at` est l'instant de réception HTTP : une commande traitée plus de
+    /// 1,5 s après est jetée sans rien taper (`input::is_expired`).
+    Input {
+        session: String,
+        pane: u32,
+        input: RemoteInput,
+        command_id: String,
+        received_at: Instant,
+        reply: oneshot::Sender<InputOutcome>,
+    },
+    /// Acquitter ce pane seul (`mark_seen`). Réponse : le pane existe.
+    Ack {
+        session: String,
+        pane: u32,
+        origin: AckOrigin,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Lire ce que le pane accepte, pour l'écran. `None` : session ou pane inconnus.
+    Probe {
+        session: String,
+        pane: u32,
+        reply: oneshot::Sender<Option<PaneProbe>>,
+    },
+}
+
+/// Qui acquitte : le téléphone (geste, ouverture de l'écran) ou la présence de Romain devant l'écran du téléphone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOrigin {
+    Phone,
+    #[allow(dead_code, reason = "émis par la présence de Romain (tâches 6 à 8)")]
+    Watched,
+}
+
+/// Ce que le fil d'interface a fait d'une saisie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputOutcome {
+    /// Tapée.
+    Sent,
+    /// Ce `command_id` a déjà été tapé dans la minute : rien n'est retapé, la page le compte pour un succès.
+    Duplicate,
+    /// Rien ne tourne dans le pane (prompt du shell, ou programme encore inconnu) : fermé par défaut.
+    NoProgram,
+    ReadOnly,
+    /// Le client de contrôle de la session est sorti : rien de ce qu'on lui écrirait n'arriverait.
+    Disconnected,
+    NoPane,
+    UnknownSession,
+    /// Arrivée sur le fil d'interface plus de 1,5 s après sa réception HTTP.
+    Expired,
+}
+
+impl InputOutcome {
+    /// Le mot du journal (`outcome=`) et de la réponse JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Duplicate => "duplicate",
+            Self::NoProgram => "no_program",
+            Self::ReadOnly => "read_only",
+            Self::Disconnected => "disconnected",
+            Self::NoPane => "no_pane",
+            Self::UnknownSession => "unknown_session",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// Ce que le pane accepte, tel que l'écran le dit à la page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneProbe {
+    /// Le pane prend-il une saisie (`input::accepts_input`) ?
+    pub accepts_input: bool,
+    /// Son état (`idle`, `running`, `waiting`, `error`).
+    pub state: &'static str,
+}

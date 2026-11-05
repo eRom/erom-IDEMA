@@ -37,15 +37,12 @@ pub struct ServiceDeps {
     pub dir: PathBuf,
     pub version: &'static str,
     pub config: CompanionConfig,
-    #[allow(
-        dead_code,
-        reason = "lu par la tâche 4 (écran, saisie et acquittement d'un pane)"
-    )]
+    /// Le serveur tmux d'IdemA : l'écran d'un pane s'y capture.
     pub tmux: Arc<TmuxServer>,
     #[allow(dead_code, reason = "lu par la tâche 9 (Scratchpad)")]
     pub scratchpad: PathBuf,
     pub events: UnboundedReceiver<ServiceEvent>,
-    #[allow(dead_code, reason = "lu par la tâche 4 (commandes sur un pane)")]
+    /// Les commandes sur un pane (saisie, acquittement, lecture), que l'espace de travail traite sur le fil d'interface.
     pub commands: UnboundedSender<PaneCommand>,
     pub status: watch::Sender<ServiceStatus>,
     /// Le dernier instantané de la flotte, publié par l'espace de travail (`CompanionController::publish`).
@@ -113,6 +110,8 @@ struct Serving {
     bind_retry: Duration,
     fleet: watch::Receiver<Arc<Fleet>>,
     timeline: Arc<Mutex<Timeline>>,
+    tmux: Arc<TmuxServer>,
+    commands: UnboundedSender<PaneCommand>,
 }
 
 /// Le corps du fil.
@@ -121,7 +120,9 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         dir,
         version,
         config,
+        tmux,
         events,
+        commands,
         status,
         fleet,
         timeline,
@@ -180,6 +181,8 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         },
         fleet,
         timeline,
+        tmux,
+        commands,
     };
     let served = runtime.block_on(serve(serving, &status, access, events, stop));
     // Le runtime est abandonné ici : ses tâches restantes (flux en retard, appel bloquant) ne retiennent plus le fil.
@@ -208,6 +211,8 @@ async fn serve(
         bind_retry,
         fleet,
         timeline,
+        tmux,
+        commands,
     } = serving;
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = match bind(address, bind_retry).await {
@@ -234,6 +239,8 @@ async fn serve(
         test_routes,
         fleet,
         timeline,
+        tmux,
+        commands,
     };
     let server = axum::serve(listener, router(state))
         .with_graceful_shutdown(stopped(stop.clone()))

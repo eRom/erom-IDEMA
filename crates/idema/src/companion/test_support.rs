@@ -49,7 +49,7 @@ use tokio::sync::{mpsc, watch};
 use super::fleet::Fleet;
 use super::service::{self, ServiceDeps, ServiceHandle};
 use super::timeline::Timeline;
-use super::{ListenState, ServiceEvent, ServiceStatus};
+use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
 
 /// Un dossier jetable, retiré en fin de test.
@@ -169,6 +169,9 @@ pub struct Harness {
     pub fleet: watch::Sender<Arc<Fleet>>,
     /// La chronologie du service, que l'espace de travail alimente en vrai.
     pub timeline: Arc<Mutex<Timeline>>,
+    /// Les commandes sur un pane que le service envoie à l'espace de travail : un test joue le fil d'interface en la
+    /// lisant (`take`) et en répondant.
+    pub commands: Option<futures::channel::mpsc::UnboundedReceiver<PaneCommand>>,
     handle: Option<ServiceHandle>,
 }
 
@@ -179,8 +182,19 @@ impl Harness {
 
     /// Démarre sur ce dossier (un nouveau service sur les appareils d'un service arrêté).
     pub fn start_in(home: TempDir, test_routes: bool) -> Self {
+        Self::start_with(home, test_routes, None)
+    }
+
+    /// Démarre avec un serveur tmux de remplacement (`fake_tmux`) : l'écran d'un pane se capture alors sans tmux.
+    pub fn start_with(home: TempDir, test_routes: bool, tmux: Option<Arc<TmuxServer>>) -> Self {
         let port = free_port();
-        let (deps, events, mut status, fleet) = deps_in(port, home.0.clone(), None, test_routes);
+        let (mut deps, events, mut status, fleet) =
+            deps_in(port, home.0.clone(), None, test_routes);
+        if let Some(tmux) = tmux {
+            deps.tmux = tmux;
+        }
+        let (commands, commands_receiver) = futures::channel::mpsc::unbounded();
+        deps.commands = commands;
         let timeline = Arc::clone(&deps.timeline);
         let handle = service::start(deps).expect("the service thread spawns");
         wait_for(&mut status, |state| {
@@ -193,6 +207,7 @@ impl Harness {
             status,
             fleet,
             timeline,
+            commands: Some(commands_receiver),
             handle: Some(handle),
         }
     }
@@ -466,4 +481,37 @@ impl EventStream {
             }
         }
     }
+}
+
+/// Un faux `tmux` : un script qui note ses arguments dans `log`, rend « 80 24 » à `display-message` et le contenu de
+/// `capture` à `capture-pane`. Rend le serveur et le fichier du journal des appels.
+pub fn fake_tmux(dir: &std::path::Path, capture: &[u8]) -> (Arc<TmuxServer>, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("tmux-calls.log");
+    let capture_file = dir.join("capture.bin");
+    std::fs::write(&capture_file, capture).unwrap();
+    let script = dir.join("tmux");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$*\" in\n*display-message*) echo '80 24' ;;\n*capture-pane*) /bin/cat '{}' ;;\n*) exit 1 ;;\nesac\n",
+            log.display(),
+            capture_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let server = TmuxServer::new(script, "idema-test-fake", dir.join("tmux.conf"), Vec::new());
+    (Arc::new(server), log)
+}
+
+/// Joue le fil d'interface : chaque commande reçue passe par `handle`, dans un fil à part qui finit avec le service.
+pub fn serve_commands(harness: &mut Harness, mut handle: impl FnMut(PaneCommand) + Send + 'static) {
+    use futures::StreamExt;
+    let mut commands = harness.commands.take().expect("commands not taken yet");
+    std::thread::spawn(move || {
+        while let Some(command) = futures::executor::block_on(commands.next()) {
+            handle(command);
+        }
+    });
 }

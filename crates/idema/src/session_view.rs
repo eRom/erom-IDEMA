@@ -685,6 +685,16 @@ impl SessionView {
         view.update(cx, |pane, _| pane.reclaim_in_pane(command))
     }
 
+    /// La vue du pane `id` que le compagnon peut lire ou taper : un pane encore dans un layout de la session.
+    pub fn remote_pane(&self, id: PaneId) -> Option<Entity<PaneView>> {
+        self.live_pane_view(id)
+    }
+
+    /// Le client de contrôle est-il sorti (et pas encore reconnecté) ? Rien de ce qu'on lui écrirait n'arriverait.
+    pub fn control_client_exited(&self) -> bool {
+        self.client_exited
+    }
+
     /// Montre une bulle d'échec sur le pane `pane`, ou sur le pane actif s'il a disparu. Faux quand la session n'a plus
     /// aucun pane : la bulle n'a nulle part où s'afficher.
     pub fn show_failure(&mut self, pane: PaneId, text: String, cx: &mut Context<Self>) -> bool {

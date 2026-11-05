@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use futures::channel::mpsc;
 use idema_term::activity::ActivityState;
@@ -13,6 +13,7 @@ use tokio::sync::watch;
 
 use super::auth::test_routes_enabled;
 use super::fleet::Fleet;
+use super::input::RecentCommands;
 use super::service::{self, ServiceDeps, ServiceHandle};
 use super::timeline::Timeline;
 use super::{PaneCommand, ServiceEvent, ServiceStatus};
@@ -34,6 +35,9 @@ pub struct CompanionController {
     /// La chronologie des transitions qui comptent. Elle appartient au contrôleur, donc à IdemA : un service qui
     /// redémarre (port changé) la retrouve, et son instant de démarrage est celui du process. Perdue avec lui.
     timeline: Arc<Mutex<Timeline>>,
+    /// Les `command_id` tapés dans la dernière minute : un service qui redémarre ne fait pas oublier une saisie, et
+    /// l'espace de travail, seul à taper, est seul à y toucher.
+    recent: RecentCommands,
     /// Le fil d'un service arrêté que personne n'a encore joint. Il n'existe que tant que rien ne tourne : un
     /// service qui démarre le reçoit comme `previous` et le joint avant de lier sa prise, donc une réactivation
     /// rapide ne dispute jamais le port à l'ancien fil.
@@ -59,6 +63,7 @@ impl CompanionController {
         Self {
             running: None,
             timeline: Arc::new(Mutex::new(Timeline::new(started_at))),
+            recent: RecentCommands::default(),
             stopping: None,
         }
     }
@@ -167,8 +172,17 @@ impl CompanionController {
         self.timeline.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Ce `command_id` a-t-il été tapé dans la dernière minute ? Ne retient rien.
+    pub fn command_typed_recently(&self, id: &str, now: Instant) -> bool {
+        self.recent.seen(id, now)
+    }
+
+    /// Retient un `command_id` qui vient d'être tapé.
+    pub fn remember_command(&mut self, id: &str, now: Instant) {
+        self.recent.first_seen(id, now);
+    }
+
     /// Envoie un événement au service ; sans effet éteint.
-    #[allow(dead_code, reason = "premier émetteur : Personnaliser (tâche 11)")]
     pub fn send(&self, event: ServiceEvent) {
         if let Some(running) = &self.running {
             let _ = running.events.send(event);

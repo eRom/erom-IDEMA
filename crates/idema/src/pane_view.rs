@@ -40,6 +40,7 @@ use idema_tmux::protocol::{ControlEvent, PaneId};
 use url::Url;
 
 use crate::browser::address::{self, is_local_document};
+use crate::companion::input::{RemoteKey, accepts_input, encode_remote_key};
 use crate::file_open::{self, PathTarget};
 use crate::hud::{self, DumpGrid, HudStats, ModeWatch, ToggleHud};
 use crate::menus::{self, Paste};
@@ -1213,6 +1214,61 @@ impl PaneView {
         }
         self.backend.scroll_to_bottom();
         write_user_input(self.read_only, &mut self.backend, bytes);
+    }
+
+    /// Le pane prend-il une saisie venue du téléphone ? Fermé par défaut : hors lecture seule, et seulement si une
+    /// commande tourne (au prompt du shell, ou tant qu'IdemA ne sait pas ce qui tourne, non).
+    pub fn accepts_remote_input(&self) -> bool {
+        accepts_input(self.read_only, self.command_running())
+    }
+
+    /// Une commande tourne-t-elle dans le pane (entre OSC 133;C et D ; sans marqueur, un programme que l'on sait n'être
+    /// pas le shell) ? Faux tant qu'IdemA ne sait pas ce qui tourne.
+    pub fn command_running(&self) -> bool {
+        self.activity.command_running()
+    }
+
+    /// Les modes du programme qui changent l'encodage des touches, comme pour le clavier.
+    fn key_modes(&self) -> KeyModes {
+        let emulator = self.backend.emulator();
+        KeyModes {
+            app_cursor: emulator.mode().contains(TermMode::APP_CURSOR),
+            extended_keys: emulator.extended_keys(),
+        }
+    }
+
+    /// Tape une touche du téléphone. Faux, sans rien taper, quand le pane n'accepte rien ou que la touche n'a pas
+    /// d'encodage.
+    pub fn send_remote_key(&mut self, key: RemoteKey) -> bool {
+        if !self.accepts_remote_input() {
+            return false;
+        }
+        let Some(bytes) = encode_remote_key(key, self.key_modes()) else {
+            return false;
+        };
+        self.send_user_input(&bytes);
+        true
+    }
+
+    /// Tape un texte du téléphone, tel quel (jamais encadré comme un collage : une ligne, sans caractère de contrôle).
+    pub fn send_remote_text(&mut self, text: &str) -> bool {
+        if !self.accepts_remote_input() {
+            return false;
+        }
+        self.send_user_input(text.as_bytes());
+        true
+    }
+
+    /// Tape Entrée pour le téléphone, une écriture à part (`ENTER_DELAY` après la précédente).
+    pub fn send_remote_enter(&mut self) -> bool {
+        self.send_remote_key(RemoteKey::Enter)
+    }
+
+    /// Acquitte ce pane seul : « attend » et « erreur » retombent et l'état est republié. Le drapeau « vue » de la
+    /// session n'est pas touché. Idempotent.
+    pub fn acknowledge(&mut self, cx: &mut Context<Self>) {
+        self.activity.mark_seen();
+        self.publish_state(Instant::now(), cx);
     }
 
     /// Tape la commande d'un agent. Le démarrage de l'agent n'est pas un tour : la grâce d'activité repart d'ici,

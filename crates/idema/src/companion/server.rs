@@ -2,28 +2,33 @@
 //! fichiers de la page sont servis à la racine, sans cookie et sans donnée.
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::rejection::PathRejection;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{DefaultBodyLimit, Extension, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::StreamExt;
+use futures::channel::mpsc::UnboundedSender;
+use idema_tmux::server::TmuxServer;
 use serde::Deserialize;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
-use super::ServiceEvent;
 use super::access::{Access, Caller};
 use super::auth::{COOKIE_NAME, cookie_header, origin_allowed};
 use super::fleet::Fleet;
+use super::input::{self, HTTP_WAIT};
+use super::screen;
 use super::sse::{self, COALESCE};
 use super::timeline::Timeline;
 use super::web_assets;
+use super::{AckOrigin, InputOutcome, PaneCommand, PaneProbe, ServiceEvent};
 use crate::hud;
 
 /// L'intervalle du commentaire de maintien du flux : il garde la connexion ouverte à travers les relais.
@@ -60,6 +65,10 @@ pub struct AppState {
     /// Le dernier instantané de la flotte : `fleet` le lit, chaque flux `events` s'y abonne.
     pub fleet: watch::Receiver<Arc<Fleet>>,
     pub timeline: Arc<Mutex<Timeline>>,
+    /// Le serveur tmux d'IdemA, pour capturer l'écran d'un pane.
+    pub tmux: Arc<TmuxServer>,
+    /// La file des commandes sur un pane, traitées par l'espace de travail sur le fil d'interface.
+    pub commands: UnboundedSender<PaneCommand>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -70,6 +79,12 @@ pub fn router(state: AppState) -> Router {
         .route("/idema-api/fleet", get(fleet))
         .route("/idema-api/events", get(events))
         .route("/idema-api/timeline", get(timeline))
+        .route(
+            "/idema-api/sessions/{name}/panes/{pane}/screen",
+            get(screen),
+        )
+        .route("/idema-api/sessions/{name}/panes/{pane}/input", post(input))
+        .route("/idema-api/sessions/{name}/panes/{pane}/ack", post(ack))
         .route("/idema-api/client-metrics", post(client_metrics));
     if state.test_routes {
         router = router
@@ -280,6 +295,274 @@ async fn timeline(
         })
     };
     json_reply(StatusCode::OK, body.to_string())
+}
+
+/// Ce qui peut empêcher d'obtenir la réponse du fil d'interface.
+enum Unanswered {
+    /// L'espace de travail n'écoute plus (compagnon retiré, IdemA qui quitte).
+    Gone,
+    /// Pas de réponse en `HTTP_WAIT`.
+    TimedOut,
+}
+
+/// Envoie une commande au fil d'interface et attend sa réponse au plus `HTTP_WAIT`. L'attente est asynchrone : le
+/// runtime du service ne bloque jamais sur le fil d'interface.
+async fn ask<T>(
+    commands: &UnboundedSender<PaneCommand>,
+    build: impl FnOnce(oneshot::Sender<T>) -> PaneCommand,
+) -> Result<T, Unanswered> {
+    let (reply, answer) = oneshot::channel();
+    commands
+        .unbounded_send(build(reply))
+        .map_err(|_| Unanswered::Gone)?;
+    match tokio::time::timeout(HTTP_WAIT, answer).await {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(_)) => Err(Unanswered::Gone),
+        Err(_) => Err(Unanswered::TimedOut),
+    }
+}
+
+fn unanswered_reply(why: Unanswered) -> Response {
+    match why {
+        Unanswered::Gone => error_reply(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        // Le fil d'interface jette toute commande de plus de 1,5 s : rien n'a été tapé.
+        Unanswered::TimedOut => error_reply(StatusCode::SERVICE_UNAVAILABLE, "expired"),
+    }
+}
+
+/// `{name}` et `{pane}` d'une route de pane. Un identifiant de pane illisible est un pane inconnu (404 chez l'appelant).
+fn pane_target(path: Result<Path<(String, String)>, PathRejection>) -> Option<(String, u32)> {
+    let Ok(Path((session, pane))) = path else {
+        return None;
+    };
+    Some((session, pane.parse().ok()?))
+}
+
+fn pane_not_found() -> Response {
+    error_reply(StatusCode::NOT_FOUND, "not_found")
+}
+
+#[derive(Deserialize)]
+struct ScreenQuery {
+    /// Les lignes d'historique au-dessus de l'écran, 1 à 2 000 (200 par défaut).
+    history: Option<u16>,
+}
+
+const DEFAULT_HISTORY: u16 = 200;
+const MAX_HISTORY: u16 = 2000;
+
+/// Le client accepte-t-il gzip ? Un jeton `gzip` (ou `*`) dont le poids n'est pas zéro.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|line| line.split(','))
+        .any(|token| {
+            let mut parts = token.split(';');
+            let coding = parts.next().unwrap_or("").trim();
+            let weight_zero = parts.any(|param| {
+                param
+                    .trim()
+                    .strip_prefix("q=")
+                    .is_some_and(|q| q.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
+            });
+            (coding.eq_ignore_ascii_case("gzip") || coding == "*") && !weight_zero
+        })
+}
+
+/// L'écran capturé, prêt à servir : 304 ou un corps JSON (compressé ou non).
+enum Rendered {
+    NotModified,
+    Body { json: Vec<u8>, gzip: bool },
+}
+
+/// Capture le pane et prépare la réponse. Bloquant : capture tmux, JSON et compression sont ici, sur `spawn_blocking`.
+fn render_screen(
+    tmux: &TmuxServer,
+    pane: u32,
+    history: u16,
+    probe: PaneProbe,
+    if_none_match: Option<&str>,
+    gzip: bool,
+) -> Result<(Rendered, String, u64), String> {
+    let screen = screen::capture(tmux, pane, history)?;
+    // L'état et la prise en compte de la saisie figurent dans la réponse : ils changent l'`ETag` comme le texte.
+    let etag = format!(
+        "\"{}-{}-{}\"",
+        screen.etag,
+        u8::from(probe.accepts_input),
+        probe.state
+    );
+    if if_none_match.is_some_and(|sent| etag_matches(sent, &etag)) {
+        return Ok((Rendered::NotModified, etag, screen.took_ms));
+    }
+    let json = serde_json::to_vec(&serde_json::json!({
+        "text": screen.text,
+        "cols": screen.cols,
+        "rows": screen.rows,
+        "accepts_input": probe.accepts_input,
+        "state": probe.state,
+        "took_ms": screen.took_ms,
+    }))
+    .map_err(|error| error.to_string())?;
+    let rendered = if gzip {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder
+            .write_all(&json)
+            .and_then(|()| encoder.finish())
+            .map(|json| Rendered::Body { json, gzip: true })
+            .map_err(|error| error.to_string())?
+    } else {
+        Rendered::Body { json, gzip: false }
+    };
+    Ok((rendered, etag, screen.took_ms))
+}
+
+/// `GET sessions/{name}/panes/{pane}/screen?history=<1..2000>` : l'écran du pane. La session et le pane sont vérifiés
+/// par l'espace de travail (`Probe`) avant toute capture : un identifiant de pane tmux qui n'est pas celui de cette
+/// session n'est jamais lu.
+async fn screen(
+    State(state): State<AppState>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    query: Result<Query<ScreenQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let Some((session, pane)) = pane_target(path) else {
+        return pane_not_found();
+    };
+    let Ok(Query(ScreenQuery { history })) = query else {
+        return error_reply(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    let history = history.unwrap_or(DEFAULT_HISTORY);
+    if !(1..=MAX_HISTORY).contains(&history) {
+        return error_reply(StatusCode::BAD_REQUEST, "bad_request");
+    }
+    let probe = ask(&state.commands, |reply| PaneCommand::Probe {
+        session: session.clone(),
+        pane,
+        reply,
+    })
+    .await;
+    let probe = match probe {
+        Ok(Some(probe)) => probe,
+        Ok(None) => return error_reply(StatusCode::NOT_FOUND, "not_found"),
+        Err(why) => return unanswered_reply(why),
+    };
+    let tmux = Arc::clone(&state.tmux);
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let gzip = accepts_gzip(&headers);
+    let work = tokio::task::spawn_blocking(move || {
+        render_screen(&tmux, pane, history, probe, if_none_match.as_deref(), gzip)
+    });
+    let rendered = match tokio::time::timeout(HTTP_WAIT, work).await {
+        Ok(Ok(Ok(rendered))) => rendered,
+        // tmux n'a pas pu capturer un pane que l'espace de travail vient de nommer : il a disparu entre-temps.
+        Ok(Ok(Err(_))) => return error_reply(StatusCode::NOT_FOUND, "not_found"),
+        Ok(Err(_)) => return error_reply(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        Err(_) => return error_reply(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+    };
+    let (rendered, etag, took_ms) = rendered;
+    hud::log_event(&format!(
+        "companion screen session={session} pane={pane} took_ms={took_ms}"
+    ));
+    let Ok(etag) = HeaderValue::from_str(&etag) else {
+        return error_reply(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+    };
+    let mut response = match rendered {
+        Rendered::NotModified => StatusCode::NOT_MODIFIED.into_response(),
+        Rendered::Body { json, gzip } => {
+            let mut response = (StatusCode::OK, json).into_response();
+            let out = response.headers_mut();
+            out.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            if gzip {
+                out.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            }
+            response
+        }
+    };
+    let out = response.headers_mut();
+    out.insert(header::ETAG, etag);
+    out.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    out.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    response
+}
+
+/// `POST sessions/{name}/panes/{pane}/input` : taper une touche ou un texte. L'instant de réception est pris avant
+/// tout : le fil d'interface jette la commande si elle lui arrive plus de 1,5 s plus tard.
+async fn input(
+    State(state): State<AppState>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    body: Bytes,
+) -> Response {
+    let received_at = Instant::now();
+    let Some((session, pane)) = pane_target(path) else {
+        return pane_not_found();
+    };
+    let (typed, command_id) = match input::parse_input(&body) {
+        Ok(parsed) => parsed,
+        Err(bad) => return error_reply(StatusCode::BAD_REQUEST, bad.error_code()),
+    };
+    let outcome = ask(&state.commands, |reply| PaneCommand::Input {
+        session,
+        pane,
+        input: typed,
+        command_id,
+        received_at,
+        reply,
+    })
+    .await;
+    match outcome {
+        Ok(outcome) => input_reply(outcome),
+        Err(why) => unanswered_reply(why),
+    }
+}
+
+fn input_reply(outcome: InputOutcome) -> Response {
+    let status = match outcome {
+        InputOutcome::Sent | InputOutcome::Duplicate => {
+            return json_reply(
+                StatusCode::OK,
+                serde_json::json!({ "ok": true, "outcome": outcome.as_str() }).to_string(),
+            );
+        }
+        InputOutcome::NoProgram | InputOutcome::ReadOnly => StatusCode::CONFLICT,
+        InputOutcome::Disconnected | InputOutcome::Expired => StatusCode::SERVICE_UNAVAILABLE,
+        InputOutcome::NoPane | InputOutcome::UnknownSession => StatusCode::NOT_FOUND,
+    };
+    error_reply(status, outcome.as_str())
+}
+
+/// `POST sessions/{name}/panes/{pane}/ack` : acquitter ce pane seul. Idempotent.
+async fn ack(
+    State(state): State<AppState>,
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> Response {
+    let Some((session, pane)) = pane_target(path) else {
+        return pane_not_found();
+    };
+    let known = ask(&state.commands, |reply| PaneCommand::Ack {
+        session,
+        pane,
+        origin: AckOrigin::Phone,
+        reply,
+    })
+    .await;
+    match known {
+        Ok(true) => json_reply(
+            StatusCode::OK,
+            serde_json::json!({ "ok": true }).to_string(),
+        ),
+        Ok(false) => error_reply(StatusCode::NOT_FOUND, "not_found"),
+        Err(why) => unanswered_reply(why),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1021,5 +1304,468 @@ mod tests {
         service.wait(|status| status.devices.is_empty());
         let me = service.request("GET", "/idema-api/me", &[("Cookie", cookie.as_str())], None);
         assert_eq!(me.status, 401);
+    }
+
+    // ---- Écran, saisie et acquittement d'un pane ----
+
+    use crate::companion::input::{RemoteInput, RemoteKey};
+    use crate::companion::test_support::{TempDir, fake_tmux, serve_commands};
+    use std::sync::mpsc;
+
+    const SCREEN: &str = "/idema-api/sessions/idema-ab12cd34/panes/5/screen";
+    const INPUT: &str = "/idema-api/sessions/idema-ab12cd34/panes/5/input";
+    const ACK: &str = "/idema-api/sessions/idema-ab12cd34/panes/5/ack";
+    /// Ce que le faux tmux rend à `capture-pane` : des couleurs, une ligne de 300 colonnes, une fin `\n` suivie d'une
+    /// ligne d'espaces, et un octet qui n'est pas de l'UTF-8.
+    fn capture_bytes() -> Vec<u8> {
+        let mut bytes = b"\x1b[31mred\x1b[0m\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', 300));
+        bytes.extend_from_slice(b"\nbad \xff byte\n   \n");
+        bytes
+    }
+
+    /// Un service dont le fil d'interface répond `probe` à toute lecture, avec un faux tmux.
+    fn screen_service(probe: Option<PaneProbe>) -> (Harness, String, std::path::PathBuf) {
+        let dir = TempDir::new("fake-tmux");
+        let (tmux, log) = fake_tmux(&dir.0, &capture_bytes());
+        let mut service = Harness::start_with(dir, true, Some(tmux));
+        serve_commands(&mut service, move |command| {
+            if let PaneCommand::Probe { reply, .. } = command {
+                let _ = reply.send(probe);
+            }
+        });
+        let cookie = service.pair(IPHONE);
+        (service, cookie, log)
+    }
+
+    fn calls(log: &std::path::Path) -> String {
+        std::fs::read_to_string(log).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_screen_route_serves_the_exact_capture_with_an_etag_and_a_304() {
+        let probe = PaneProbe {
+            accepts_input: true,
+            state: "waiting",
+        };
+        let (service, cookie, log) = screen_service(Some(probe));
+        let get = |path: &str, extra: &[(&str, &str)]| {
+            let mut headers = vec![("Cookie", cookie.as_str())];
+            headers.extend_from_slice(extra);
+            service.request("GET", path, &headers, None)
+        };
+        let reply = get(SCREEN, &[]);
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        assert_hardened(&reply, "screen");
+        let json = reply.json();
+        // Le texte est celui de la capture, octet pour octet (le seul octet invalide devient U+FFFD).
+        assert_eq!(
+            json["text"].as_str().unwrap().as_bytes(),
+            String::from_utf8_lossy(&capture_bytes()).as_bytes()
+        );
+        assert!(json["text"].as_str().unwrap().ends_with("byte\n   \n"));
+        assert_eq!(
+            (json["cols"].as_u64(), json["rows"].as_u64()),
+            (Some(80), Some(24))
+        );
+        assert_eq!(json["accepts_input"], true);
+        assert_eq!(json["state"], "waiting");
+        assert!(json["took_ms"].is_u64());
+        let etag = reply.header("etag").expect("an ETag").to_owned();
+
+        // Une seconde lecture sans changement : 304, même ETag, pas de corps.
+        let again = get(SCREEN, &[("If-None-Match", &etag)]);
+        assert_eq!(again.status, 304);
+        assert_eq!(again.header("etag"), Some(etag.as_str()));
+        assert!(again.body.is_empty());
+        // Un autre ETag n'est pas pris pour celui-là.
+        assert_eq!(get(SCREEN, &[("If-None-Match", "\"autre\"")]).status, 200);
+
+        // Par défaut 200 lignes d'historique ; la capture se fait avec les options de la spec.
+        let log = calls(&log);
+        assert!(log.contains("capture-pane -p -e -J -t %5 -S -200"), "{log}");
+        assert!(log.contains("display-message -p -t %5"), "{log}");
+    }
+
+    #[test]
+    fn the_etag_follows_what_the_pane_accepts_not_only_its_text() {
+        let dir = TempDir::new("etag-follows");
+        let (tmux, _log) = fake_tmux(&dir.0, b"same\n");
+        let mut service = Harness::start_with(dir, true, Some(tmux));
+        let accepts = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let seen = Arc::clone(&accepts);
+        serve_commands(&mut service, move |command| {
+            if let PaneCommand::Probe { reply, .. } = command {
+                let _ = reply.send(Some(PaneProbe {
+                    accepts_input: seen.load(std::sync::atomic::Ordering::SeqCst),
+                    state: "running",
+                }));
+            }
+        });
+        let cookie = service.pair(IPHONE);
+        let first = service.request("GET", SCREEN, &[("Cookie", &cookie)], None);
+        let etag = first.header("etag").unwrap().to_owned();
+        accepts.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Même texte, mais le pane n'accepte plus de saisie : un 304 ferait garder la barre de réponse à la page.
+        let after = service.request(
+            "GET",
+            SCREEN,
+            &[("Cookie", &cookie), ("If-None-Match", &etag)],
+            None,
+        );
+        assert_eq!(after.status, 200);
+        assert_eq!(after.json()["accepts_input"], false);
+        assert_ne!(after.header("etag"), Some(etag.as_str()));
+    }
+
+    #[test]
+    fn the_screen_is_compressed_only_when_the_client_asks() {
+        use std::io::Read as _;
+        let (service, cookie, _log) = screen_service(Some(PaneProbe {
+            accepts_input: false,
+            state: "idle",
+        }));
+        let plain = service.request("GET", SCREEN, &[("Cookie", &cookie)], None);
+        assert_eq!(plain.header("content-encoding"), None);
+        let zipped = service.request(
+            "GET",
+            SCREEN,
+            &[("Cookie", &cookie), ("Accept-Encoding", "br, gzip;q=0.8")],
+            None,
+        );
+        assert_eq!(zipped.header("content-encoding"), Some("gzip"));
+        let mut inflated = Vec::new();
+        flate2::read::GzDecoder::new(&zipped.body[..])
+            .read_to_end(&mut inflated)
+            .unwrap();
+        // Le même écran (la durée de capture change d'une lecture à l'autre).
+        let inflated: serde_json::Value = serde_json::from_slice(&inflated).unwrap();
+        assert_eq!(inflated["text"], plain.json()["text"]);
+        assert_eq!(inflated["cols"], plain.json()["cols"]);
+        // `gzip;q=0` refuse la compression.
+        let refused = service.request(
+            "GET",
+            SCREEN,
+            &[
+                ("Cookie", &cookie),
+                ("Accept-Encoding", "gzip;q=0, identity"),
+            ],
+            None,
+        );
+        assert_eq!(refused.header("content-encoding"), None);
+        assert_eq!(refused.json()["text"], plain.json()["text"]);
+    }
+
+    #[test]
+    fn history_is_bounded_and_passed_to_tmux() {
+        let (service, cookie, log) = screen_service(Some(PaneProbe {
+            accepts_input: false,
+            state: "idle",
+        }));
+        let get = |query: &str| {
+            service.request(
+                "GET",
+                &format!("{SCREEN}{query}"),
+                &[("Cookie", &cookie)],
+                None,
+            )
+        };
+        for bad in ["?history=0", "?history=2001", "?history=abc", "?history=-5"] {
+            assert_eq!(get(bad).status, 400, "{bad}");
+        }
+        assert_eq!(get("?history=2000").status, 200);
+        assert_eq!(get("?history=1").status, 200);
+        let log = calls(&log);
+        assert!(log.contains("-S -2000"), "{log}");
+        assert!(log.contains("-S -1"), "{log}");
+        // Les refus n'ont rien capturé : trois captures seulement.
+        assert_eq!(log.matches("capture-pane").count(), 2, "{log}");
+    }
+
+    #[test]
+    fn an_unknown_session_or_pane_takes_a_404_and_nothing_is_captured() {
+        let (service, cookie, log) = screen_service(None);
+        let get = |path: &str| service.request("GET", path, &[("Cookie", &cookie)], None);
+        assert_eq!(get(SCREEN).status, 404);
+        assert_eq!(get(SCREEN).json()["error"], "not_found");
+        assert_eq!(
+            get("/idema-api/sessions/idema-ab12cd34/panes/%255/screen").status,
+            404
+        );
+        assert_eq!(
+            get("/idema-api/sessions/idema-ab12cd34/panes/abc/screen").status,
+            404
+        );
+        assert_eq!(
+            calls(&log).matches("capture-pane").count(),
+            0,
+            "{}",
+            calls(&log)
+        );
+    }
+
+    /// Ce que le faux fil d'interface a reçu d'une saisie : session, pane, saisie, `command_id`.
+    type SeenInput = (String, u32, RemoteInput, String);
+
+    /// Un service dont le fil d'interface note chaque commande reçue et répond `outcome` aux saisies.
+    fn input_service(outcome: InputOutcome) -> (Harness, String, mpsc::Receiver<SeenInput>) {
+        let mut service = Harness::start(true);
+        let (sender, received) = mpsc::channel();
+        serve_commands(&mut service, move |command| {
+            if let PaneCommand::Input {
+                session,
+                pane,
+                input,
+                command_id,
+                reply,
+                ..
+            } = command
+            {
+                let _ = sender.send((session, pane, input, command_id));
+                let _ = reply.send(outcome);
+            }
+        });
+        let cookie = service.pair(IPHONE);
+        (service, cookie, received)
+    }
+
+    #[test]
+    fn an_input_reaches_the_workspace_with_its_session_pane_and_id() {
+        let (service, cookie, received) = input_service(InputOutcome::Sent);
+        let reply = service.request(
+            "POST",
+            INPUT,
+            &[JSON, ("Cookie", &cookie)],
+            Some(r#"{"key":"y","enter":true,"command_id":"abc-1"}"#),
+        );
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        assert_eq!(
+            reply.json(),
+            serde_json::json!({ "ok": true, "outcome": "sent" })
+        );
+        assert_eq!(
+            received.try_recv().unwrap(),
+            (
+                "idema-ab12cd34".to_owned(),
+                5,
+                RemoteInput::Key {
+                    key: RemoteKey::Y,
+                    enter: true
+                },
+                "abc-1".to_owned()
+            )
+        );
+        let text = service.request(
+            "POST",
+            INPUT,
+            &[JSON, ("Cookie", &cookie)],
+            Some(r#"{"text":"voir le diff","enter":false,"command_id":"abc-2"}"#),
+        );
+        assert_eq!(text.status, 200);
+        assert_eq!(
+            received.try_recv().unwrap().2,
+            RemoteInput::Text {
+                text: "voir le diff".into(),
+                enter: false
+            }
+        );
+    }
+
+    #[test]
+    fn every_outcome_has_its_status_and_none_but_sent_and_duplicate_succeed() {
+        let cases = [
+            (InputOutcome::Sent, 200, "sent"),
+            (InputOutcome::Duplicate, 200, "duplicate"),
+            (InputOutcome::NoProgram, 409, "no_program"),
+            (InputOutcome::ReadOnly, 409, "read_only"),
+            (InputOutcome::Disconnected, 503, "disconnected"),
+            (InputOutcome::NoPane, 404, "no_pane"),
+            (InputOutcome::UnknownSession, 404, "unknown_session"),
+            (InputOutcome::Expired, 503, "expired"),
+        ];
+        for (outcome, status, word) in cases {
+            let (service, cookie, _received) = input_service(outcome);
+            let reply = service.request(
+                "POST",
+                INPUT,
+                &[JSON, ("Cookie", &cookie)],
+                Some(r#"{"key":"1","command_id":"c"}"#),
+            );
+            assert_eq!(reply.status, status, "{word}");
+            let json = reply.json();
+            if status == 200 {
+                assert_eq!(
+                    (json["ok"].clone(), json["outcome"].clone()),
+                    (true.into(), word.into())
+                );
+            } else {
+                assert_eq!(json["error"], word, "{word}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_input_body_takes_a_400_and_never_reaches_the_workspace() {
+        let (service, cookie, received) = input_service(InputOutcome::Sent);
+        let cases = [
+            ("nope", "not_json"),
+            (r#"{"command_id":"c"}"#, "neither_key_nor_text"),
+            (
+                r#"{"key":"y","text":"a","command_id":"c"}"#,
+                "both_key_and_text",
+            ),
+            (r#"{"key":"F5","command_id":"c"}"#, "unknown_key"),
+            (r#"{"text":"","command_id":"c"}"#, "empty_text"),
+            (r#"{"text":"a\nb","command_id":"c"}"#, "control_char"),
+            (r#"{"text":"a\u0085b","command_id":"c"}"#, "control_char"),
+            (r#"{"key":"y"}"#, "missing_command_id"),
+        ];
+        for (body, error) in cases {
+            let reply = service.request("POST", INPUT, &[JSON, ("Cookie", &cookie)], Some(body));
+            assert_eq!(reply.status, 400, "{body}");
+            assert_eq!(reply.json()["error"], error, "{body}");
+        }
+        let too_long = format!(r#"{{"text":"{}","command_id":"c"}}"#, "a".repeat(1025));
+        let reply = service.request("POST", INPUT, &[JSON, ("Cookie", &cookie)], Some(&too_long));
+        assert_eq!(
+            (reply.status, reply.json()["error"].clone()),
+            (400, "text_too_long".into())
+        );
+        assert!(received.try_recv().is_err(), "no command was queued");
+    }
+
+    #[test]
+    fn the_input_route_is_closed_to_a_stranger_and_types_nothing() {
+        let (service, cookie, received) = input_service(InputOutcome::Sent);
+        let body = Some(r#"{"key":"y","command_id":"c"}"#);
+        let anonymous = service.request("POST", INPUT, &[JSON], body);
+        assert_eq!(anonymous.status, 401);
+        let wrong_type = service.request(
+            "POST",
+            INPUT,
+            &[("Cookie", &cookie), ("Content-Type", "text/plain")],
+            body,
+        );
+        assert_eq!(wrong_type.status, 415);
+        let foreign = service.request(
+            "POST",
+            INPUT,
+            &[
+                JSON,
+                ("Cookie", &cookie),
+                ("Origin", "https://evil.example"),
+            ],
+            body,
+        );
+        assert_eq!(foreign.status, 403);
+        let get = service.request("GET", INPUT, &[("Cookie", &cookie)], None);
+        assert_ne!(get.status, 200);
+        assert!(
+            received.try_recv().is_err(),
+            "nothing reached the workspace"
+        );
+        // Le cookie d'un appareil oublié n'ouvre rien non plus.
+        let forgotten = service.pair("Mozilla/5.0 (iPad)");
+        let id = service
+            .request("GET", "/idema-api/me", &[("Cookie", &forgotten)], None)
+            .json()["device"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        service.request(
+            "POST",
+            "/idema-api/test/forget",
+            &[JSON],
+            Some(&serde_json::json!({ "id": id }).to_string()),
+        );
+        let after = service.request("POST", INPUT, &[JSON, ("Cookie", &forgotten)], body);
+        assert_eq!(after.status, 401);
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_unanswered_input_takes_a_503_expired_after_the_http_wait() {
+        let mut service = Harness::start(true);
+        let (sender, received) = mpsc::channel();
+        // Le fil d'interface reçoit la commande et ne répond pas.
+        serve_commands(&mut service, move |command| {
+            if let PaneCommand::Input {
+                received_at, reply, ..
+            } = command
+            {
+                let _ = sender.send(received_at);
+                std::mem::forget(reply);
+            }
+        });
+        let cookie = service.pair(IPHONE);
+        let started = Instant::now();
+        let reply = service.request(
+            "POST",
+            INPUT,
+            &[JSON, ("Cookie", &cookie)],
+            Some(r#"{"key":"y","command_id":"c"}"#),
+        );
+        assert_eq!(
+            (reply.status, reply.json()["error"].clone()),
+            (503, "expired".into())
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= input::HTTP_WAIT && waited < input::HTTP_WAIT + Duration::from_millis(1000),
+            "waited {waited:?}"
+        );
+        // La commande portait l'instant de réception HTTP, pris avant l'envoi.
+        let received_at = received.try_recv().expect("the command was queued");
+        assert!(received_at >= started);
+        assert!(received_at.duration_since(started) < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_workspace_that_is_gone_takes_a_503_not_a_hang() {
+        let mut service = Harness::start(true);
+        drop(service.commands.take());
+        let cookie = service.pair(IPHONE);
+        let started = Instant::now();
+        let reply = service.request(
+            "POST",
+            INPUT,
+            &[JSON, ("Cookie", &cookie)],
+            Some(r#"{"key":"y","command_id":"c"}"#),
+        );
+        assert_eq!(reply.status, 503);
+        assert_eq!(reply.json()["error"], "unavailable");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let screen = service.request("GET", SCREEN, &[("Cookie", &cookie)], None);
+        assert_eq!(screen.status, 503);
+    }
+
+    #[test]
+    fn an_acknowledgement_asks_for_the_phone_origin_and_maps_the_answer() {
+        for (known, status) in [(true, 200), (false, 404)] {
+            let mut service = Harness::start(true);
+            let (sender, received) = mpsc::channel();
+            serve_commands(&mut service, move |command| {
+                if let PaneCommand::Ack {
+                    session,
+                    pane,
+                    origin,
+                    reply,
+                } = command
+                {
+                    let _ = sender.send((session, pane, origin));
+                    let _ = reply.send(known);
+                }
+            });
+            let cookie = service.pair(IPHONE);
+            let reply = service.request("POST", ACK, &[JSON, ("Cookie", &cookie)], Some("{}"));
+            assert_eq!(reply.status, status);
+            assert_eq!(
+                received.try_recv().unwrap(),
+                ("idema-ab12cd34".to_owned(), 5, AckOrigin::Phone)
+            );
+            let wrong_type = service.request("POST", ACK, &[("Cookie", &cookie)], Some("{}"));
+            assert_eq!(wrong_type.status, 415);
+            assert!(received.try_recv().is_err());
+        }
     }
 }
