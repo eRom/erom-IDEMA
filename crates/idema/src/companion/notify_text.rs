@@ -228,6 +228,18 @@ mod tests {
         "   \n",
     );
 
+    /// Le pied de page d'un vrai pane de Claude Code, sous le menu : un trait horizontal `─` en gris (SGR 38;5;244), l'invite
+    /// `❯` vide, un second trait, une ligne de statut en segments à fond coloré (SGR 48;5;n, caractères de bloc entre les
+    /// segments), une ligne de quotas grisée, une ligne de mode en rose. Contenu synthétique, forme relevée.
+    const CLAUDE_FOOTER: &str = concat!(
+        "\u{1b}[38;5;244m────────────────────────────────────────────────────\u{1b}[39m\n",
+        "\u{1b}[39m❯ \n",
+        "\u{1b}[38;5;244m────────────────────────────────────────────────────\u{1b}[39m\n",
+        "\u{1b}[39m  \u{1b}[38;5;235m\u{1b}[48;5;117m Opus 4 \u{1b}[48;5;215m▏ ctx 12% \u{1b}[48;5;149m▏ main \u{1b}[48;5;59m\u{1b}[38;5;255m 14:02 \u{1b}[39m\u{1b}[49m\n",
+        "  \u{1b}[2m\u{1b}[38;5;246mweekly\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;149m41%\u{1b}[38;5;246m - reset 14:00\u{1b}[2m\u{1b}[90m | \u{1b}[38;5;246mdaily\u{1b}[0m\n",
+        "  \u{1b}[38;5;211m⏵⏵ accept edits on\u{1b}[38;5;246m (shift+tab to cycle)\u{1b}[39m\n",
+    );
+
     /// Un menu à la forme de Codex, relevée sur un vrai pane de Codex : couleurs 24 bits (`38;2;r;g;b`), `›` devant le
     /// choix courant, lignes d'aide grisées (SGR 2), sans cadre.
     const CODEX_MENU: &str = concat!(
@@ -359,6 +371,27 @@ mod tests {
         {
             assert!(!line.chars().any(char::is_control), "{line:?}");
         }
+    }
+
+    /// Sur un écran entier de Claude Code, le menu est suivi du pied de page de l'agent : la règle (les trois dernières
+    /// lignes qui ont une lettre ou un chiffre) rend alors les trois lignes de ce pied de page, pas celles du menu.
+    #[test]
+    fn a_claude_footer_is_what_the_rule_really_keeps() {
+        let screen = format!("{CLAUDE_MENU}{CLAUDE_FOOTER}");
+        assert_eq!(
+            useful_lines(&screen, 3),
+            [
+                "Opus 4 ▏ ctx 12% ▏ main  14:02",
+                "weekly 41% - reset 14:00 | daily",
+                "⏵⏵ accept edits on (shift+tab to cycle)",
+            ]
+        );
+        // Les traits horizontaux et l'invite vide du pied de page n'y comptent pas ; le menu est juste au-dessus.
+        assert_eq!(useful_lines(&screen, 4)[0], "Esc to cancel");
+        assert_eq!(
+            useful_lines(&screen, 5)[0],
+            "3. No, and tell Claude what to do differently"
+        );
     }
 
     #[test]

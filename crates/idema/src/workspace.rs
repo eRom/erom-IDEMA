@@ -42,7 +42,9 @@ use crate::changes::panel::{
     render_panel as render_changes_panel, target_menu,
 };
 use crate::commit_message::CommitMessageSettings;
-use crate::companion::episodes::{EpisodeChange, EpisodeKind, episode_changes, urgent_pane};
+use crate::companion::episodes::{
+    EpisodeChange, EpisodeKind, episode_changes, no_pane_waiting, urgent_pane,
+};
 use crate::companion::fleet::{FleetPane, SessionInput, compose_fleet, mac_name, state_label};
 use crate::companion::input::{
     ENTER_DELAY, Gate, RemoteInput, enter_still_allowed, gate, is_expired,
@@ -4302,6 +4304,35 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Un pane a changé d'état : si plus aucun pane de la session n'attend, l'épisode « attend » est fini. Ce que l'état
+    /// agrégé ne dit pas toujours : un pane caché qui attendait pendant que la session était en erreur a ouvert un
+    /// épisode (`on_hidden_pane_waiting`) que le passage de la session hors de « attend » ne clôt jamais. La clôture
+    /// d'un épisode qui n'existe pas est sans effet.
+    fn close_waiting_episode_if_over(&self, view: &Entity<SessionView>, cx: &App) {
+        if !self.companion.is_on() {
+            return;
+        }
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.view.as_ref() == Some(view))
+        else {
+            return;
+        };
+        let panes: Vec<(u32, bool, ActivityState)> = view
+            .read(cx)
+            .pane_states(cx)
+            .into_iter()
+            .map(|(pane, active, state)| (pane.0, active, state))
+            .collect();
+        if no_pane_waiting(&panes) {
+            self.companion.send(ServiceEvent::EpisodeClosed {
+                session: entry.summary.name.clone(),
+                kind: EpisodeKind::Waiting,
+            });
+        }
+    }
+
     /// Dit au compagnon ce que le passage de `states.0` à `states.1` change aux épisodes de la session (spec §3.7) :
     /// un épisode « attend » quand le son retentirait (`chimes`, que le son soit coupé ou non), un épisode « erreur »
     /// au passage en erreur d'une session qui compte au badge, et la clôture de celui que l'état vient de quitter.
@@ -4542,7 +4573,10 @@ impl Workspace {
                 self.publish_fleet(cx);
                 cx.notify();
             }
-            SessionEvent::PanesChanged => self.publish_fleet(cx),
+            SessionEvent::PanesChanged => {
+                self.publish_fleet(cx);
+                self.close_waiting_episode_if_over(view, cx);
+            }
             SessionEvent::StateChanged { previous, current } => {
                 self.on_state_changed(view, *previous, *current, cx);
             }

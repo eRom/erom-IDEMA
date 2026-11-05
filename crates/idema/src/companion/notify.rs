@@ -33,14 +33,16 @@ const BODY_LINES: usize = 3;
 pub enum Message {
     /// Un événement de l'espace de travail (épisode, présence, saisie du téléphone, config).
     Event(ServiceEvent),
-    /// La page déclare le pane qu'elle montre au premier plan, ou plus aucun (`PUT presence`).
-    Watch(Option<(String, u32)>),
-    /// Un envoi est fini.
-    Finished {
-        session: String,
-        kind: EpisodeKind,
-        verdict: Verdict,
+    /// La page de cet appareil déclare le pane qu'elle montre au premier plan, ou plus aucun (`PUT presence`).
+    Watch {
+        device: String,
+        declared: Option<(String, u32)>,
     },
+    /// Un appareil vient de s'abonner : un épisode retenu faute d'appareil est à réévaluer sans attendre un événement.
+    Wake,
+    /// Un envoi est fini. `due` désigne l'épisode (session, type et identité) : si l'épisode a été clos puis rouvert
+    /// entre-temps, le résultat ne le touche pas.
+    Finished { due: Due, verdict: Verdict },
 }
 
 /// Ce qu'un épisode retient de l'envoi, tous appareils confondus.
@@ -50,8 +52,10 @@ pub enum Verdict {
     Sent,
     /// Aucun n'a pu la recevoir, et au moins un échec est passager : renvoi à la fin de l'anti-rafale.
     RetryLater,
-    /// Aucun appareil à joindre, ou réponses sans appel : l'épisode ne sera plus envoyé.
+    /// Réponses sans appel (abonnement mort, refus définitif) : l'épisode ne sera plus envoyé.
     Done,
+    /// Plus aucun appareil abonné au moment d'envoyer : l'épisode reste en attente, retenu faute d'appareil.
+    NoDevice,
 }
 
 /// Les réglages de notification d'une section `[companion]`.
@@ -135,25 +139,30 @@ fn apply(message: Message, episodes: &mut Episodes, notifier: &Notifier) {
             | ServiceEvent::CancelPairing
             | ServiceEvent::ForgetDevice { .. } => {}
         },
-        Message::Watch(Some((session, pane))) => {
-            if episodes.watch(&session, pane, now) == OpenOutcome::AutoAck {
+        Message::Watch {
+            device,
+            declared: Some((session, pane)),
+        } => {
+            if episodes.watch(&device, &session, pane, now) == OpenOutcome::AutoAck {
                 acknowledge(&notifier.commands, session, pane);
             }
         }
-        Message::Watch(None) => episodes.unwatch(),
-        Message::Finished {
-            session,
-            kind,
-            verdict,
-        } => match verdict {
-            Verdict::Sent => episodes.delivered(&session, kind, now),
-            Verdict::Done => episodes.abandon(&session, kind),
+        Message::Watch {
+            device,
+            declared: None,
+        } => episodes.unwatch(&device),
+        // Rien à appliquer : la boucle réévalue ce qui est dû à chaque message.
+        Message::Wake => {}
+        Message::Finished { due, verdict } => match verdict {
+            Verdict::Sent => episodes.delivered(&due, now),
+            Verdict::Done => episodes.abandon(&due),
+            Verdict::NoDevice => episodes.release(&due),
             Verdict::RetryLater => {
-                if !episodes.retry_later(&session, kind, now) {
+                if !episodes.retry_later(&due, now) {
                     hud::log_event(&format!(
                         "companion push failed kind={} session={} reason=gave_up",
-                        kind.as_str(),
-                        log_safe(&session)
+                        due.kind.as_str(),
+                        log_safe(&due.session)
                     ));
                 }
             }
@@ -175,11 +184,7 @@ fn acknowledge(commands: &CommandSender<PaneCommand>, session: String, pane: u32
 /// Envoie la notification d'un épisode, puis rend son verdict à la boucle.
 async fn deliver(notifier: Arc<Notifier>, due: Due) {
     let verdict = send_episode(&notifier, &due).await;
-    let _ = notifier.inbox.send(Message::Finished {
-        session: due.session,
-        kind: due.kind,
-        verdict,
-    });
+    let _ = notifier.inbox.send(Message::Finished { due, verdict });
 }
 
 async fn send_episode(notifier: &Arc<Notifier>, due: &Due) -> Verdict {
@@ -220,21 +225,25 @@ async fn send_episode(notifier: &Arc<Notifier>, due: &Due) -> Verdict {
         due.pane,
         fleet.badge,
     );
-    let sends = notifier
-        .access
-        .subscriptions()
-        .into_iter()
-        .map(|subscription| {
-            send_one(
-                Arc::clone(notifier),
-                Arc::clone(&push),
-                due.clone(),
-                subscription,
-                full.clone(),
-                shrunk.clone(),
-            )
-        });
+    let subscriptions = notifier.access.subscriptions();
+    if subscriptions.is_empty() {
+        // Les appareils ont été oubliés ou désabonnés pendant la capture : l'épisode attend le prochain abonné.
+        return Verdict::NoDevice;
+    }
+    let sends = subscriptions.into_iter().map(|subscription| {
+        send_one(
+            Arc::clone(notifier),
+            Arc::clone(&push),
+            due.clone(),
+            subscription,
+            full.clone(),
+            shrunk.clone(),
+        )
+    });
     let results = join_all(sends).await;
+    // Un épisode est notifié dès qu'un appareil a reçu un 201 ; un appareil en échec passager (429, 5xx, délai) n'est pas
+    // relancé tant qu'un autre a reçu (choix de la v1, R17). Sans aucun 201, un échec passager relance l'épisode pour
+    // tous les appareils, à la fin de l'anti-rafale.
     if results.contains(&Delivery::Sent) {
         Verdict::Sent
     } else if results.contains(&Delivery::RetryLater) {
@@ -466,7 +475,11 @@ mod tests {
         }
 
         fn declare(&self, body: &str) -> crate::companion::test_support::Reply {
-            let cookie = &self.devices[0].2;
+            self.declare_as(0, body)
+        }
+
+        fn declare_as(&self, device: usize, body: &str) -> crate::companion::test_support::Reply {
+            let cookie = &self.devices[device].2;
             self.service.request(
                 "PUT",
                 "/idema-api/presence",
@@ -582,6 +595,61 @@ mod tests {
             requests[1].header("Topic"),
             Some(webpush::topic(SESSION).as_str())
         );
+    }
+
+    /// Un appareil qui dit ne plus rien regarder n'efface pas la déclaration d'un autre.
+    #[test]
+    fn one_device_clearing_its_watch_leaves_the_others_in_place() {
+        let mut rig = Rig::start((201, ""), &[("phone", IPHONE), ("tablet", IPAD)]);
+        let (acks, received) = std::sync::mpsc::channel();
+        crate::companion::test_support::serve_commands(&mut rig.service, move |command| {
+            if let PaneCommand::Ack {
+                session,
+                pane,
+                reply,
+                ..
+            } = command
+            {
+                let _ = acks.send((session, pane));
+                let _ = reply.send(true);
+            }
+        });
+        rig.away();
+        let body = format!(r#"{{"session":"{SESSION}","pane":4}}"#);
+        assert_eq!(rig.declare_as(0, &body).status, 200);
+        assert_eq!(
+            rig.declare_as(1, "null").status,
+            200,
+            "the tablet watches nothing"
+        );
+        rig.send(opened(SESSION, 4, EpisodeKind::Waiting));
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (SESSION.to_owned(), 4),
+            "the phone still watches the pane"
+        );
+        assert!(rig.fake.requests().is_empty());
+    }
+
+    /// Un épisode retenu faute d'appareil part dès qu'un appareil s'abonne, sans autre événement.
+    #[test]
+    fn subscribing_wakes_an_episode_held_for_lack_of_a_device() {
+        let rig = Rig::start((201, ""), &[]);
+        rig.away();
+        rig.send(opened(SESSION, 4, EpisodeKind::Waiting));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(rig.fake.requests().is_empty(), "nobody to tell");
+        let cookie = rig.service.pair(IPHONE);
+        let keys = PhoneKeys::new();
+        let put = rig.service.request(
+            "PUT",
+            "/idema-api/push/subscription",
+            &[JSON, ("Cookie", &cookie)],
+            Some(&keys.subscription_body("https://web.push.apple.com/QXX-late")),
+        );
+        assert_eq!(put.status, 200, "{}", put.text());
+        let requests = rig.fake.wait_for(1);
+        assert_eq!(requests[0].path, "/QXX-late");
     }
 
     #[test]

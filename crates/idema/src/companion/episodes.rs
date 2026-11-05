@@ -75,12 +75,15 @@ impl Held {
     }
 }
 
-/// Un épisode à notifier maintenant.
+/// Un épisode à notifier maintenant. `seq` identifie l'épisode (posé à son ouverture) : un résultat d'envoi qui revient
+/// après que l'épisode a été clos, puis rouvert, ne touche pas le nouveau (`delivered`, `abandon`, `retry_later` et
+/// `release` comparent `seq`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Due {
     pub session: String,
     pub pane: u32,
     pub kind: EpisodeKind,
+    pub seq: u64,
 }
 
 /// Ce que l'état d'une session change aux épisodes.
@@ -102,12 +105,16 @@ enum Phase {
 }
 
 struct Episode {
+    /// L'identité de l'épisode : un épisode clos puis rouvert en a une autre.
+    seq: u64,
     pane: u32,
     phase: Phase,
     /// Renvois déjà demandés par `retry_later`.
     retries: u8,
     /// La dernière raison dite pour cet épisode : une retenue n'est rapportée qu'une fois, pas à chaque tour.
     last_held: Option<Held>,
+    /// L'anti-rafale de la session avant le départ de l'envoi en cours, que `release` rétablit.
+    attempt_before: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -132,6 +139,13 @@ impl Slot {
             EpisodeKind::Error => &mut self.error,
         }
     }
+
+    /// L'épisode que ce `Due` désigne, s'il existe encore (même type, même `seq`).
+    fn episode_of(&mut self, due: &Due) -> Option<&mut Episode> {
+        self.episode_mut(due.kind)
+            .as_mut()
+            .filter(|episode| episode.seq == due.seq)
+    }
 }
 
 struct Watch {
@@ -150,8 +164,11 @@ impl Watch {
 pub struct Episodes {
     policy: Policy,
     away: bool,
-    watch: Option<Watch>,
+    /// Le pane que chaque appareil dit regarder (une déclaration par appareil : le `null` d'un appareil n'efface pas
+    /// celle d'un autre).
+    watches: BTreeMap<String, Watch>,
     sessions: BTreeMap<String, Slot>,
+    next_seq: u64,
 }
 
 const KINDS: [EpisodeKind; 2] = [EpisodeKind::Waiting, EpisodeKind::Error];
@@ -161,8 +178,9 @@ impl Episodes {
         Self {
             policy,
             away: false,
-            watch: None,
+            watches: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            next_seq: 0,
         }
     }
 
@@ -179,7 +197,16 @@ impl Episodes {
         }
     }
 
-    /// Un épisode s'ouvre. Un pane regardé sur le téléphone est acquitté aussitôt (`AutoAck`) et ne devient pas un
+    /// Jusqu'à quand un appareil au moins déclare regarder ce pane (le plus tard de ses déclarations), s'il en est un.
+    fn watched_until(&self, session: &str, pane: u32, now: Instant) -> Option<Instant> {
+        self.watches
+            .values()
+            .filter(|watch| watch.holds(session, pane, now))
+            .map(|watch| watch.declared_at + WATCH_TTL)
+            .max()
+    }
+
+    /// Un épisode s'ouvre. Un pane regardé sur un téléphone est acquitté aussitôt (`AutoAck`) et ne devient pas un
     /// épisode à notifier ; sinon l'épisode attend ses conditions. Rouvrir un épisode déjà ouvert de ce type ne fait
     /// rien (il n'est notifié qu'une fois).
     pub fn open(
@@ -189,20 +216,23 @@ impl Episodes {
         kind: EpisodeKind,
         now: Instant,
     ) -> OpenOutcome {
-        if self
-            .watch
-            .as_ref()
-            .is_some_and(|watch| watch.holds(session, pane, now))
-        {
+        if self.watched_until(session, pane, now).is_some() {
             return OpenOutcome::AutoAck;
         }
+        let seq = self.next_seq;
         let slot = self.sessions.entry(session.to_owned()).or_default();
-        slot.episode_mut(kind).get_or_insert(Episode {
-            pane,
-            phase: Phase::Pending,
-            retries: 0,
-            last_held: None,
-        });
+        let episode = slot.episode_mut(kind);
+        if episode.is_none() {
+            self.next_seq += 1;
+            *episode = Some(Episode {
+                seq,
+                pane,
+                phase: Phase::Pending,
+                retries: 0,
+                last_held: None,
+                attempt_before: None,
+            });
+        }
         OpenOutcome::Pending
     }
 
@@ -226,13 +256,19 @@ impl Episodes {
         }
     }
 
-    /// La page déclare regarder ce pane. `AutoAck` quand ce pane a déjà un épisode ouvert : il est à acquitter aussi.
-    pub fn watch(&mut self, session: &str, pane: u32, now: Instant) -> OpenOutcome {
-        self.watch = Some(Watch {
-            session: session.to_owned(),
-            pane,
-            declared_at: now,
-        });
+    /// L'appareil `device` déclare regarder ce pane. `AutoAck` quand ce pane a déjà un épisode ouvert : il est à acquitter
+    /// aussi.
+    pub fn watch(&mut self, device: &str, session: &str, pane: u32, now: Instant) -> OpenOutcome {
+        self.watches
+            .retain(|_, watch| now < watch.declared_at + WATCH_TTL);
+        self.watches.insert(
+            device.to_owned(),
+            Watch {
+                session: session.to_owned(),
+                pane,
+                declared_at: now,
+            },
+        );
         let open_there = self.sessions.get(session).is_some_and(|slot| {
             KINDS.iter().any(|kind| {
                 slot.episode(*kind)
@@ -246,15 +282,15 @@ impl Episodes {
         }
     }
 
-    /// La déclaration est retirée (la page est passée en arrière-plan).
-    pub fn unwatch(&mut self) {
-        self.watch = None;
+    /// L'appareil `device` ne regarde plus rien (la page est passée en arrière-plan). Les autres appareils gardent la leur.
+    pub fn unwatch(&mut self, device: &str) {
+        self.watches.remove(device);
     }
 
     /// Les épisodes à notifier maintenant, et ceux que leur raison retient (chacune rapportée une fois, quand elle
     /// change). `subscribers` : le nombre d'appareils abonnés. Les conditions se lisent dans l'ordre de la spec :
     /// type activé, Romain absent, pane non regardé, anti-rafale, au moins un appareil. Un épisode rendu est « en vol » :
-    /// il ne repart que si `retry_later` le remet en attente.
+    /// il ne repart que si `retry_later` ou `release` le remet en attente.
     pub fn due(&mut self, now: Instant, subscribers: usize) -> (Vec<Due>, Vec<(Due, Held)>) {
         let mut ready = Vec::new();
         let mut held = Vec::new();
@@ -263,12 +299,11 @@ impl Episodes {
             EpisodeKind::Waiting => policy.notify_waiting,
             EpisodeKind::Error => policy.notify_error,
         };
-        let watch = self.watch.as_ref();
+        let watches = &self.watches;
         for (session, slot) in &mut self.sessions {
             for kind in KINDS {
-                let cooling = slot
-                    .last_attempt
-                    .is_some_and(|attempt| now < attempt + COOLDOWN);
+                let before = slot.last_attempt;
+                let cooling = before.is_some_and(|attempt| now < attempt + COOLDOWN);
                 let Some(episode) = slot.episode_mut(kind).as_mut() else {
                     continue;
                 };
@@ -279,7 +314,10 @@ impl Episodes {
                     Some(Held::Disabled)
                 } else if !away {
                     Some(Held::Present)
-                } else if watch.is_some_and(|watch| watch.holds(session, episode.pane, now)) {
+                } else if watches
+                    .values()
+                    .any(|watch| watch.holds(session, episode.pane, now))
+                {
                     // Regardé : l'acquittement est en route, il n'y a rien à dire ni à envoyer.
                     episode.last_held = None;
                     continue;
@@ -294,6 +332,7 @@ impl Episodes {
                     session: session.clone(),
                     pane: episode.pane,
                     kind,
+                    seq: episode.seq,
                 };
                 match verdict {
                     Some(reason) => {
@@ -305,6 +344,7 @@ impl Episodes {
                     None => {
                         episode.phase = Phase::InFlight;
                         episode.last_held = None;
+                        episode.attempt_before = before;
                         // La tentative compte dès son départ : un second épisode de la session, dans ce même tour,
                         // est déjà dans l'anti-rafale.
                         slot.last_attempt = Some(now);
@@ -324,39 +364,55 @@ impl Episodes {
         (ready, held)
     }
 
-    /// Le service push a pris la notification : l'épisode est notifié, et l'anti-rafale part de maintenant.
-    pub fn delivered(&mut self, session: &str, kind: EpisodeKind, now: Instant) {
-        let Some(slot) = self.sessions.get_mut(session) else {
+    /// Le service push a pris la notification : l'épisode est notifié, et l'anti-rafale part de maintenant. Sans effet si
+    /// l'épisode a été clos entre-temps (et rouvert : un autre `seq`).
+    pub fn delivered(&mut self, due: &Due, now: Instant) {
+        let Some(slot) = self.sessions.get_mut(&due.session) else {
             return;
         };
-        if let Some(episode) = slot.episode_mut(kind) {
+        if let Some(episode) = slot.episode_of(due) {
             episode.phase = Phase::Done;
             slot.last_attempt = Some(now);
         }
     }
 
     /// L'envoi a reçu une réponse sans appel (ni succès ni raison de réessayer) : l'épisode ne sera plus envoyé.
-    pub fn abandon(&mut self, session: &str, kind: EpisodeKind) {
+    pub fn abandon(&mut self, due: &Due) {
         if let Some(episode) = self
             .sessions
-            .get_mut(session)
-            .and_then(|slot| slot.episode_mut(kind).as_mut())
+            .get_mut(&due.session)
+            .and_then(|slot| slot.episode_of(due))
         {
             episode.phase = Phase::Done;
         }
     }
 
+    /// L'envoi n'a pu joindre personne (plus aucun appareil abonné au moment d'envoyer) : l'épisode reste en attente,
+    /// sans renvoi compté et sans anti-rafale consommée.
+    pub fn release(&mut self, due: &Due) {
+        let Some(slot) = self.sessions.get_mut(&due.session) else {
+            return;
+        };
+        if let Some(episode) = slot.episode_of(due) {
+            episode.phase = Phase::Pending;
+            episode.last_held = None;
+            let before = episode.attempt_before.take();
+            slot.last_attempt = before;
+        }
+    }
+
     /// L'envoi a échoué pour une raison passagère. Rend vrai quand l'épisode sera renvoyé à la fin de l'anti-rafale ;
-    /// faux quand il est abandonné (plus de `MAX_RETRIES` renvois) ou n'existe plus (clos entre-temps).
-    pub fn retry_later(&mut self, session: &str, kind: EpisodeKind, now: Instant) -> bool {
-        let Some(slot) = self.sessions.get_mut(session) else {
+    /// faux quand il est abandonné (plus de `MAX_RETRIES` renvois) ou n'existe plus (clos entre-temps, ou rouvert : un
+    /// autre `seq` que celui de l'envoi qui revient).
+    pub fn retry_later(&mut self, due: &Due, now: Instant) -> bool {
+        let Some(slot) = self.sessions.get_mut(&due.session) else {
             return false;
         };
-        if slot.episode(kind).is_none() {
+        if slot.episode_of(due).is_none() {
             return false;
         }
         slot.last_attempt = Some(now);
-        let Some(episode) = slot.episode_mut(kind).as_mut() else {
+        let Some(episode) = slot.episode_of(due) else {
             return false;
         };
         episode.retries += 1;
@@ -369,7 +425,7 @@ impl Episodes {
     }
 
     /// Le prochain instant où `due` pourrait rendre quelque chose sans qu'un événement arrive : la fin d'une
-    /// anti-rafale qui retient un épisode, ou la chute d'une déclaration de pane regardé qui en retient un.
+    /// anti-rafale qui retient un épisode, ou la chute de la dernière déclaration de pane regardé qui en retient un.
     pub fn next_wakeup(&self, now: Instant) -> Option<Instant> {
         let mut earliest: Option<Instant> = None;
         let mut consider = |instant: Instant| {
@@ -385,10 +441,8 @@ impl Episodes {
                 if episode.phase != Phase::Pending || !self.enabled(kind) || !self.away {
                     continue;
                 }
-                if let Some(watch) = &self.watch
-                    && watch.holds(session, episode.pane, now)
-                {
-                    consider(watch.declared_at + WATCH_TTL);
+                if let Some(until) = self.watched_until(session, episode.pane, now) {
+                    consider(until);
                 } else if let Some(attempt) = slot.last_attempt {
                     consider(attempt + COOLDOWN);
                 }
@@ -396,6 +450,28 @@ impl Episodes {
         }
         earliest
     }
+}
+
+#[cfg(test)]
+impl Episodes {
+    /// L'épisode ouvert de ce type, tel que `due` l'aurait rendu (pour rejouer un résultat d'envoi dans un test).
+    fn current_due(&self, session: &str, kind: EpisodeKind) -> Option<Due> {
+        let episode = self.sessions.get(session)?.episode(kind)?;
+        Some(Due {
+            session: session.to_owned(),
+            pane: episode.pane,
+            kind,
+            seq: episode.seq,
+        })
+    }
+}
+
+/// Plus aucun pane de la session n'attend : l'épisode « attend » qu'un pane caché avait ouvert (ou que l'état agrégé
+/// masquait derrière une erreur) est fini. `panes` : (identifiant, actif, état).
+pub fn no_pane_waiting(panes: &[(u32, bool, ActivityState)]) -> bool {
+    !panes
+        .iter()
+        .any(|(_, _, state)| *state == ActivityState::Waiting)
 }
 
 /// Ce que le passage de `previous` à `current` change aux épisodes de la session : les clôtures d'abord, puis les
@@ -455,17 +531,60 @@ mod tests {
         base + Duration::from_secs(seconds)
     }
 
+    /// Un `Due` sans identité d'épisode (`seq` à zéro) : `plain_due` ramène ce que `due` rend à cette forme, pour que les
+    /// assertions comparent la session, le pane et le type.
     fn due(session: &str, pane: u32, kind: EpisodeKind) -> Due {
         Due {
             session: session.into(),
             pane,
             kind,
+            seq: 0,
         }
+    }
+
+    fn plain(due: Due) -> Due {
+        Due { seq: 0, ..due }
+    }
+
+    fn plain_due(
+        episodes: &mut Episodes,
+        now: Instant,
+        subscribers: usize,
+    ) -> (Vec<Due>, Vec<(Due, Held)>) {
+        let (ready, held) = episodes.due(now, subscribers);
+        (
+            ready.into_iter().map(plain).collect(),
+            held.into_iter()
+                .map(|(due, why)| (plain(due), why))
+                .collect(),
+        )
     }
 
     /// Les sessions notifiées à cet instant, sans les retenues.
     fn sent(episodes: &mut Episodes, now: Instant, subscribers: usize) -> Vec<Due> {
-        episodes.due(now, subscribers).0
+        plain_due(episodes, now, subscribers).0
+    }
+
+    /// Le résultat d'envoi de l'épisode ouvert de ce type.
+    fn deliver(episodes: &mut Episodes, session: &str, kind: EpisodeKind, now: Instant) {
+        let due = episodes
+            .current_due(session, kind)
+            .expect("an open episode");
+        episodes.delivered(&due, now);
+    }
+
+    fn retry(episodes: &mut Episodes, session: &str, kind: EpisodeKind, now: Instant) -> bool {
+        match episodes.current_due(session, kind) {
+            Some(due) => episodes.retry_later(&due, now),
+            None => false,
+        }
+    }
+
+    fn give_up(episodes: &mut Episodes, session: &str, kind: EpisodeKind) {
+        let due = episodes
+            .current_due(session, kind)
+            .expect("an open episode");
+        episodes.abandon(&due);
     }
 
     #[test]
@@ -475,10 +594,10 @@ mod tests {
         assert_eq!(episodes.open("s", 4, WAITING, t0), OpenOutcome::Pending);
 
         // Romain est présent : retenu, avec sa raison, une seule fois (pas une ligne à chaque tour).
-        let (sent_now, held) = episodes.due(t0, 1);
+        let (sent_now, held) = plain_due(&mut episodes, t0, 1);
         assert!(sent_now.is_empty());
         assert_eq!(held, vec![(due("s", 4, WAITING), Held::Present)]);
-        let (sent_now, held) = episodes.due(at(t0, 1), 1);
+        let (sent_now, held) = plain_due(&mut episodes, at(t0, 1), 1);
         assert!(
             sent_now.is_empty() && held.is_empty(),
             "held once, not at every turn"
@@ -501,7 +620,7 @@ mod tests {
         assert_eq!(sent(&mut episodes, t0, 1).len(), 1);
         // Tant que l'envoi est en cours, ni la boucle ni un autre événement ne le redemandent.
         assert!(sent(&mut episodes, at(t0, 1), 1).is_empty());
-        episodes.delivered("s", WAITING, at(t0, 1));
+        deliver(&mut episodes, "s", WAITING, at(t0, 1));
         // Une fois notifié, ni le temps qui passe, ni l'ouverture répétée du même épisode ne le renvoient.
         episodes.open("s", 4, WAITING, at(t0, 2));
         episodes.set_away(false);
@@ -526,12 +645,12 @@ mod tests {
         episodes.set_away(true);
         episodes.open("s", 4, WAITING, t0);
         assert_eq!(sent(&mut episodes, t0, 1).len(), 1);
-        episodes.delivered("s", WAITING, t0);
+        deliver(&mut episodes, "s", WAITING, t0);
 
         // La session repart puis réattend à +15 s : différée, avec son réveil à +30 s.
         episodes.close("s", WAITING);
         episodes.open("s", 4, WAITING, at(t0, 15));
-        let (now_sent, held) = episodes.due(at(t0, 15), 1);
+        let (now_sent, held) = plain_due(&mut episodes, at(t0, 15), 1);
         assert!(now_sent.is_empty());
         assert_eq!(held, vec![(due("s", 4, WAITING), Held::Cooldown)]);
         assert_eq!(episodes.next_wakeup(at(t0, 15)), Some(at(t0, 30)));
@@ -551,7 +670,7 @@ mod tests {
         episodes.set_away(true);
         episodes.open("s", 4, WAITING, t0);
         sent(&mut episodes, t0, 1);
-        episodes.delivered("s", WAITING, t0);
+        deliver(&mut episodes, "s", WAITING, t0);
         episodes.close("s", WAITING);
         episodes.open("s", 4, WAITING, at(t0, 15));
         assert!(sent(&mut episodes, at(t0, 16), 1).is_empty());
@@ -575,14 +694,14 @@ mod tests {
             2,
             "two sessions, two sends"
         );
-        episodes.delivered("a", WAITING, t0);
-        episodes.delivered("b", WAITING, t0);
+        deliver(&mut episodes, "a", WAITING, t0);
+        deliver(&mut episodes, "b", WAITING, t0);
 
         // Une erreur de la session « a » à +5 s attend la fin du délai de « a » ; « b » n'est pas concernée.
         episodes.open("a", 1, ERROR, at(t0, 5));
         episodes.close("b", WAITING);
         episodes.open("b", 2, ERROR, at(t0, 5));
-        let (now_sent, held) = episodes.due(at(t0, 5), 1);
+        let (now_sent, held) = plain_due(&mut episodes, at(t0, 5), 1);
         assert!(now_sent.is_empty());
         assert_eq!(
             held.len(),
@@ -599,7 +718,7 @@ mod tests {
         episodes.set_away(true);
         episodes.open("s", 4, WAITING, t0);
         sent(&mut episodes, t0, 1);
-        episodes.delivered("s", WAITING, t0);
+        deliver(&mut episodes, "s", WAITING, t0);
 
         // Romain répond depuis le téléphone ; l'agent repose une question 15 s plus tard : elle vibre tout de suite.
         episodes.phone_interaction("s");
@@ -611,7 +730,7 @@ mod tests {
         );
 
         // Même chose quand la réponse arrive alors que la seconde attente est déjà retenue par le délai.
-        episodes.delivered("s", WAITING, at(t0, 15));
+        deliver(&mut episodes, "s", WAITING, at(t0, 15));
         episodes.close("s", WAITING);
         episodes.open("s", 4, WAITING, at(t0, 20));
         assert!(sent(&mut episodes, at(t0, 20), 1).is_empty());
@@ -627,7 +746,7 @@ mod tests {
         let t0 = Instant::now();
         let mut episodes = Episodes::new(BOTH);
         episodes.set_away(true);
-        episodes.watch("s", 4, t0);
+        episodes.watch("phone", "s", 4, t0);
         // Le pane regardé qui se met à attendre (ou à échouer) est acquitté aussitôt, et n'est pas notifié.
         assert_eq!(
             episodes.open("s", 4, WAITING, at(t0, 5)),
@@ -654,13 +773,19 @@ mod tests {
         episodes.set_away(true);
         episodes.open("s", 4, WAITING, t0);
         episodes.set_away(false);
-        assert_eq!(episodes.watch("s", 4, at(t0, 1)), OpenOutcome::AutoAck);
-        assert_eq!(episodes.watch("s", 9, at(t0, 2)), OpenOutcome::Pending);
+        assert_eq!(
+            episodes.watch("phone", "s", 4, at(t0, 1)),
+            OpenOutcome::AutoAck
+        );
+        assert_eq!(
+            episodes.watch("phone", "s", 9, at(t0, 2)),
+            OpenOutcome::Pending
+        );
 
         // Déclarer ne retient pas non plus une attente d'un autre pane déjà partie, et `unwatch` rend la règle normale.
         let mut episodes = Episodes::new(BOTH);
-        episodes.watch("s", 4, t0);
-        episodes.unwatch();
+        episodes.watch("phone", "s", 4, t0);
+        episodes.unwatch("phone");
         assert_eq!(
             episodes.open("s", 4, WAITING, at(t0, 1)),
             OpenOutcome::Pending
@@ -673,9 +798,9 @@ mod tests {
         let mut episodes = Episodes::new(BOTH);
         episodes.set_away(true);
         episodes.open("s", 4, WAITING, t0);
-        episodes.watch("s", 4, at(t0, 1));
+        episodes.watch("phone", "s", 4, at(t0, 1));
         // Regardé : ni envoyé ni compté comme retenu (l'acquittement est en route), et le réveil est à la chute.
-        let (now_sent, held) = episodes.due(at(t0, 2), 1);
+        let (now_sent, held) = plain_due(&mut episodes, at(t0, 2), 1);
         assert!(now_sent.is_empty() && held.is_empty());
         assert_eq!(episodes.next_wakeup(at(t0, 2)), Some(at(t0, 31)));
         // Plus de déclaration pendant 30 s : la règle normale reprend.
@@ -690,7 +815,7 @@ mod tests {
         let t0 = Instant::now();
         let mut episodes = Episodes::new(BOTH);
         episodes.set_away(true);
-        episodes.watch("s", 4, t0);
+        episodes.watch("phone", "s", 4, t0);
         assert_eq!(
             episodes.open("s", 4, WAITING, at(t0, 29)),
             OpenOutcome::AutoAck
@@ -703,7 +828,7 @@ mod tests {
         );
         episodes.close("s", WAITING);
         // Une nouvelle déclaration repart de zéro.
-        episodes.watch("s", 4, at(t0, 40));
+        episodes.watch("phone", "s", 4, at(t0, 40));
         assert_eq!(
             episodes.open("s", 4, WAITING, at(t0, 69)),
             OpenOutcome::AutoAck
@@ -719,7 +844,7 @@ mod tests {
         });
         episodes.set_away(true);
         episodes.open("s", 4, WAITING, t0);
-        let (now_sent, held) = episodes.due(t0, 1);
+        let (now_sent, held) = plain_due(&mut episodes, t0, 1);
         assert!(now_sent.is_empty());
         assert_eq!(held, vec![(due("s", 4, WAITING), Held::Disabled)]);
         // L'erreur de la même session part (l'autre type n'a rien à y voir).
@@ -740,7 +865,7 @@ mod tests {
         });
         episodes.set_away(true);
         episodes.open("s", 4, ERROR, t0);
-        let (now_sent, held) = episodes.due(t0, 1);
+        let (now_sent, held) = plain_due(&mut episodes, t0, 1);
         assert!(now_sent.is_empty());
         assert_eq!(held, vec![(due("s", 4, ERROR), Held::Disabled)]);
     }
@@ -751,7 +876,7 @@ mod tests {
         let mut episodes = Episodes::new(BOTH);
         episodes.set_away(true);
         episodes.open("s", 4, WAITING, t0);
-        let (now_sent, held) = episodes.due(t0, 0);
+        let (now_sent, held) = plain_due(&mut episodes, t0, 0);
         assert!(now_sent.is_empty());
         assert_eq!(held, vec![(due("s", 4, WAITING), Held::NoSubscriber)]);
         // Un appareil s'abonne : l'épisode, resté en attente, part.
@@ -770,12 +895,12 @@ mod tests {
         });
         // Type éteint, Romain présent, aucun appareil : la première raison de la liste est celle qui est dite.
         episodes.open("s", 4, WAITING, t0);
-        assert_eq!(episodes.due(t0, 0).1[0].1, Held::Disabled);
+        assert_eq!(plain_due(&mut episodes, t0, 0).1[0].1, Held::Disabled);
         let mut episodes = Episodes::new(BOTH);
         episodes.open("s", 4, WAITING, t0);
-        assert_eq!(episodes.due(t0, 0).1[0].1, Held::Present);
+        assert_eq!(plain_due(&mut episodes, t0, 0).1[0].1, Held::Present);
         episodes.set_away(true);
-        assert_eq!(episodes.due(t0, 0).1[0].1, Held::NoSubscriber);
+        assert_eq!(plain_due(&mut episodes, t0, 0).1[0].1, Held::NoSubscriber);
     }
 
     #[test]
@@ -787,7 +912,7 @@ mod tests {
 
         // Premier envoi, puis trois renvois, chacun à la fin de l'anti-rafale ; le quatrième échec abandonne.
         assert_eq!(sent(&mut episodes, t0, 1).len(), 1);
-        assert!(episodes.retry_later("s", WAITING, t0));
+        assert!(retry(&mut episodes, "s", WAITING, t0));
         for round in 1..=3u64 {
             let now = at(t0, 30 * round);
             assert!(sent(&mut episodes, at(t0, 30 * round - 1), 1).is_empty());
@@ -797,7 +922,7 @@ mod tests {
                 vec![due("s", 4, WAITING)],
                 "resend {round}"
             );
-            let retried = episodes.retry_later("s", WAITING, now);
+            let retried = retry(&mut episodes, "s", WAITING, now);
             assert_eq!(retried, round < 3, "after resend {round}");
         }
         for seconds in [120, 150, 600] {
@@ -815,13 +940,13 @@ mod tests {
         let mut episodes = Episodes::new(BOTH);
         episodes.set_away(true);
         episodes.open("s", 4, WAITING, t0);
-        sent(&mut episodes, t0, 1);
-        episodes.retry_later("s", WAITING, t0);
+        let attempt = episodes.due(t0, 1).0.remove(0);
+        assert!(episodes.retry_later(&attempt, t0));
         episodes.close("s", WAITING);
         assert!(sent(&mut episodes, at(t0, 30), 1).is_empty());
         // Un résultat qui arrive pour un épisode clos entre-temps ne ressuscite rien.
-        episodes.delivered("s", WAITING, at(t0, 31));
-        assert!(!episodes.retry_later("s", WAITING, at(t0, 31)));
+        episodes.delivered(&attempt, at(t0, 31));
+        assert!(!episodes.retry_later(&attempt, at(t0, 31)));
         assert!(sent(&mut episodes, at(t0, 90), 1).is_empty());
     }
 
@@ -832,7 +957,7 @@ mod tests {
         episodes.set_away(true);
         episodes.open("s", 4, WAITING, t0);
         sent(&mut episodes, t0, 1);
-        episodes.abandon("s", WAITING);
+        give_up(&mut episodes, "s", WAITING);
         assert!(sent(&mut episodes, at(t0, 60), 1).is_empty());
         assert_eq!(episodes.next_wakeup(at(t0, 60)), None);
     }
@@ -896,5 +1021,162 @@ mod tests {
         let late = [(1, true, Idle), (2, false, Running)];
         assert_eq!(urgent_pane(&late, EpisodeKind::Waiting), Some(2));
         assert_eq!(urgent_pane(&[], EpisodeKind::Waiting), None);
+    }
+
+    /// Un envoi en vol pour l'épisode `s`/Waiting, puis cet épisode clos et rouvert (retenu par l'anti-rafale) : le
+    /// résultat tardif de l'ancien envoi.
+    fn reopened_behind_a_stale_send() -> (Episodes, Instant, Due) {
+        let t0 = Instant::now();
+        let mut episodes = Episodes::new(BOTH);
+        episodes.set_away(true);
+        episodes.open("s", 4, WAITING, t0);
+        let stale = episodes.due(t0, 1).0.remove(0);
+        episodes.close("s", WAITING);
+        episodes.open("s", 4, WAITING, at(t0, 2));
+        let (now_sent, held) = plain_due(&mut episodes, at(t0, 2), 1);
+        assert!(now_sent.is_empty());
+        assert_eq!(held, vec![(due("s", 4, WAITING), Held::Cooldown)]);
+        (episodes, t0, stale)
+    }
+
+    #[test]
+    fn a_late_delivery_does_not_close_the_reopened_episode() {
+        let (mut episodes, t0, stale) = reopened_behind_a_stale_send();
+        episodes.delivered(&stale, at(t0, 3));
+        assert_eq!(
+            sent(&mut episodes, at(t0, 30), 1),
+            vec![due("s", 4, WAITING)],
+            "the second wait is not silently dropped"
+        );
+    }
+
+    #[test]
+    fn a_late_abandon_does_not_drop_the_reopened_episode() {
+        let (mut episodes, t0, stale) = reopened_behind_a_stale_send();
+        episodes.abandon(&stale);
+        assert_eq!(
+            sent(&mut episodes, at(t0, 30), 1),
+            vec![due("s", 4, WAITING)]
+        );
+    }
+
+    #[test]
+    fn a_late_retry_does_not_consume_the_retries_of_the_reopened_episode() {
+        let (mut episodes, t0, stale) = reopened_behind_a_stale_send();
+        for round in 0..=u64::from(MAX_RETRIES) + 2 {
+            assert!(
+                !episodes.retry_later(&stale, at(t0, 3 + round)),
+                "a stale failure is nobody's retry"
+            );
+        }
+        // Les renvois du nouvel épisode sont intacts : trois renvois possibles, comme au premier jour.
+        let mut now = at(t0, 30);
+        let mut fresh = episodes.due(now, 1).0;
+        assert_eq!(fresh.len(), 1);
+        for round in 1..=3 {
+            assert!(episodes.retry_later(&fresh[0], now), "retry {round}");
+            now = at(now, 30);
+            fresh = episodes.due(now, 1).0;
+            assert_eq!(fresh.len(), 1, "resend {round}");
+        }
+        assert!(
+            !episodes.retry_later(&fresh[0], now),
+            "the fourth failure gives up"
+        );
+    }
+
+    #[test]
+    fn a_send_that_reached_nobody_keeps_the_episode_and_its_cooldown() {
+        let t0 = Instant::now();
+        let mut episodes = Episodes::new(BOTH);
+        episodes.set_away(true);
+        // Une notification partie à t0 pour une autre attente : l'anti-rafale court jusqu'à +30 s.
+        episodes.open("s", 4, ERROR, t0);
+        let first = episodes.due(t0, 1).0.remove(0);
+        episodes.delivered(&first, t0);
+        episodes.close("s", ERROR);
+        episodes.open("s", 4, WAITING, at(t0, 31));
+        let attempt = episodes.due(at(t0, 31), 1).0.remove(0);
+        // Plus aucun appareil au moment d'envoyer : l'épisode reste en attente, retenu faute d'appareil.
+        episodes.release(&attempt);
+        let (now_sent, held) = plain_due(&mut episodes, at(t0, 32), 0);
+        assert!(now_sent.is_empty());
+        assert_eq!(held, vec![(due("s", 4, WAITING), Held::NoSubscriber)]);
+        // Un appareil s'abonne : il part, sans renvoi consommé.
+        assert_eq!(
+            sent(&mut episodes, at(t0, 33), 1),
+            vec![due("s", 4, WAITING)]
+        );
+    }
+
+    #[test]
+    fn a_device_clears_only_its_own_watch() {
+        let t0 = Instant::now();
+        let mut episodes = Episodes::new(BOTH);
+        episodes.set_away(true);
+        episodes.watch("phone", "s", 4, t0);
+        episodes.watch("tablet", "s", 4, at(t0, 5));
+        // Le téléphone ne regarde plus rien : la tablette regarde toujours ce pane.
+        episodes.unwatch("phone");
+        assert_eq!(
+            episodes.open("s", 4, WAITING, at(t0, 6)),
+            OpenOutcome::AutoAck
+        );
+        episodes.unwatch("tablet");
+        assert_eq!(
+            episodes.open("s", 4, WAITING, at(t0, 7)),
+            OpenOutcome::Pending
+        );
+        // Chaque déclaration tombe à son heure : la tablette tient jusqu'à +35 s, même après celle du téléphone.
+        let mut episodes = Episodes::new(BOTH);
+        episodes.set_away(true);
+        episodes.watch("phone", "s", 4, t0);
+        episodes.watch("tablet", "s", 4, at(t0, 10));
+        episodes.close("s", WAITING);
+        assert_eq!(
+            episodes.open("s", 4, WAITING, at(t0, 31)),
+            OpenOutcome::AutoAck,
+            "the tablet declared at +10 s"
+        );
+        assert_eq!(
+            episodes.open("s", 4, WAITING, at(t0, 40)),
+            OpenOutcome::Pending
+        );
+    }
+
+    /// Un épisode « attend » ouvert par un pane caché alors que l'état agrégé est « erreur » ne se clôt pas avec l'état de
+    /// la session : c'est la fin de l'attente de tout pane (`no_pane_waiting`) qui le clôt. Resté ouvert, il avalerait
+    /// l'attente suivante.
+    #[test]
+    fn a_hidden_pane_episode_closed_by_its_pane_does_not_swallow_the_next_wait() {
+        use ActivityState::{Error, Idle, Running, Waiting};
+        let t0 = Instant::now();
+        let mut episodes = Episodes::new(BOTH);
+        episodes.set_away(true);
+        // La session est en erreur ; un de ses panes cachés attend.
+        episodes.open("s", 4, WAITING, t0);
+        let hidden = episodes.due(t0, 1).0.remove(0);
+        episodes.delivered(&hidden, t0);
+        let panes = [(4, false, Waiting), (5, true, Error)];
+        assert!(!no_pane_waiting(&panes));
+        // Le pane caché cesse d'attendre, l'erreur reste : plus rien n'attend.
+        let panes = [(4, false, Idle), (5, true, Error)];
+        assert!(no_pane_waiting(&panes));
+        episodes.close("s", WAITING);
+        assert!(no_pane_waiting(&[(1, true, Running)]) && no_pane_waiting(&[]));
+        // Plus tard, une vraie attente : un nouvel épisode, qui part.
+        episodes.open("s", 5, WAITING, at(t0, 60));
+        assert_eq!(
+            sent(&mut episodes, at(t0, 60), 1),
+            vec![due("s", 5, WAITING)]
+        );
+        // Sans cette clôture, `open` aurait gardé l'épisode terminé et rien ne serait parti.
+        let mut swallowed = Episodes::new(BOTH);
+        swallowed.set_away(true);
+        swallowed.open("s", 4, WAITING, t0);
+        let hidden = swallowed.due(t0, 1).0.remove(0);
+        swallowed.delivered(&hidden, t0);
+        swallowed.open("s", 5, WAITING, at(t0, 60));
+        assert!(sent(&mut swallowed, at(t0, 60), 1).is_empty());
     }
 }

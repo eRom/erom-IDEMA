@@ -18,7 +18,7 @@ use super::input::RecentCommands;
 use super::push_send::{OVERRIDE_VAR, override_endpoint};
 use super::service::{self, ServiceDeps, ServiceHandle};
 use super::timeline::Timeline;
-use super::{PaneCommand, ServiceEvent, ServiceStatus};
+use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
 use crate::hud;
 
@@ -89,8 +89,12 @@ impl CompanionController {
         let wanted = config.zip(tmux);
         // Seul un changement de port redémarre le service. Les autres réglages (notifications, seuil d'absence, adresse
         // publique) lui sont dits tels quels : ses flux ouverts ne tombent pas.
+        // Un service dont la prise n'a pas pu être liée (port pris) ne répond plus à rien : tout changement de config le
+        // relance, c'est la seule chance qu'a l'utilisateur de le voir démarrer sans toucher au port.
         if let (Some(running), Some((config, _))) = (self.running.as_mut(), &wanted)
             && running.config.port == config.port
+            && !(running.config != **config
+                && matches!(running.status.borrow().listen, ListenState::Failed { .. }))
         {
             if running.config != **config {
                 running.config = (*config).clone();
@@ -354,6 +358,59 @@ mod tests {
         assert!(restarted.is_some(), "a port change restarts the service");
         assert_ne!(thread_of(&controller), original);
         assert_eq!(controller.running.as_ref().unwrap().config, moved);
+
+        controller.sync(None, Some(tmux()), &home.0, &scratchpad);
+        controller.stopping.take().unwrap().join().unwrap();
+    }
+
+    /// Le service n'a pas pu lier sa prise (port pris) : changer n'importe quel réglage le relance, sans toucher au port.
+    #[test]
+    fn a_service_that_failed_to_bind_restarts_on_any_config_change() {
+        let home = super::super::test_support::TempDir::new("controller-failed");
+        let scratchpad = home.0.join("scratchpad.md");
+        let port = super::super::test_support::free_port();
+        let taken = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let mut controller = CompanionController::new();
+        assert!(
+            controller
+                .sync(Some(&config(port)), Some(tmux()), &home.0, &scratchpad)
+                .is_some()
+        );
+        let mut status = controller.status().unwrap();
+        super::super::test_support::wait_for(&mut status, |state| {
+            matches!(state, ListenState::Failed { .. })
+        });
+        let failed = controller.running.as_ref().unwrap().handle.thread_id();
+
+        // La même config : rien à relancer (sinon chaque relecture de la config réessaierait en boucle).
+        assert!(
+            controller
+                .sync(Some(&config(port)), Some(tmux()), &home.0, &scratchpad)
+                .is_none()
+        );
+        assert_eq!(
+            controller.running.as_ref().unwrap().handle.thread_id(),
+            failed
+        );
+
+        // Le port se libère, un réglage change : le service est relancé et lie sa prise.
+        drop(taken);
+        let changed: CompanionConfig =
+            toml::from_str(&format!("port = {port}\nnotify_waiting = false")).unwrap();
+        assert!(
+            controller
+                .sync(Some(&changed), Some(tmux()), &home.0, &scratchpad)
+                .is_some(),
+            "a failed service is restarted by a config change"
+        );
+        assert_ne!(
+            controller.running.as_ref().unwrap().handle.thread_id(),
+            failed
+        );
+        let mut status = controller.status().unwrap();
+        super::super::test_support::wait_for(&mut status, |state| {
+            *state == ListenState::Listening { port }
+        });
 
         controller.sync(None, Some(tmux()), &home.0, &scratchpad);
         controller.stopping.take().unwrap().join().unwrap();

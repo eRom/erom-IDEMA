@@ -606,7 +606,11 @@ struct PresenceBody {
 /// n'en montre plus. Tant que la déclaration tient (30 s), une attente ou une erreur de ce pane est acquittée aussitôt
 /// et n'est pas notifiée (spec §3.6). Elle n'a pas à nommer une session qui existe : elle ne fait que se comparer aux
 /// épisodes.
-async fn presence(State(state): State<AppState>, body: Bytes) -> Response {
+async fn presence(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    body: Bytes,
+) -> Response {
     let declared = match serde_json::from_slice::<Option<PresenceBody>>(&body) {
         Ok(Some(PresenceBody { session, pane }))
             if !session.is_empty() && session.len() <= PRESENCE_SESSION_MAX_LEN =>
@@ -617,7 +621,10 @@ async fn presence(State(state): State<AppState>, body: Bytes) -> Response {
         _ => return error_reply(StatusCode::BAD_REQUEST, "bad_request"),
     };
     // La boucle ne se ferme qu'avec le service : un envoi qui échoue n'a plus personne à servir.
-    let _ = state.inbox.send(Message::Watch(declared));
+    let _ = state.inbox.send(Message::Watch {
+        device: caller.id,
+        declared,
+    });
     json_reply(
         StatusCode::OK,
         serde_json::json!({ "ok": true }).to_string(),
@@ -708,10 +715,14 @@ async fn push_subscribe(
         tokio::task::spawn_blocking(move || access.set_subscription(&caller.id, subscription))
             .await;
     match written {
-        Ok(Ok(())) => json_reply(
-            StatusCode::OK,
-            serde_json::json!({ "ok": true }).to_string(),
-        ),
+        Ok(Ok(())) => {
+            // Un épisode retenu faute d'appareil part sans attendre le prochain événement.
+            let _ = state.inbox.send(Message::Wake);
+            json_reply(
+                StatusCode::OK,
+                serde_json::json!({ "ok": true }).to_string(),
+            )
+        }
         // L'appareil a été oublié entre la garde et l'écriture.
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             error_reply(StatusCode::UNAUTHORIZED, "unpaired")
