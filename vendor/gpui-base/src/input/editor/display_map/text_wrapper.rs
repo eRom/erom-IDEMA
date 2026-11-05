@@ -27,13 +27,77 @@ pub enum WrappingIndent {
     Same,
 }
 
+/// IdemA : vrai pour un caractère dont la largeur façonnée seule est celle qu'il prend dans la ligne : ni marque
+/// combinante, ni liant, ni sélecteur de variante, ni tabulation ou contrôle, ni écriture à mise en forme contextuelle,
+/// ni CJK ou emoji (gpui-base garde pour eux sa mesure exacte). Latin, ponctuation, flèches, symboles et filets.
+fn is_simple_char(c: char) -> bool {
+    matches!(c,
+        ' '..='~'
+        | '\u{00A0}'..='\u{00AC}'
+        | '\u{00AE}'..='\u{024F}'
+        | '\u{2000}'..='\u{200A}'
+        | '\u{2010}'..='\u{2027}'
+        | '\u{202F}'..='\u{205F}'
+        | '\u{20A0}'..='\u{20C0}'
+        | '\u{2100}'..='\u{214F}'
+        | '\u{2190}'..='\u{23FF}'
+        | '\u{2500}'..='\u{27BF}'
+    )
+}
+
+/// IdemA : les largeurs de caractère d'une police, façonnées une fois chacune.
+struct CharWidths {
+    text_system: std::sync::Arc<gpui::TextSystem>,
+    font_id: gpui::FontId,
+    font_size: Pixels,
+    ascii: [Option<Pixels>; 128],
+    other: std::collections::HashMap<char, Pixels>,
+}
+
+impl CharWidths {
+    fn new(text_system: std::sync::Arc<gpui::TextSystem>, font: &Font, font_size: Pixels) -> Self {
+        let font_id = text_system.resolve_font(font);
+        Self {
+            text_system,
+            font_id,
+            font_size,
+            ascii: [None; 128],
+            other: Default::default(),
+        }
+    }
+
+    fn width(&mut self, c: char) -> Pixels {
+        let (text_system, font_id, font_size) = (&self.text_system, self.font_id, self.font_size);
+        let shape = || text_system.layout_width(font_id, font_size, c);
+        match self.ascii.get_mut(c as usize) {
+            Some(slot) => *slot.get_or_insert_with(shape),
+            None => *self.other.entry(c).or_insert_with(shape),
+        }
+    }
+
+    /// Remplit `cumulative` : la largeur du texte avant chaque frontière de caractère de `line` (et à sa fin).
+    fn cumulate(&mut self, line: &str, cumulative: &mut Vec<Pixels>) {
+        cumulative.clear();
+        cumulative.resize(line.len() + 1, px(0.));
+        let mut total = px(0.);
+        for (ix, c) in line.char_indices() {
+            cumulative[ix] = total;
+            total += self.width(c);
+        }
+        cumulative[line.len()] = total;
+    }
+}
+
 /// Choose Unicode line-break opportunities using the same shaped widths as
 /// painting. Oversized words fall back to complete graphemes, never UTF-8 bytes.
+///
+/// IdemA : `measure` reçoit une plage d'octets de `text` (et non plus la tranche), pour qu'une ligne simple se mesure
+/// par différence de sommes cumulées.
 fn measured_wrap_boundaries(
     text: &str,
     width: Pixels,
     wrapping_indent: WrappingIndent,
-    mut measure: impl FnMut(&str) -> Pixels,
+    mut measure: impl FnMut(Range<usize>) -> Pixels,
 ) -> Vec<gpui::Boundary> {
     let indent = if wrapping_indent == WrappingIndent::Same {
         text.chars()
@@ -43,7 +107,7 @@ fn measured_wrap_boundaries(
     } else {
         0
     };
-    let indent_width = measure(&text[..indent]);
+    let indent_width = measure(0..indent);
     let ends: Vec<usize> = text
         .grapheme_indices(true)
         .map(|(ix, grapheme)| ix + grapheme.len())
@@ -66,7 +130,7 @@ fn measured_wrap_boundaries(
         let remaining = ends.len() - first;
         let mut low = 0;
         let mut high = 1;
-        while measure(&text[start..ends[first + high - 1]]) <= available {
+        while measure(start..ends[first + high - 1]) <= available {
             low = high;
             if high == remaining {
                 break;
@@ -75,7 +139,7 @@ fn measured_wrap_boundaries(
         }
         while low + 1 < high {
             let mid = (low + high) / 2;
-            if measure(&text[start..ends[first + mid - 1]]) <= available {
+            if measure(start..ends[first + mid - 1]) <= available {
                 low = mid;
             } else {
                 high = mid;
@@ -377,6 +441,9 @@ impl TextWrapper {
         let font = self.font.clone();
         let font_size = self.font_size;
         let wrapping_indent = self.wrapping_indent;
+        // IdemA : les largeurs de caractère servent à toutes les lignes de cette passe.
+        let mut char_widths = CharWidths::new(cx.text_system().clone(), &font, font_size);
+        let mut cumulative = Vec::new();
         self._update(
             changed_text,
             range,
@@ -405,11 +472,23 @@ impl TextWrapper {
                     offset = range.end;
                 }
                 if fragments.is_empty() {
+                    // IdemA : une ligne simple se mesure par sommes cumulées, sans façonner chaque préfixe sondé ;
+                    // les coupures sont les mêmes, à une fraction du coût.
+                    if line_str.chars().all(is_simple_char) {
+                        char_widths.cumulate(line_str, &mut cumulative);
+                        return measured_wrap_boundaries(
+                            line_str,
+                            wrap_width,
+                            wrapping_indent,
+                            |range| cumulative[range.end] - cumulative[range.start],
+                        );
+                    }
                     return measured_wrap_boundaries(
                         line_str,
                         wrap_width,
                         wrapping_indent,
-                        |text| {
+                        |range| {
+                            let text = &line_str[range];
                             text_system
                                 .layout_line(
                                     text,
@@ -1214,7 +1293,9 @@ mod tests {
                 &(start..previous.len()),
                 &inserted,
                 &mut |line, width, _| {
-                    measured_wrap_boundaries(line, width, WrappingIndent::None, measure)
+                    measured_wrap_boundaries(line, width, WrappingIndent::None, |range| {
+                        measure(&line[range])
+                    })
                 },
             );
             let expected = if value.ends_with('s') {
@@ -1232,8 +1313,8 @@ mod tests {
     #[test]
     fn measured_wrap_preserves_words_graphemes_and_indentation() {
         let wrap = |text: &str, width, indent| {
-            measured_wrap_boundaries(text, px(width), indent, |s| {
-                px(s.graphemes(true).count() as f32)
+            measured_wrap_boundaries(text, px(width), indent, |range| {
+                px(text[range].graphemes(true).count() as f32)
             })
             .into_iter()
             .map(|b| b.ix)

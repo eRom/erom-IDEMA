@@ -52,3 +52,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "bitflags", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKNavigation", "WKNavigationDelegate", "WKNavigationAction", "WKNavigationResponse", "WKUIDelegate", "WKFrameInfo", "WKWindowFeatures", "WKPreferences", "WKSnapshotConfiguration", "WKFindConfiguration", "WKFindResult", "WKDownload", "WKDownloadDelegate", "WKWebpagePreferences", "WKHTTPCookieStore", "WKContentWorld", "WKOpenPanelParameters", "WKUserScript", "WKUserContentController"] }
 block2 = "0.6"
 raw-window-handle = "0.6"
+
+# gpui-base 0.7.3 recopié tel que publié, plus un seul patch : le retour à la ligne de l'éditeur mesure les lignes
+# simples par sommes de largeurs de caractère au lieu de façonner chaque préfixe sondé avec CoreText (30 à 40 fois plus
+# rapide, mêmes coupures ; `text_wrapper.rs`, blocs marqués « IdemA »). Sans lui, un fichier de 1 Mo gèle l'interface
+# 3 s à l'ouverture et près de 2 s à chaque changement de largeur. Le patch se relit par
+# `diff -ru ~/.cargo/registry/src/index.crates.io-*/gpui-base-0.7.3 vendor/gpui-base` (gpui-base 0.8.0 a le même
+# `text_wrapper.rs`) ; à une montée de version, recopier la nouvelle, réappliquer le patch, puis rejouer le banc local
+# de l'éditeur (`tests/perf/editor-bench/run.sh <racine>`, hors dépôt public comme les tests d'acceptance).
+[patch.crates-io]
+gpui-base = { path = "vendor/gpui-base" }

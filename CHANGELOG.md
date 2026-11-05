@@ -4,6 +4,10 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 
 ## [Unreleased]
 
+### Corrigé
+
+- Le volet Fichiers ne gèle plus sur les gros fichiers : un fichier de 1 Mo s'ouvre en un dixième de seconde au lieu de 3, et changer la largeur du volet ne fige plus l'interface près de 2 s. Le retour à la ligne reste identique.
+
 ## [0.4.0] - 2026-11-04
 
 ### Modifié
