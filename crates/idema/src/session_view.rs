@@ -600,11 +600,6 @@ impl SessionView {
             .map(|slot| &slot.view)
     }
 
-    /// La vue du pane actif, pour que le compagnon (sonde 2) y tape une touche.
-    pub fn active_pane_view(&self) -> Option<Entity<PaneView>> {
-        self.active_view().cloned()
-    }
-
     pub fn preset(&self) -> Preset {
         self.preset
     }

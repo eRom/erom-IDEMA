@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures::StreamExt;
@@ -42,7 +42,7 @@ use crate::changes::panel::{
     render_panel as render_changes_panel, target_menu,
 };
 use crate::commit_message::CommitMessageSettings;
-use crate::companion::{self, Companion, InputCommand, InputOutcome, SharedFleet};
+use crate::companion::{CompanionController, PaneCommand};
 use crate::config::{
     AgentEntry, Config, ConfigError, FileWatch, IdeationConfig, ReloadEffects, SHELL_ENTRY,
     SHELL_SESSION_NAME, ensure_config_file, harness_groups, load_config,
@@ -729,6 +729,8 @@ pub struct Workspace {
     config: Config,
     /// La taille du texte en vigueur quand ⌘+ ou ⌘− l'éloigne de la config ; rien n'est écrit sur disque.
     font_zoom: Option<f32>,
+    /// Le dossier de configuration d'IdemA (`IDEMA_HOME` ou `~/.config/idema`).
+    dir: PathBuf,
     config_path: PathBuf,
     config_watch: FileWatch,
     /// L'erreur de la dernière lecture de `config.toml` : `config` reste alors la dernière version valide.
@@ -780,9 +782,9 @@ pub struct Workspace {
     _bootstrap_task: Option<Task<()>>,
     /// L'attache différée des sessions listées au démarrage.
     _attach_task: Option<Task<()>>,
-    /// L'instantané que lit le service du compagnon (sonde 2) ; `None` sans `IDEMA_COMPANION_PORT`.
-    companion_fleet: Option<SharedFleet>,
-    /// La tâche qui traite sur le fil d'interface les saisies que le service lui envoie.
+    /// Le compagnon iPhone : éteint tant que `[companion]` est absente de la config.
+    companion: CompanionController,
+    /// La tâche qui traite sur le fil d'interface les commandes que le service du compagnon lui envoie.
     _companion_task: Option<Task<()>>,
     _config_task: Task<()>,
     _branch_task: Option<Task<()>>,
@@ -936,27 +938,6 @@ impl Workspace {
             }
         });
 
-        // Sonde du compagnon : sans la variable, `start` ne lance rien et rend `None`.
-        let (companion_fleet, companion_task) = match companion::start() {
-            Some(Companion {
-                fleet,
-                mut commands,
-            }) => {
-                let task = cx.spawn(async move |this, cx| {
-                    while let Some(command) = commands.next().await {
-                        if this
-                            .update(cx, |this, cx| this.on_companion_input(command, cx))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                });
-                (Some(fleet), Some(task))
-            }
-            None => (None, None),
-        };
-
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         // Une session fermée par un autre client n'envoie rien à une entrée sans vue : on les recompte à chaque retour.
@@ -1017,6 +998,7 @@ impl Workspace {
             focus_handle,
             config,
             font_zoom: None,
+            dir,
             config_path,
             config_watch,
             config_error,
@@ -1045,8 +1027,8 @@ impl Workspace {
             _sessions_poll: None,
             _bootstrap_task: task,
             _attach_task: None,
-            companion_fleet,
-            _companion_task: companion_task,
+            companion: CompanionController::new(),
+            _companion_task: None,
             _config_task: config_task,
             _branch_task: None,
             right_panel: None,
@@ -1161,8 +1143,8 @@ impl Workspace {
                 self.adopt_projects(&sessions);
                 self.refresh_missing(cx);
                 self.server = Some(Arc::clone(&server));
+                self.sync_companion(cx);
                 self.entries = session_entries(&sessions, &panes);
-                self.publish_fleet(cx);
                 self.drop_hidden_selection();
                 self.bootstrapped = true;
                 self.start_servers(Arc::clone(&server), window, cx);
@@ -1187,7 +1169,10 @@ impl Workspace {
                 }
                 self.start_sessions_poll(window, cx);
             }
-            Err(error) => self.startup_error = Some(StartupError::from(error)),
+            Err(error) => {
+                self.startup_error = Some(StartupError::from(error));
+                self.sync_companion(cx);
+            }
         }
         cx.notify();
     }
@@ -1566,7 +1551,6 @@ impl Workspace {
                 }
                 self.entries
                     .sort_by(|a, b| session_order(&a.summary, &b.summary));
-                self.publish_fleet(cx);
                 self.drop_hidden_selection();
                 self.sync_branch(cx);
                 self.attach_sessions(launches, window, cx);
@@ -1806,7 +1790,6 @@ impl Workspace {
         }
         self.entries
             .sort_by(|a, b| session_order(&a.summary, &b.summary));
-        self.publish_fleet(cx);
         // Attachées sans taille, comme au lancement : un échec suit les essais de `on_attach_lost` (écart E34).
         for name in names {
             if let Err(error) = self.attach(&name, None, Vec::new(), window, cx) {
@@ -2054,6 +2037,7 @@ impl Workspace {
                 let ideation_was_on = self.ideation().is_some();
                 self.config = config;
                 self.config_error = None;
+                self.sync_companion(cx);
                 if effects.theme || effects.terminal_font {
                     apply_editor_theme(
                         &Theme::new(self.config.ui_font_size),
@@ -2063,7 +2047,7 @@ impl Workspace {
                 }
                 self.leave_hidden_ideation(window, cx);
                 if ideation_was_on != self.ideation().is_some() {
-                    self.refresh_badge(cx);
+                    self.refresh_badge();
                 }
                 hud::log_event(&format!(
                     "config reloaded theme={} terminal_font={} ideation={}",
@@ -2083,6 +2067,43 @@ impl Workspace {
         }
         window.refresh();
         cx.notify();
+    }
+
+    /// Aligne le service du compagnon sur la config : le démarre, l'arrête ou le redémarre. Il ne démarre qu'avec le
+    /// serveur tmux prêt ; si l'amorçage a échoué, la section est dite sans effet au journal.
+    fn sync_companion(&mut self, cx: &mut Context<Self>) {
+        if self.server.is_none() && self.startup_error.is_some() && self.config.companion.is_some()
+        {
+            hud::log_event("companion disabled reason=tmux_unavailable");
+        }
+        let scratchpad = scratchpad_path(&self.dir);
+        let started = self.companion.sync(
+            self.config.companion.as_ref(),
+            self.server.clone(),
+            &self.dir,
+            &scratchpad,
+        );
+        match started {
+            Some(mut commands) => {
+                self._companion_task = Some(cx.spawn(async move |this, cx| {
+                    while let Some(command) = commands.next().await {
+                        if this
+                            .update(cx, |this, cx| this.on_companion_command(command, cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }));
+            }
+            None if !self.companion.is_on() => self._companion_task = None,
+            None => {}
+        }
+    }
+
+    /// Une commande du service du compagnon, traitée sur le fil d'interface. `PaneCommand` n'a pas encore de variante.
+    fn on_companion_command(&mut self, command: PaneCommand, _cx: &mut Context<Self>) {
+        match command {}
     }
 
     /// La section `[ideation]` vient de disparaître alors qu'un bouillon est sélectionné : la première session de l'ordre
@@ -2297,7 +2318,7 @@ impl Workspace {
         entry._subscription = Some(subscription);
         // Une vue neuve repart de zéro : l'état de la précédente ne survit pas à son remplacement.
         entry.summary.state = ActivityState::Idle;
-        self.refresh_badge(cx);
+        self.refresh_badge();
         Ok(())
     }
 
@@ -2386,7 +2407,6 @@ impl Workspace {
         for (seen, view) in views {
             view.update(cx, |view, cx| view.set_seen(seen, cx));
         }
-        self.publish_fleet(cx);
     }
 
     /// Le volet droit ouvert est-il agrandi ? Il prend alors la place de la colonne principale.
@@ -3869,75 +3889,11 @@ impl Workspace {
     }
 
     /// Le badge du Dock compte les sessions qui attendent ou sont en erreur ; il disparaît à zéro.
-    fn refresh_badge(&self, cx: &App) {
+    fn refresh_badge(&self) {
         dock::set_badge(dock_badge_count(
             self.entries.iter().map(|entry| &entry.summary),
             self.ideation().is_some(),
         ));
-        self.publish_fleet(cx);
-    }
-
-    /// Publie l'instantané de la flotte pour le service du compagnon (sonde 2) : la barre, le badge et le drapeau
-    /// « vue » de chaque session. Sans la variable `IDEMA_COMPANION_PORT`, il n'y a pas d'instantané et rien ne se fait.
-    fn publish_fleet(&self, cx: &App) {
-        let Some(shared) = &self.companion_fleet else {
-            return;
-        };
-        let fleet = companion::fleet_of(
-            self.entries.iter().map(|entry| {
-                let seen = entry
-                    .view
-                    .as_ref()
-                    .is_some_and(|view| view.read(cx).is_seen());
-                (&entry.summary, seen)
-            }),
-            self.ideation().is_some(),
-        );
-        *shared.lock().unwrap_or_else(PoisonError::into_inner) = fleet;
-    }
-
-    /// Une saisie du compagnon (sonde 2) : tape dans le pane actif de la session nommée, sauf au prompt d'un shell.
-    /// Le temps passé ici, journal exclu, est ce que la requête coûte au fil d'interface.
-    fn on_companion_input(&mut self, command: InputCommand, cx: &mut Context<Self>) {
-        let started = Instant::now();
-        let outcome = self.companion_type(&command.session, &command.bytes, cx);
-        let micros = started.elapsed().as_micros();
-        let _ = command.reply.send(outcome);
-        hud::log_event(&format!(
-            "companion input session={} outcome={} main_thread_us={micros}",
-            command.session,
-            outcome.label()
-        ));
-    }
-
-    fn companion_type(
-        &mut self,
-        session: &str,
-        bytes: &[u8],
-        cx: &mut Context<Self>,
-    ) -> InputOutcome {
-        let Some(entry) = self
-            .entries
-            .iter()
-            .find(|entry| entry.summary.name == session)
-        else {
-            return InputOutcome::UnknownSession;
-        };
-        let Some(pane) = entry
-            .view
-            .as_ref()
-            .and_then(|view| view.read(cx).active_pane_view())
-        else {
-            return InputOutcome::NoPane;
-        };
-        if pane.read(cx).at_prompt() {
-            return InputOutcome::RefusedAtPrompt;
-        }
-        if pane.update(cx, |pane, _| pane.send_remote_input(bytes)) {
-            InputOutcome::Sent
-        } else {
-            InputOutcome::ReadOnly
-        }
     }
 
     /// Une session change d'état : la barre, le badge et, au passage en « attend » d'une session non vue, le son.
@@ -3963,7 +3919,7 @@ impl Workspace {
         {
             self.chime(&format!("session={name}"));
         }
-        self.refresh_badge(cx);
+        self.refresh_badge();
         cx.notify();
     }
 
@@ -4300,7 +4256,7 @@ impl Workspace {
         entry._subscription = None;
         entry.summary.state = ActivityState::Idle;
         entry.unreachable = Some(raw);
-        self.refresh_badge(cx);
+        self.refresh_badge();
         if self.selected_name() == Some(name) {
             window.focus(&self.focus_handle, cx);
         }
@@ -4325,7 +4281,7 @@ impl Workspace {
             })
             .flatten();
         self.entries.retain(|entry| entry.summary.name != name);
-        self.refresh_badge(cx);
+        self.refresh_badge();
         if was_selected {
             match neighbor {
                 Some(next) => match neighbor_handoff(keep_gallery) {
@@ -5285,7 +5241,6 @@ impl Workspace {
         });
         self.entries
             .sort_by(|a, b| session_order(&a.summary, &b.summary));
-        self.publish_fleet(cx);
         let size = Some(self.central_grid(window, Preset::Single.column_gaps()));
         let launches = command
             .map(|command| PaneLaunch {
@@ -5889,7 +5844,6 @@ impl Workspace {
             return;
         }
         let previous = std::mem::replace(current, text.clone());
-        self.publish_fleet(cx);
         let target = name.to_owned();
         let written = text.clone();
         let write = cx.background_spawn({
@@ -5904,7 +5858,6 @@ impl Workspace {
                         && this.entries[index].summary.display_name == text
                     {
                         this.entries[index].summary.display_name = previous;
-                        this.publish_fleet(cx);
                         cx.notify();
                     }
                 });

@@ -52,12 +52,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "bitflags", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKNavigation", "WKNavigationDelegate", "WKNavigationAction", "WKNavigationResponse", "WKUIDelegate", "WKFrameInfo", "WKWindowFeatures", "WKPreferences", "WKSnapshotConfiguration", "WKFindConfiguration", "WKFindResult", "WKDownload", "WKDownloadDelegate", "WKWebpagePreferences", "WKHTTPCookieStore", "WKContentWorld", "WKOpenPanelParameters", "WKUserScript", "WKUserContentController"] }
 block2 = "0.6"
 raw-window-handle = "0.6"
-# Service HTTP du compagnon iOS (sonde 2). tokio 1.53.3 est déjà au lock (tiré par gpui-pre-reqwest, via gpui-kit-assets) :
+# Service HTTP du compagnon iPhone. tokio 1.53.3 est déjà au lock (tiré par gpui-pre-reqwest, via gpui-kit-assets) :
 # même version, `=` comme les autres, et seulement le runtime, les prises, les délais et les canaux.
 tokio = { version = "=1.53.3", default-features = false, features = ["rt", "net", "time", "sync"] }
-# axum 0.8.9, la version de la sonde web-push, sans ses features par défaut (ni JSON, ni formulaire, ni tracing) :
-# le corps de la saisie est lu à la main pour répondre 400 à tout ce qui n'est pas exactement la forme attendue.
-axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+# axum 0.8.9 sans ses features par défaut (ni JSON, ni formulaire, ni tracing) : `query` lit les paramètres d'URL, et
+# les corps sont lus à la main pour répondre 400 à tout ce qui n'est pas exactement la forme attendue.
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "query"] }
 
 # gpui-base 0.7.3 recopié tel que publié, plus un seul patch : en police monospace, le retour à la ligne mesure les
 # lignes simples par sommes de largeurs de caractère (celles qui empruntent une police de secours seulement si leur

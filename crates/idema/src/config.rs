@@ -176,6 +176,42 @@ pub struct Config {
     /// Section `[ideation]` : les sessions d'idéation (bouillon de neurones). Absente, la fonction est masquée.
     #[serde(default)]
     pub ideation: Option<IdeationConfig>,
+    /// Section `[companion]` : le compagnon iPhone. Absente, il n'existe pas (ni prise, ni fil).
+    #[serde(default)]
+    pub companion: Option<CompanionConfig>,
+}
+
+/// Section `[companion]` : le service local que la page installée sur l'iPhone interroge.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompanionConfig {
+    /// Port local, lié à `127.0.0.1` seulement.
+    #[serde(default = "default_companion_port")]
+    pub port: u16,
+    /// Adresse tailnet à montrer quand la détection échoue.
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// Notifier le passage d'une session en « attend ».
+    #[serde(default = "default_true")]
+    pub notify_waiting: bool,
+    /// Notifier le passage d'une session en « erreur ».
+    #[serde(default = "default_true")]
+    pub notify_error: bool,
+    /// Romain est absent après ce délai sans clavier ni souris ; `0` : toujours absent.
+    #[serde(default = "default_away_after")]
+    pub away_after_seconds: u64,
+}
+
+fn default_companion_port() -> u16 {
+    3910
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_away_after() -> u64 {
+    120
 }
 
 /// Section `[ideation]` : où vivent les sessions d'idéation et comment `claude` y est lancé.
@@ -498,6 +534,13 @@ fn validate(config: &Config, text: &str) -> Result<(), ConfigError> {
                 )));
             }
         }
+    }
+    if config
+        .companion
+        .as_ref()
+        .is_some_and(|companion| companion.port == 0)
+    {
+        return Err(invalid("[companion] port doit être entre 1 et 65535"));
     }
     let favorites = config.browser.iter().flat_map(|browser| &browser.favorites);
     for (index, favorite) in favorites.enumerate() {
@@ -1073,6 +1116,61 @@ mod tests {
                 .0
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn companion_section_absent_means_off() {
+        assert_eq!(parse_config("").unwrap().companion, None);
+    }
+
+    #[test]
+    fn companion_section_takes_its_defaults() {
+        let section = parse_config("[companion]\n").unwrap().companion.unwrap();
+        assert_eq!(section.port, 3910);
+        assert!(section.notify_waiting);
+        assert!(section.notify_error);
+        assert_eq!(section.away_after_seconds, 120);
+        assert_eq!(section.public_url, None);
+    }
+
+    #[test]
+    fn companion_section_rejects_unknown_keys() {
+        assert!(parse_config("[companion]\nfoo = 1\n").is_err());
+    }
+
+    #[test]
+    fn companion_section_reads_every_field() {
+        let text = "[companion]\nport = 4000\npublic_url = \"https://mac.tailnet.ts.net:8455\"\nnotify_waiting = false\nnotify_error = false\naway_after_seconds = 0\n";
+        let section = parse_config(text).unwrap().companion.unwrap();
+        assert_eq!(section.port, 4000);
+        assert_eq!(
+            section.public_url.as_deref(),
+            Some("https://mac.tailnet.ts.net:8455")
+        );
+        assert!(!section.notify_waiting);
+        assert!(!section.notify_error);
+        assert_eq!(section.away_after_seconds, 0);
+    }
+
+    #[test]
+    fn companion_port_zero_is_refused() {
+        let error = parse_config("[companion]\nport = 0\n").unwrap_err();
+        assert_eq!(error.kind, ConfigErrorKind::Invalid, "{error}");
+    }
+
+    #[test]
+    fn companion_changes_reload_without_any_global_refresh() {
+        let base = Config::default();
+        let mut other = base.clone();
+        other.companion = parse_config("[companion]\n").unwrap().companion;
+        assert_ne!(other, base);
+        assert_eq!(
+            other.reload_effects(&base),
+            ReloadEffects {
+                theme: false,
+                terminal_font: false
+            }
         );
     }
 }
