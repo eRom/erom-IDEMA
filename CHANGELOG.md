@@ -6,7 +6,7 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 
 ### Corrigé
 
-- Les éditeurs (volet Fichiers, Scratchpad) ne gèlent plus sur les gros fichiers : un fichier de 1 Mo s'ouvre en un dixième de seconde au lieu de 3, et changer la largeur du volet ne fige plus l'interface près de 2 s. Les lignes se coupent aux mêmes endroits qu'avant.
+- Les éditeurs (volet Fichiers, Scratchpad) ne gèlent plus sur les gros fichiers : un fichier de 1 Mo s'ouvre en un dixième de seconde au lieu de 3, et changer la largeur du volet ne fige plus l'interface près de 2 s. Sur le texte et le code courants, les lignes se coupent aux mêmes endroits qu'avant.
 
 ## [0.4.0] - 2026-11-04
 
