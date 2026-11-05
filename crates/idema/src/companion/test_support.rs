@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use idema_tmux::server::TmuxServer;
 use tokio::sync::{mpsc, watch};
 
+use super::fleet::Fleet;
 use super::service::{self, ServiceDeps, ServiceHandle};
 use super::{ListenState, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
@@ -98,10 +99,12 @@ pub fn deps_in(
     ServiceDeps,
     mpsc::UnboundedSender<ServiceEvent>,
     watch::Receiver<ServiceStatus>,
+    watch::Sender<Arc<Fleet>>,
 ) {
     let (events_sender, events) = mpsc::unbounded_channel();
     let (commands, _commands_receiver) = futures::channel::mpsc::unbounded();
     let (status, status_receiver) = watch::channel(ServiceStatus::default());
+    let (fleet_sender, fleet) = watch::channel(Arc::new(Fleet::default()));
     let config: CompanionConfig = toml::from_str(&format!("port = {port}")).unwrap();
     let tmux = Arc::new(TmuxServer::new(
         "/nonexistent/tmux".into(),
@@ -118,10 +121,11 @@ pub fn deps_in(
         events,
         commands,
         status,
+        fleet,
         previous,
         test_routes,
     };
-    (deps, events_sender, status_receiver)
+    (deps, events_sender, status_receiver, fleet_sender)
 }
 
 /// Comme `deps_in`, sur un dossier neuf que l'appelant garde le temps du test.
@@ -130,7 +134,7 @@ pub fn deps(
     previous: Option<JoinHandle<()>>,
 ) -> (ServiceDeps, watch::Receiver<ServiceStatus>, TempDir) {
     let home = TempDir::new("deps");
-    let (deps, _events, status) = deps_in(port, home.0.clone(), previous, false);
+    let (deps, _events, status, _fleet) = deps_in(port, home.0.clone(), previous, false);
     (deps, status, home)
 }
 
@@ -159,6 +163,8 @@ pub struct Harness {
     pub home: TempDir,
     pub events: mpsc::UnboundedSender<ServiceEvent>,
     pub status: watch::Receiver<ServiceStatus>,
+    /// De quoi publier la flotte comme le fait l'espace de travail.
+    pub fleet: watch::Sender<Arc<Fleet>>,
     handle: Option<ServiceHandle>,
 }
 
@@ -170,7 +176,7 @@ impl Harness {
     /// Démarre sur ce dossier (un nouveau service sur les appareils d'un service arrêté).
     pub fn start_in(home: TempDir, test_routes: bool) -> Self {
         let port = free_port();
-        let (deps, events, mut status) = deps_in(port, home.0.clone(), None, test_routes);
+        let (deps, events, mut status, fleet) = deps_in(port, home.0.clone(), None, test_routes);
         let handle = service::start(deps).expect("the service thread spawns");
         wait_for(&mut status, |state| {
             *state == ListenState::Listening { port }
@@ -180,6 +186,7 @@ impl Harness {
             home,
             events,
             status,
+            fleet,
             handle: Some(handle),
         }
     }
@@ -329,5 +336,128 @@ pub fn pair_device(port: u16, user_agent: &str) -> String {
 impl Harness {
     pub fn pair(&self, user_agent: &str) -> String {
         pair_device(self.port, user_agent)
+    }
+
+    /// Appaire un appareil sans route de test, par l'événement de Personnaliser : le cookie à présenter.
+    pub fn pair_with_events(&self, user_agent: &str) -> String {
+        self.events.send(ServiceEvent::StartPairing).unwrap();
+        let code = self
+            .wait(|status| status.pairing.is_some())
+            .pairing
+            .unwrap()
+            .code;
+        let body = serde_json::json!({ "code": code }).to_string();
+        let reply = self.request(
+            "POST",
+            "/idema-api/pair",
+            &[
+                ("User-Agent", user_agent),
+                ("Content-Type", "application/json"),
+            ],
+            Some(&body),
+        );
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        let cookie = reply.header("set-cookie").expect("a cookie is set");
+        cookie.split(';').next().unwrap().to_owned()
+    }
+}
+
+/// Un flux SSE ouvert, lu image par image. Le corps arrive en `Transfer-Encoding: chunked` : les morceaux sont
+/// recollés avant de couper les images (séparées par une ligne vide).
+pub struct EventStream {
+    stream: TcpStream,
+    /// Les octets reçus, pas encore décodés en morceaux.
+    raw: Vec<u8>,
+    /// Le corps décodé, pas encore rendu.
+    text: String,
+    pub head: String,
+    ended: bool,
+}
+
+/// Ouvre `GET path` et lit l'en-tête de la réponse.
+pub fn open_stream(port: u16, path: &str, headers: &[(&str, &str)]) -> EventStream {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+    }
+    EventStream {
+        stream,
+        raw: Vec::new(),
+        text: String::new(),
+        head: String::from_utf8(head).unwrap(),
+        ended: false,
+    }
+}
+
+impl EventStream {
+    /// Décode les morceaux complets de `raw` vers `text`.
+    fn decode(&mut self) {
+        loop {
+            let Some(line_end) = self.raw.windows(2).position(|pair| pair == b"\r\n") else {
+                return;
+            };
+            let size =
+                usize::from_str_radix(String::from_utf8_lossy(&self.raw[..line_end]).trim(), 16)
+                    .expect("a chunk size");
+            if size == 0 {
+                self.ended = true;
+                return;
+            }
+            let end = line_end + 2 + size;
+            if self.raw.len() < end + 2 {
+                return;
+            }
+            self.text
+                .push_str(&String::from_utf8_lossy(&self.raw[line_end + 2..end]));
+            self.raw.drain(..end + 2);
+        }
+    }
+
+    /// La prochaine image (sans sa ligne vide finale), ou `None` si rien n'arrive en `wait` ou si le flux est fini.
+    pub fn next_frame(&mut self, wait: Duration) -> Option<String> {
+        let deadline = Instant::now() + wait;
+        loop {
+            self.decode();
+            if let Some(at) = self.text.find("\n\n") {
+                let frame = self.text[..at].to_owned();
+                self.text.drain(..at + 2);
+                return Some(frame);
+            }
+            if self.ended {
+                return None;
+            }
+            let left = deadline.checked_duration_since(Instant::now())?;
+            self.stream
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .unwrap();
+            let mut buffer = [0u8; 4096];
+            match self.stream.read(&mut buffer) {
+                Ok(0) => {
+                    self.ended = true;
+                }
+                Ok(read) => self.raw.extend_from_slice(&buffer[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return None;
+                }
+                Err(error) => panic!("stream read failed: {error}"),
+            }
+        }
     }
 }

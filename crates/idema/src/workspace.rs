@@ -42,7 +42,11 @@ use crate::changes::panel::{
     render_panel as render_changes_panel, target_menu,
 };
 use crate::commit_message::CommitMessageSettings;
-use crate::companion::{CompanionController, PaneCommand};
+use crate::companion::fleet::{
+    Fleet, FleetAgent, FleetPane, FleetSession, fleet_agents, mac_name, project_of, state_label,
+    unix_millis,
+};
+use crate::companion::{CompanionController, PaneCommand, ServiceEvent};
 use crate::config::{
     AgentEntry, Config, ConfigError, FileWatch, IdeationConfig, ReloadEffects, SHELL_ENTRY,
     SHELL_SESSION_NAME, ensure_config_file, harness_groups, load_config,
@@ -607,6 +611,7 @@ fn session_entries(sessions: &[ListedSession], panes: &[ListedPane]) -> Vec<Sess
                 view: None,
                 attempts: 0,
                 unreachable: None,
+                state_since: SystemTime::now(),
                 _subscription: None,
             })
         })
@@ -696,7 +701,20 @@ pub(crate) struct SessionEntry {
     /// Le message brut de la dernière chute quand les essais sont épuisés : le centre dit « Session injoignable »
     /// tant qu'il y en a un. Remis à `None` par une attache réussie.
     pub(crate) unreachable: Option<String>,
+    /// L'instant d'entrée dans l'état courant de `summary.state` : le compagnon l'affiche (« attend · 3 min »).
+    state_since: SystemTime,
     _subscription: Option<Subscription>,
+}
+
+impl SessionEntry {
+    /// Pose l'état affiché de la session et l'instant où elle y entre. Rend l'état d'avant, s'il a changé.
+    fn enter_state(&mut self, state: ActivityState, at: SystemTime) -> Option<ActivityState> {
+        if self.summary.state == state {
+            return None;
+        }
+        self.state_since = at;
+        Some(std::mem::replace(&mut self.summary.state, state))
+    }
 }
 
 /// Ce que le clic sur « Ramener dans ce pane » retient jusqu'à la fin de l'arrêt (`finish_reclaim`).
@@ -1149,6 +1167,7 @@ impl Workspace {
                 self.server = Some(Arc::clone(&server));
                 self.sync_companion(cx);
                 self.entries = session_entries(&sessions, &panes);
+                self.publish_fleet(cx);
                 self.drop_hidden_selection();
                 self.bootstrapped = true;
                 self.start_servers(Arc::clone(&server), window, cx);
@@ -1606,6 +1625,8 @@ impl Workspace {
 
     /// Les projets de la barre, dans son ordre, poussés aux serveurs (une liste inchangée ne coûte rien).
     fn sync_servers_projects(&mut self, cx: &mut Context<Self>) {
+        // Ajout, retrait ou ordre des projets : la flotte suit l'ordre de la barre.
+        self.publish_fleet(cx);
         let Some(servers) = self.servers.clone() else {
             return;
         };
@@ -1659,6 +1680,8 @@ impl Workspace {
                     self.state_mut().ui.servers_dev_ports = ports;
                     self.save();
                 }
+                // Un relevé a peut-être reconnu ou perdu un agent dans un pane.
+                self.publish_fleet(cx);
                 cx.notify();
             }
         }
@@ -2042,6 +2065,8 @@ impl Workspace {
                 self.config = config;
                 self.config_error = None;
                 self.sync_companion(cx);
+                // Les lanceurs (logos) et le libellé des bouillons viennent de la config.
+                self.publish_fleet(cx);
                 if effects.theme || effects.terminal_font {
                     apply_editor_theme(
                         &Theme::new(self.config.ui_font_size),
@@ -2051,7 +2076,7 @@ impl Workspace {
                 }
                 self.leave_hidden_ideation(window, cx);
                 if ideation_was_on != self.ideation().is_some() {
-                    self.refresh_badge();
+                    self.refresh_badge(cx);
                 }
                 hud::log_event(&format!(
                     "config reloaded theme={} terminal_font={} ideation={}",
@@ -2095,6 +2120,8 @@ impl Workspace {
         );
         match started {
             Some(mut commands) => {
+                // Le service qui démarre n'a encore aucun instantané : le premier part tout de suite.
+                self.publish_fleet(cx);
                 self._companion_task = Some(cx.spawn(async move |this, cx| {
                     while let Some(command) = commands.next().await {
                         if this
@@ -2323,12 +2350,18 @@ impl Workspace {
         };
         let view = SessionView::spawn(server, &info, launches, size, window, cx)?;
         let subscription = cx.subscribe_in(&view, window, Self::on_session_event);
+        let now = SystemTime::now();
         let entry = &mut self.entries[index];
         entry.view = Some(view);
         entry._subscription = Some(subscription);
         // Une vue neuve repart de zéro : l'état de la précédente ne survit pas à son remplacement.
-        entry.summary.state = ActivityState::Idle;
-        self.refresh_badge();
+        let left = entry
+            .enter_state(ActivityState::Idle, now)
+            .map(|previous| (entry.summary.name.clone(), previous));
+        if let Some((session, previous)) = left {
+            self.report_transition(session, previous, ActivityState::Idle, now);
+        }
+        self.refresh_badge(cx);
         Ok(())
     }
 
@@ -2417,6 +2450,7 @@ impl Workspace {
         for (seen, view) in views {
             view.update(cx, |view, cx| view.set_seen(seen, cx));
         }
+        self.publish_fleet(cx);
     }
 
     /// Le volet droit ouvert est-il agrandi ? Il prend alors la place de la colonne principale.
@@ -3899,11 +3933,113 @@ impl Workspace {
     }
 
     /// Le badge du Dock compte les sessions qui attendent ou sont en erreur ; il disparaît à zéro.
-    fn refresh_badge(&self) {
+    fn refresh_badge(&self, cx: &App) {
         dock::set_badge(dock_badge_count(
             self.entries.iter().map(|entry| &entry.summary),
             self.ideation().is_some(),
         ));
+        self.publish_fleet(cx);
+    }
+
+    /// Publie l'instantané de la flotte au service du compagnon : projets et sessions dans l'ordre de la barre (tous les
+    /// projets dépliés, les bouillons en tête), avec l'état, l'instant d'entrée, les agents et les panes de chaque
+    /// session. Compagnon éteint, rien n'est construit. Un instantané qui ne dit rien de plus que le précédent n'est
+    /// pas republié (`CompanionController::publish`), donc on peut l'appeler à chaque changement possible.
+    fn publish_fleet(&self, cx: &App) {
+        if !self.companion.is_on() {
+            return;
+        }
+        let ideation = self.ideation();
+        let summaries = self.summaries();
+        let sessions = self
+            .full_order(&summaries)
+            .iter()
+            .filter_map(|name| {
+                self.entries
+                    .iter()
+                    .find(|entry| entry.summary.name == *name)
+            })
+            .map(|entry| self.fleet_session(entry, cx))
+            .collect();
+        self.companion.publish(Fleet {
+            mac: mac_name().to_owned(),
+            generated_at: unix_millis(SystemTime::now()),
+            badge: dock_badge_count(
+                self.entries.iter().map(|entry| &entry.summary),
+                ideation.is_some(),
+            ),
+            ideation_label: ideation.map(|ideation| ideation.label.clone()),
+            projects: self
+                .state()
+                .ordered_projects()
+                .iter()
+                .map(|project| project_of(&project.path))
+                .collect(),
+            sessions,
+        });
+    }
+
+    /// Une session telle que le téléphone la montre.
+    fn fleet_session(&self, entry: &SessionEntry, cx: &App) -> FleetSession {
+        let summary = &entry.summary;
+        let agents = if summary.ideation {
+            // Un bouillon porte toujours l'astérisque de Claude, sous le libellé de la section (comme la barre).
+            vec![FleetAgent {
+                label: self
+                    .ideation()
+                    .map_or_else(String::new, |ideation| ideation.label.clone()),
+                logo: Some("claude".into()),
+            }]
+        } else {
+            self.servers.as_ref().map_or_else(Vec::new, |servers| {
+                fleet_agents(
+                    servers.read(cx).agents_of(&summary.name),
+                    &self.config.agents,
+                )
+            })
+        };
+        let view = entry.view.as_ref().map(|view| view.read(cx));
+        FleetSession {
+            name: summary.name.clone(),
+            display_name: summary.display_name.clone(),
+            // Un bouillon n'a pas de projet : son dossier d'idéation n'a rien à faire sur le téléphone.
+            project: if summary.ideation {
+                String::new()
+            } else {
+                summary.project.to_string_lossy().into_owned()
+            },
+            ideation: summary.ideation,
+            state: state_label(summary.state),
+            state_since: unix_millis(entry.state_since),
+            seen: view.is_some_and(SessionView::is_seen),
+            agents,
+            panes: view.map_or_else(Vec::new, |view| {
+                view.pane_states(cx)
+                    .into_iter()
+                    .map(|(pane, active, state)| FleetPane {
+                        id: pane.0,
+                        active,
+                        state: state_label(state),
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    /// Dit au service du compagnon qu'une session a changé d'état (sans effet compagnon éteint).
+    fn report_transition(
+        &self,
+        session: String,
+        from: ActivityState,
+        to: ActivityState,
+        at: SystemTime,
+    ) {
+        self.companion.send(ServiceEvent::Transition {
+            session,
+            from,
+            to,
+            at,
+        });
     }
 
     /// Une session change d'état : la barre, le badge et, au passage en « attend » d'une session non vue, le son.
@@ -3922,14 +4058,16 @@ impl Workspace {
         else {
             return;
         };
-        entry.summary.state = current;
+        let now = SystemTime::now();
+        entry.enter_state(current, now);
         let name = entry.summary.name.clone();
         if is_alerting_session(entry.summary.ideation, ideation_enabled)
             && should_chime(previous, current, view.read(cx).is_seen())
         {
             self.chime(&format!("session={name}"));
         }
-        self.refresh_badge();
+        self.report_transition(name, previous, current, now);
+        self.refresh_badge(cx);
         cx.notify();
     }
 
@@ -4121,7 +4259,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            SessionEvent::MetaChanged => cx.notify(),
+            SessionEvent::MetaChanged => {
+                // Le pane actif ou son programme a changé : la flotte porte le drapeau « actif ».
+                self.publish_fleet(cx);
+                cx.notify();
+            }
+            SessionEvent::PanesChanged => self.publish_fleet(cx),
             SessionEvent::StateChanged { previous, current } => {
                 self.on_state_changed(view, *previous, *current, cx);
             }
@@ -4261,12 +4404,16 @@ impl Workspace {
             return;
         };
         hud::log_event(&format!("session unreachable session={name}: {raw}"));
+        let now = SystemTime::now();
         let entry = &mut self.entries[index];
         entry.view = None;
         entry._subscription = None;
-        entry.summary.state = ActivityState::Idle;
+        let left = entry.enter_state(ActivityState::Idle, now);
         entry.unreachable = Some(raw);
-        self.refresh_badge();
+        if let Some(previous) = left {
+            self.report_transition(name.to_owned(), previous, ActivityState::Idle, now);
+        }
+        self.refresh_badge(cx);
         if self.selected_name() == Some(name) {
             window.focus(&self.focus_handle, cx);
         }
@@ -4291,7 +4438,7 @@ impl Workspace {
             })
             .flatten();
         self.entries.retain(|entry| entry.summary.name != name);
-        self.refresh_badge();
+        self.refresh_badge(cx);
         if was_selected {
             match neighbor {
                 Some(next) => match neighbor_handoff(keep_gallery) {
@@ -4824,6 +4971,7 @@ impl Workspace {
         self.state_mut()
             .set_pinned(path, pinned.then_some(now.as_str()));
         self.save();
+        self.publish_fleet(cx);
         cx.notify();
     }
 
@@ -5247,6 +5395,7 @@ impl Workspace {
             view: None,
             attempts: 0,
             unreachable: None,
+            state_since: SystemTime::now(),
             _subscription: None,
         });
         self.entries
@@ -5854,6 +6003,7 @@ impl Workspace {
             return;
         }
         let previous = std::mem::replace(current, text.clone());
+        self.publish_fleet(cx);
         let target = name.to_owned();
         let written = text.clone();
         let write = cx.background_spawn({
@@ -5868,6 +6018,7 @@ impl Workspace {
                         && this.entries[index].summary.display_name == text
                     {
                         this.entries[index].summary.display_name = previous;
+                        this.publish_fleet(cx);
                         cx.notify();
                     }
                 });
@@ -7457,6 +7608,29 @@ mod tests {
             (entries[1].pane, entries[1].agent.as_str()),
             (PaneId(7), "Pi")
         );
+    }
+
+    #[test]
+    fn an_entry_remembers_when_it_entered_its_state() {
+        let mut entries = session_entries(
+            &[listed_session("a", 1)],
+            &[listed_pane("a", 1, true, "Shell")],
+        );
+        let entry = &mut entries[0];
+        let start = entry.state_since;
+        let later = start + Duration::from_secs(30);
+
+        // Le même état : rien ne bouge, l'instant d'entrée reste celui d'origine.
+        assert_eq!(entry.enter_state(ActivityState::Idle, later), None);
+        assert_eq!(entry.state_since, start);
+
+        // Un autre état : l'ancien est rendu, l'instant devient celui du changement.
+        assert_eq!(
+            entry.enter_state(ActivityState::Waiting, later),
+            Some(ActivityState::Idle)
+        );
+        assert_eq!(entry.summary.state, ActivityState::Waiting);
+        assert_eq!(entry.state_since, later);
     }
 
     #[test]

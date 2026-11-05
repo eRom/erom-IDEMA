@@ -36,10 +36,20 @@ impl From<&Device> for Caller {
 }
 
 /// Un appairage réussi : le jeton à poser en cookie (base64url, jamais gardé) et l'appareil créé.
-#[derive(Debug)]
 pub struct Paired {
     pub token: String,
     pub caller: Caller,
+}
+
+/// Le jeton ne s'écrit jamais, ni au journal ni dans une assertion qui échoue.
+impl std::fmt::Debug for Paired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Paired")
+            .field("token", &"<masqué>")
+            .field("caller", &self.caller)
+            .finish()
+    }
 }
 
 /// Pourquoi un appairage est refusé.
@@ -72,7 +82,14 @@ struct State {
 }
 
 pub struct Access {
+    /// Les appareils (lus par la garde, sur le runtime) et les codes. Jamais tenu pendant une écriture sur disque :
+    /// une écriture lente ne doit pas figer la reconnaissance d'un cookie.
     state: Mutex<State>,
+    /// Une écriture de `devices.json` à la fois (le fil du service reste l'unique écrivain). Les méthodes qui écrivent
+    /// le prennent d'abord, puis copient la liste, l'écrivent hors de `state`, et ne la mettent en place qu'ensuite :
+    /// la mémoire ne devance jamais le disque, et personne d'autre que ces méthodes ne change la liste entre-temps.
+    /// Ordre des verrous : `writer` puis `state`, jamais l'inverse.
+    writer: Mutex<()>,
     status: Arc<watch::Sender<ServiceStatus>>,
 }
 
@@ -84,6 +101,7 @@ impl Access {
                 devices,
                 codes: PairingCodes::default(),
             }),
+            writer: Mutex::new(()),
             status,
         };
         access.publish(&access.lock());
@@ -137,6 +155,8 @@ impl Access {
             ServiceEvent::ForgetDevice { id } => {
                 self.forget(&id);
             }
+            // Les transitions vont à la chronologie (`service::control_loop`), pas à l'accès.
+            ServiceEvent::Transition { .. } => {}
         }
     }
 
@@ -165,14 +185,18 @@ impl Access {
 
     /// Essaie un code d'appairage. Bon : crée l'appareil et rend le jeton, que seul ce retour contient.
     pub fn pair(&self, code: &str, user_agent: Option<&str>) -> Result<Paired, PairRefusal> {
-        let mut state = self.lock();
-        let result = match state.codes.verify(code, Instant::now()) {
+        let outcome = {
+            let mut state = self.lock();
+            let outcome = state.codes.verify(code, Instant::now());
+            self.publish(&state);
+            outcome
+        };
+        let result = match outcome {
             PairOutcome::Accepted => {
                 let token = new_token(&mut OsRng);
                 let name = device_name(user_agent);
-                match state
-                    .devices
-                    .add(name, &token_hash(&token), SystemTime::now())
+                match self
+                    .write_devices(|store| store.add(name, &token_hash(&token), SystemTime::now()))
                 {
                     Ok(id) => Ok(Paired {
                         token: URL_SAFE_NO_PAD.encode(token),
@@ -193,7 +217,6 @@ impl Access {
             PairOutcome::Locked => Err(PairRefusal::Locked),
             PairOutcome::NoCode => Err(PairRefusal::NoCode),
         };
-        self.publish(&state);
         hud::log_event(if result.is_ok() {
             "companion pair ok"
         } else {
@@ -216,23 +239,19 @@ impl Access {
 
     /// Note l'activité de l'appareil (une écriture au plus par minute).
     pub fn touch(&self, id: &str) {
-        let mut state = self.lock();
-        let now = SystemTime::now();
-        if !state.devices.touch_due(id, now) {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.lock().devices.touch_due(id, SystemTime::now()) {
             return;
         }
-        match state.devices.touch(id, now) {
-            Ok(()) => self.publish(&state),
-            Err(error) => log_write_failure("touch", &error),
+        if let Err(error) = self.write_devices_held(|store| store.touch(id, SystemTime::now())) {
+            log_write_failure("touch", &error);
         }
     }
 
     /// Oublie l'appareil et son abonnement. Rend vrai s'il existait.
     pub fn forget(&self, id: &str) -> bool {
-        let mut state = self.lock();
-        match state.devices.forget(id) {
+        match self.write_devices(|store| store.forget(id)) {
             Ok(true) => {
-                self.publish(&state);
                 hud::log_event("companion device forgotten");
                 true
             }
@@ -242,6 +261,29 @@ impl Access {
                 false
             }
         }
+    }
+
+    /// Change la liste des appareils et l'écrit, hors du verrou d'état (voir `writer`).
+    fn write_devices<R>(
+        &self,
+        change: impl FnOnce(&mut DeviceStore) -> io::Result<R>,
+    ) -> io::Result<R> {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.write_devices_held(change)
+    }
+
+    /// Comme `write_devices`, `writer` déjà tenu par l'appelant. `change` s'applique à une copie du magasin, qui écrit
+    /// le fichier lui-même et revient en arrière s'il échoue ; la copie ne remplace le magasin qu'une fois écrite.
+    fn write_devices_held<R>(
+        &self,
+        change: impl FnOnce(&mut DeviceStore) -> io::Result<R>,
+    ) -> io::Result<R> {
+        let mut working = self.lock().devices.clone();
+        let result = change(&mut working)?;
+        let mut state = self.lock();
+        state.devices = working;
+        self.publish(&state);
+        Ok(result)
     }
 }
 
@@ -381,5 +423,74 @@ mod tests {
         let (access, status) = access(&home);
         assert!(access.authenticate(&token).is_some());
         assert_eq!(status.borrow().devices.len(), 1, "listed from the start");
+    }
+
+    #[test]
+    fn a_paired_token_does_not_leak_through_debug() {
+        let home = TempDir::new("access");
+        let (access, _) = access(&home);
+        let display = access.start_pairing();
+        let paired = access.pair(&display.code, Some("iPhone")).unwrap();
+        let printed = format!("{paired:?}");
+        assert!(!printed.contains(&paired.token), "{printed}");
+        assert!(printed.contains("iPhone"), "the device is still shown");
+    }
+
+    /// Une écriture de `devices.json` qui traîne (disque lent) ne fige pas la reconnaissance d'un cookie : le fichier
+    /// voisin est un tube sans lecteur, donc l'écriture reste bloquée tant que le test ne l'ouvre pas en lecture.
+    #[test]
+    fn a_slow_devices_write_never_blocks_authentication() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let home = TempDir::new("access");
+        let (access, _) = access(&home);
+        let access = Arc::new(access);
+        let pair = |agent: &str| {
+            let display = access.start_pairing();
+            access.pair(&display.code, Some(agent)).unwrap()
+        };
+        let phone = pair("iPhone");
+        let tablet = pair("iPad");
+
+        let fifo = home.0.join("companion").join("devices.json.tmp");
+        let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let (started, started_receiver) = mpsc::channel();
+        let forgetting = {
+            let access = Arc::clone(&access);
+            let id = phone.caller.id.clone();
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                access.forget(&id)
+            })
+        };
+        started_receiver.recv().unwrap();
+        // Laisse l'oubli atteindre l'ouverture bloquée du fichier voisin.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let (done, done_receiver) = mpsc::channel();
+        {
+            let access = Arc::clone(&access);
+            let token = tablet.token.clone();
+            std::thread::spawn(move || {
+                let known = access.authenticate(&token).is_some();
+                let deadline = access.pairing_deadline();
+                done.send((known, deadline)).unwrap();
+            });
+        }
+        let answered = done_receiver.recv_timeout(Duration::from_secs(2));
+
+        // Libère l'écriture (le tube est vidé, `sync_all` sur un tube échoue : l'oubli est alors refusé).
+        let mut drain = std::fs::File::open(&fifo).unwrap();
+        std::io::Read::read_to_end(&mut drain, &mut Vec::new()).unwrap();
+        forgetting.join().unwrap();
+
+        let (known, deadline) = answered.expect("authenticate answered while the write was stuck");
+        assert!(known);
+        assert!(deadline.is_none());
     }
 }

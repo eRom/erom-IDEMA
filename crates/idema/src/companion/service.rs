@@ -4,9 +4,9 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::{Either, select};
@@ -15,7 +15,9 @@ use tokio::sync::{mpsc::UnboundedReceiver, watch};
 
 use super::access::Access;
 use super::devices::DeviceStore;
+use super::fleet::Fleet;
 use super::server::{AppState, router, stopped};
+use super::timeline::Timeline;
 use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
 use crate::hud;
@@ -46,6 +48,8 @@ pub struct ServiceDeps {
     #[allow(dead_code, reason = "lu par la tâche 4 (commandes sur un pane)")]
     pub commands: UnboundedSender<PaneCommand>,
     pub status: watch::Sender<ServiceStatus>,
+    /// Le dernier instantané de la flotte, publié par l'espace de travail (`CompanionController::publish`).
+    pub fleet: watch::Receiver<Arc<Fleet>>,
     /// Le fil du service précédent, quand celui-ci le remplace : le nouveau le joint (sur son propre fil, jamais celui
     /// de l'interface) avant de lier la prise, pour ne pas la trouver encore occupée.
     pub previous: Option<JoinHandle<()>>,
@@ -104,6 +108,7 @@ struct Serving {
     known_origin: Option<String>,
     test_routes: bool,
     bind_retry: Duration,
+    fleet: watch::Receiver<Arc<Fleet>>,
 }
 
 /// Le corps du fil.
@@ -114,6 +119,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         config,
         events,
         status,
+        fleet,
         previous,
         test_routes,
         ..
@@ -167,6 +173,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         } else {
             Duration::ZERO
         },
+        fleet,
     };
     let served = runtime.block_on(serve(serving, &status, access, events, stop));
     // Le runtime est abandonné ici : ses tâches restantes (flux en retard, appel bloquant) ne retiennent plus le fil.
@@ -193,6 +200,7 @@ async fn serve(
         known_origin,
         test_routes,
         bind_retry,
+        fleet,
     } = serving;
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = match bind(address, bind_retry).await {
@@ -208,8 +216,15 @@ async fn serve(
     if test_routes {
         hud::log_event("companion test routes active");
     }
-    // Les gestes de Personnaliser (code, oubli) et l'échéance du code : une tâche du runtime, qui s'arrête avec lui.
-    tokio::spawn(control_loop(events, Arc::clone(&access)));
+    // La chronologie vit autant que le service : elle est perdue à son arrêt, et son instant de démarrage est celui-ci.
+    let timeline = Arc::new(Mutex::new(Timeline::new(SystemTime::now())));
+    // Les gestes de Personnaliser (code, oubli), les transitions et l'échéance du code : une tâche du runtime, qui
+    // s'arrête avec lui.
+    tokio::spawn(control_loop(
+        events,
+        Arc::clone(&access),
+        Arc::clone(&timeline),
+    ));
     let state = AppState {
         version,
         stop: stop.clone(),
@@ -217,6 +232,8 @@ async fn serve(
         known_origin,
         port,
         test_routes,
+        fleet,
+        timeline,
     };
     let server = axum::serve(listener, router(state))
         .with_graceful_shutdown(stopped(stop.clone()))
@@ -248,10 +265,14 @@ async fn serve(
     }
 }
 
-/// Applique les événements de l'espace de travail à l'état d'accès, et fait disparaître le code d'appairage à son
-/// échéance. S'arrête quand l'espace de travail ferme la file (service retiré). Sans code en cours, la tâche dort
-/// sur la file : aucune minuterie.
-async fn control_loop(mut events: UnboundedReceiver<ServiceEvent>, access: Arc<Access>) {
+/// Applique les événements de l'espace de travail : les transitions à la chronologie, les gestes de Personnaliser à
+/// l'état d'accès. Fait aussi disparaître le code d'appairage à son échéance. S'arrête quand l'espace de travail
+/// ferme la file (service retiré). Sans code en cours, la tâche dort sur la file : aucune minuterie.
+async fn control_loop(
+    mut events: UnboundedReceiver<ServiceEvent>,
+    access: Arc<Access>,
+    timeline: Arc<Mutex<Timeline>>,
+) {
     loop {
         let event = match access.pairing_deadline() {
             Some(deadline) => {
@@ -273,6 +294,20 @@ async fn control_loop(mut events: UnboundedReceiver<ServiceEvent>, access: Arc<A
         let Some(event) = event else {
             return;
         };
+        if let ServiceEvent::Transition {
+            session,
+            from,
+            to,
+            at,
+        } = event
+        {
+            // Une insertion en mémoire : pas de disque, donc pas de `spawn_blocking`.
+            timeline
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .record(&session, from, to, at);
+            continue;
+        }
         let access = Arc::clone(&access);
         // L'oubli d'un appareil écrit sur disque : hors du runtime.
         let _ = tokio::task::spawn_blocking(move || access.handle(event)).await;
@@ -374,7 +409,7 @@ mod tests {
     fn stop_frees_the_port_even_with_an_open_stream() {
         let port = free_port();
         let home = TempDir::new("stop");
-        let (service_deps, _events, mut status) = deps_in(port, home.0.clone(), None, true);
+        let (service_deps, _events, mut status, _fleet) = deps_in(port, home.0.clone(), None, true);
         let handle = start(service_deps).expect("the service thread spawns");
         wait_for(&mut status, |state| {
             *state == ListenState::Listening { port }
@@ -435,7 +470,7 @@ mod tests {
         let home = TempDir::new("no-folder");
         let not_a_folder = home.0.join("file");
         std::fs::write(&not_a_folder, b"x").unwrap();
-        let (service_deps, _events, mut status) = deps_in(port, not_a_folder, None, false);
+        let (service_deps, _events, mut status, _fleet) = deps_in(port, not_a_folder, None, false);
         let handle = start(service_deps).expect("the service thread spawns");
         let state = wait_for(&mut status, |state| {
             matches!(state, ListenState::Failed { .. })

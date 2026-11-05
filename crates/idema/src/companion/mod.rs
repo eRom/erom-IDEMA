@@ -7,13 +7,18 @@ mod access;
 mod auth;
 pub mod controller;
 mod devices;
+pub mod fleet;
 mod server;
 pub mod service;
+mod sse;
 #[cfg(test)]
 mod test_support;
+mod timeline;
 mod web_assets;
 
 use std::time::SystemTime;
+
+use idema_term::activity::ActivityState;
 
 pub use controller::CompanionController;
 
@@ -72,6 +77,13 @@ pub enum ServiceEvent {
     CancelPairing,
     /// Oublier un appareil et son abonnement : sa requête suivante prend 401.
     ForgetDevice { id: String },
+    /// Une session a changé d'état : le service range la transition dans la chronologie (si elle compte).
+    Transition {
+        session: String,
+        from: ActivityState,
+        to: ActivityState,
+        at: SystemTime,
+    },
 }
 
 /// Ce que le service demande au fil d'interface. Les tâches suivantes ajoutent les variantes.

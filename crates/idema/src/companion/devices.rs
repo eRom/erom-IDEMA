@@ -88,7 +88,7 @@ impl From<Record> for Device {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeviceStore {
     path: PathBuf,
     devices: Vec<Device>,
@@ -112,12 +112,16 @@ impl DeviceStore {
         fs::set_permissions(&folder, fs::Permissions::from_mode(0o700))?;
         let path = folder.join("devices.json");
         let devices = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<FileContent>(&bytes)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-                .devices
-                .into_iter()
-                .map(Device::from)
-                .collect(),
+            Ok(bytes) => {
+                // Un fichier laissé avec des droits plus larges (restauré, copié) est resserré avant tout usage.
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+                serde_json::from_slice::<FileContent>(&bytes)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                    .devices
+                    .into_iter()
+                    .map(Device::from)
+                    .collect()
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
         };
@@ -314,10 +318,16 @@ mod tests {
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&folder), 0o700);
         assert_eq!(mode(&folder.join("devices.json")), 0o600);
-        // Un dossier déjà là avec des droits trop larges est resserré à l'ouverture.
+        // Un dossier et un fichier déjà là avec des droits trop larges sont resserrés à l'ouverture.
         fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            folder.join("devices.json"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
         DeviceStore::open(&home.0).unwrap();
         assert_eq!(mode(&folder), 0o700);
+        assert_eq!(mode(&folder.join("devices.json")), 0o600);
     }
 
     #[test]

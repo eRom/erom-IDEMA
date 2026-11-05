@@ -542,6 +542,19 @@ fn validate(config: &Config, text: &str) -> Result<(), ConfigError> {
     {
         return Err(invalid("[companion] port doit être entre 1 et 65535"));
     }
+    // Une adresse illisible ferait admettre toute origine `*.ts.net` en écriture (le repli quand aucune adresse n'est
+    // connue) : mieux vaut refuser la config que dégrader la garde en silence. Elle n'est pas répétée dans le message.
+    if let Some(address) = config
+        .companion
+        .as_ref()
+        .and_then(|companion| companion.public_url.as_deref())
+        && !url::Url::parse(address)
+            .is_ok_and(|parsed| parsed.scheme() == "https" && parsed.host_str().is_some())
+    {
+        return Err(invalid(
+            "[companion] public_url doit être une adresse https valide, par exemple https://mac.tailnet.ts.net:8455",
+        ));
+    }
     let favorites = config.browser.iter().flat_map(|browser| &browser.favorites);
     for (index, favorite) in favorites.enumerate() {
         let refusal = if favorite.name.trim().is_empty() {
@@ -1157,6 +1170,32 @@ mod tests {
     fn companion_port_zero_is_refused() {
         let error = parse_config("[companion]\nport = 0\n").unwrap_err();
         assert_eq!(error.kind, ConfigErrorKind::Invalid, "{error}");
+    }
+
+    #[test]
+    fn companion_public_url_must_be_a_valid_https_address() {
+        for bad in [
+            "",
+            "not a url",
+            "mac.tailnet.ts.net:8455",
+            "http://mac.tailnet.ts.net:8455",
+            "ftp://mac.tailnet.ts.net",
+            "https://",
+        ] {
+            let error =
+                parse_config(&format!("[companion]\npublic_url = {bad:?}\n")).expect_err(bad);
+            assert_eq!(error.kind, ConfigErrorKind::Invalid, "{bad}: {error}");
+            assert!(error.to_string().contains("public_url"), "{bad}: {error}");
+        }
+        for good in [
+            "https://mac.tailnet.ts.net",
+            "https://mac.tailnet.ts.net:8455",
+            "https://mac.tailnet.ts.net:8455/",
+        ] {
+            let parsed = parse_config(&format!("[companion]\npublic_url = {good:?}\n"));
+            assert!(parsed.is_ok(), "{good}");
+        }
+        assert!(parse_config("[companion]\n").is_ok(), "no URL stays valid");
     }
 
     #[test]

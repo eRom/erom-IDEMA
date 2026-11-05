@@ -107,6 +107,9 @@ pub enum SessionEvent {
         previous: ActivityState,
         current: ActivityState,
     },
+    /// L'état d'un de ses panes a changé, que celui de la session change ou non : le compagnon republie la flotte, qui
+    /// porte l'état de chaque pane.
+    PanesChanged,
     /// Le focus GPUI d'un de ses panes a changé : l'espace de travail recalcule qui tient le clavier.
     FocusChanged,
     /// Un pane caché par le zoom passe en « attend » alors que la session est vue : le son part quand même
@@ -602,6 +605,21 @@ impl SessionView {
 
     pub fn preset(&self) -> Preset {
         self.preset
+    }
+
+    /// Les panes suivis, cachés compris : leur identifiant tmux, s'ils sont le pane actif, et leur état propre. C'est
+    /// ce que le compagnon montre de la session, au-delà de l'état le plus urgent.
+    pub fn pane_states(&self, cx: &App) -> Vec<(PaneId, bool, ActivityState)> {
+        self.slots
+            .iter()
+            .map(|slot| {
+                (
+                    slot.id,
+                    self.active == Some(slot.id),
+                    slot.view.read(cx).state(),
+                )
+            })
+            .collect()
     }
 
     /// Le nombre de panes cachés (la fenêtre cachée), pour « N panes masqués ».
@@ -1161,6 +1179,7 @@ impl SessionView {
             PaneEvent::MetaChanged => cx.emit(SessionEvent::MetaChanged),
             PaneEvent::StateChanged { previous, current } => {
                 self.refresh_state(cx);
+                cx.emit(SessionEvent::PanesChanged);
                 if let Some(id) = pane.read(cx).pane()
                     && hidden_pane_chimes(
                         self.seen,

@@ -1,16 +1,16 @@
 //! Les routes HTTP du service. Toutes les routes de données sont sous `/idema-api/` et passent par la garde ; les
 //! fichiers de la page sont servis à la racine, sans cookie et sans donnée.
 
-use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Extension, Request, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{DefaultBodyLimit, Extension, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::StreamExt;
@@ -20,6 +20,9 @@ use tokio::sync::watch;
 use super::ServiceEvent;
 use super::access::{Access, Caller};
 use super::auth::{COOKIE_NAME, cookie_header, origin_allowed};
+use super::fleet::Fleet;
+use super::sse::{self, COALESCE};
+use super::timeline::Timeline;
 use super::web_assets;
 use crate::hud;
 
@@ -32,7 +35,8 @@ const BODY_LIMIT: usize = 64 * 1024;
 const API_PREFIX: &str = "/idema-api/";
 const HEALTH_PATH: &str = "/idema-api/health";
 const PAIR_PATH: &str = "/idema-api/pair";
-const TEST_PREFIX: &str = "/idema-api/test/";
+const TEST_PAIRING_CODE_PATH: &str = "/idema-api/test/pairing-code";
+const TEST_FORGET_PATH: &str = "/idema-api/test/forget";
 
 /// La politique de contenu de toutes les réponses (spec §3.3) : rien d'extérieur, aucun script en ligne.
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
@@ -53,6 +57,9 @@ pub struct AppState {
     pub port: u16,
     /// Les routes de test existent-elles ? Décidé une fois par le contrôleur (`auth::test_routes_enabled`).
     pub test_routes: bool,
+    /// Le dernier instantané de la flotte : `fleet` le lit, chaque flux `events` s'y abonne.
+    pub fleet: watch::Receiver<Arc<Fleet>>,
+    pub timeline: Arc<Mutex<Timeline>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -60,12 +67,14 @@ pub fn router(state: AppState) -> Router {
         .route(HEALTH_PATH, get(health))
         .route(PAIR_PATH, post(pair))
         .route("/idema-api/me", get(me))
+        .route("/idema-api/fleet", get(fleet))
         .route("/idema-api/events", get(events))
+        .route("/idema-api/timeline", get(timeline))
         .route("/idema-api/client-metrics", post(client_metrics));
     if state.test_routes {
         router = router
-            .route("/idema-api/test/pairing-code", post(test_pairing_code))
-            .route("/idema-api/test/forget", post(test_forget));
+            .route(TEST_PAIRING_CODE_PATH, post(test_pairing_code))
+            .route(TEST_FORGET_PATH, post(test_forget));
     }
     router
         .fallback(app_files)
@@ -108,14 +117,19 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// La garde de `/idema-api/*`. Dans l'ordre : l'origine d'une écriture (403), le cookie (401, sauf `health`, `pair` et
-/// les routes de test), le type du corps d'une écriture (415). Les fichiers de la page ne passent pas par elle.
+/// La garde de `/idema-api/*`. Dans l'ordre : l'origine d'une écriture (403), le cookie (401, sauf `health`, `pair` et,
+/// quand elles existent, les deux routes de test), le type du corps d'une écriture (415). Les fichiers de la page ne
+/// passent pas par elle.
 async fn guard(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path();
     if !path.starts_with(API_PREFIX) {
         return next.run(request).await;
     }
-    let exempt = path == HEALTH_PATH || path == PAIR_PATH || path.starts_with(TEST_PREFIX);
+    // Les deux chemins exacts des routes de test, et seulement quand elles sont allumées : tout autre chemin sous
+    // `/idema-api/test/` demande le cookie comme le reste de l'API.
+    let exempt = path == HEALTH_PATH
+        || path == PAIR_PATH
+        || (state.test_routes && (path == TEST_PAIRING_CODE_PATH || path == TEST_FORGET_PATH));
     let write = !matches!(*request.method(), Method::GET | Method::HEAD);
 
     if write && let Some(origin) = request.headers().get(header::ORIGIN) {
@@ -224,11 +238,48 @@ async fn me(Extension(caller): Extension<Caller>) -> Response {
     )
 }
 
-/// Le flux d'événements, provisoire : il n'émet que le commentaire de maintien et se ferme à l'arrêt du service.
+/// `GET fleet` : le dernier instantané publié.
+async fn fleet(State(state): State<AppState>) -> Response {
+    let latest = Arc::clone(&state.fleet.borrow());
+    match serde_json::to_string(&*latest) {
+        Ok(json) => json_reply(StatusCode::OK, json),
+        Err(_) => error_reply(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
+/// `GET events` : le flux SSE de la flotte. Un événement `fleet` à chaque nouvel instantané (regroupé sur 250 ms), un
+/// commentaire de maintien toutes les 20 s, et la fin du flux au signal d'arrêt du service.
 async fn events(State(state): State<AppState>) -> impl IntoResponse {
-    let stream = futures::stream::pending::<Result<Event, Infallible>>()
-        .take_until(stopped(state.stop.clone()));
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEP_ALIVE).text(""))
+    let stream =
+        sse::fleet_events(state.fleet.clone(), COALESCE).take_until(stopped(state.stop.clone()));
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEP_ALIVE).text("keepalive"))
+}
+
+#[derive(Deserialize)]
+struct TimelineQuery {
+    /// Les transitions dont l'instant est au moins celui-ci, en millisecondes ; absent : toutes.
+    since: Option<u64>,
+}
+
+/// `GET timeline?since=<ms>` : les transitions qui comptent, et l'instant de démarrage d'IdemA.
+async fn timeline(
+    State(state): State<AppState>,
+    query: Result<Query<TimelineQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(TimelineQuery { since })) = query else {
+        return error_reply(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    let body = {
+        let timeline = state
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        serde_json::json!({
+            "started_at": timeline.started_at(),
+            "events": timeline.since(since.unwrap_or(0)),
+        })
+    };
+    json_reply(StatusCode::OK, body.to_string())
 }
 
 #[derive(Deserialize)]
@@ -352,7 +403,8 @@ fn etag_matches(sent: &str, etag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::companion::test_support::{Harness, Reply};
+    use crate::companion::fleet::unix_millis;
+    use crate::companion::test_support::{Harness, Reply, open_stream};
 
     const JSON: (&str, &str) = ("Content-Type", "application/json");
     const IPHONE: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 19_0 like Mac OS X)";
@@ -489,19 +541,18 @@ mod tests {
         );
         assert!(locked.header("set-cookie").is_none());
 
-        for bad in [
-            "",
-            "not json",
-            "{}",
-            r#"{"code":5}"#,
-            r#"{"code":"1","x":1}"#,
+        // Un corps illisible est une mauvaise requête (400) ; un corps lisible qui présente un code tombe sur le code
+        // verrouillé (403), même avec un champ en trop.
+        for (bad, status, error) in [
+            ("", 400, "bad_request"),
+            ("not json", 400, "bad_request"),
+            ("{}", 400, "bad_request"),
+            (r#"{"code":5}"#, 400, "bad_request"),
+            (r#"{"code":"1","x":1}"#, 403, "locked"),
         ] {
             let reply = service.request("POST", "/idema-api/pair", &[JSON], Some(bad));
-            assert!(
-                reply.status == 400 || reply.status == 403,
-                "{bad}: {}",
-                reply.status
-            );
+            assert_eq!(reply.status, status, "{bad}");
+            assert_eq!(reply.json()["error"], error, "{bad}");
             assert!(reply.header("set-cookie").is_none(), "{bad}");
         }
     }
@@ -610,11 +661,20 @@ mod tests {
 
     #[test]
     fn test_routes_need_both_variables_and_a_local_request() {
-        // Sans l'autorisation (une des deux variables manque, décision de `test_routes_enabled`), la route n'existe pas.
+        // Sans l'autorisation (une des deux variables manque, décision de `test_routes_enabled`), la route n'existe pas :
+        // un client sans cookie prend 401 de la garde (il ne saurait pas si elle existe), un appareil appairé 404.
         let closed = Harness::start(false);
+        let paired = closed.pair_with_events(IPHONE);
         for path in ["/idema-api/test/pairing-code", "/idema-api/test/forget"] {
-            let reply = closed.request("POST", path, &[JSON], Some("{}"));
-            assert_eq!(reply.status, 404, "{path}");
+            let anonymous = closed.request("POST", path, &[JSON], Some("{}"));
+            assert_eq!(anonymous.status, 401, "{path}");
+            let known = closed.request(
+                "POST",
+                path,
+                &[JSON, ("Cookie", paired.as_str())],
+                Some("{}"),
+            );
+            assert_eq!(known.status, 404, "{path}");
         }
         assert!(closed.status.borrow().pairing.is_none());
 
@@ -636,6 +696,197 @@ mod tests {
         let served = open.request("POST", "/idema-api/test/pairing-code", &[JSON], Some("{}"));
         assert_eq!(served.status, 200);
         assert!(open.status.borrow().pairing.is_some());
+    }
+
+    #[test]
+    fn only_the_two_test_routes_skip_the_cookie() {
+        let service = Harness::start(true);
+        let cookie = service.pair(IPHONE);
+        for path in [
+            "/idema-api/test/other",
+            "/idema-api/test/pairing-code/",
+            "/idema-api/test/",
+            "/idema-api/test/forget/x",
+        ] {
+            let anonymous = service.request("POST", path, &[JSON], Some("{}"));
+            assert_eq!(anonymous.status, 401, "{path} without a cookie");
+            let known = service.request(
+                "POST",
+                path,
+                &[JSON, ("Cookie", cookie.as_str())],
+                Some("{}"),
+            );
+            assert_eq!(known.status, 404, "{path} with a cookie");
+        }
+    }
+
+    fn numbered_fleet(badge: usize) -> Arc<Fleet> {
+        Arc::new(Fleet {
+            mac: "Test Mac".into(),
+            badge,
+            ..Fleet::default()
+        })
+    }
+
+    #[test]
+    fn the_fleet_route_serves_the_last_snapshot_to_a_paired_device() {
+        let service = Harness::start(true);
+        let anonymous = service.request("GET", "/idema-api/fleet", &[], None);
+        assert_eq!(anonymous.status, 401);
+        let cookie = service.pair(IPHONE);
+        let get = || {
+            service.request(
+                "GET",
+                "/idema-api/fleet",
+                &[("Cookie", cookie.as_str())],
+                None,
+            )
+        };
+
+        service.fleet.send(numbered_fleet(2)).unwrap();
+        let reply = get();
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.header("content-type"), Some("application/json"));
+        assert_eq!(reply.json()["badge"], 2);
+        assert_eq!(reply.json()["mac"], "Test Mac");
+
+        service.fleet.send(numbered_fleet(5)).unwrap();
+        assert_eq!(
+            get().json()["badge"],
+            5,
+            "the latest snapshot, not the first"
+        );
+    }
+
+    #[test]
+    fn the_events_stream_pushes_one_fleet_event_per_burst() {
+        let service = Harness::start(true);
+        let cookie = service.pair(IPHONE);
+        service.fleet.send(numbered_fleet(1)).unwrap();
+        let mut stream = open_stream(
+            service.port,
+            "/idema-api/events",
+            &[("Cookie", cookie.as_str())],
+        );
+        assert!(stream.head.starts_with("HTTP/1.1 200"), "{}", stream.head);
+        assert!(
+            stream
+                .head
+                .to_lowercase()
+                .contains("content-type: text/event-stream"),
+            "{}",
+            stream.head
+        );
+
+        // Le premier événement est l'instantané de la connexion.
+        let first = stream
+            .next_frame(Duration::from_secs(2))
+            .expect("a first event");
+        let data = first
+            .strip_prefix("event: fleet\ndata: ")
+            .unwrap_or_else(|| panic!("{first}"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(data).unwrap()["badge"],
+            1
+        );
+
+        // Dix publications en 50 ms : un événement, le dernier.
+        for badge in 2..=11 {
+            service.fleet.send(numbered_fleet(badge)).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let burst = stream
+            .next_frame(Duration::from_secs(2))
+            .expect("the burst event");
+        let data = burst
+            .strip_prefix("event: fleet\ndata: ")
+            .unwrap_or_else(|| panic!("{burst}"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(data).unwrap()["badge"],
+            11
+        );
+        assert_eq!(
+            stream.next_frame(Duration::from_millis(600)),
+            None,
+            "nothing else after the burst"
+        );
+    }
+
+    #[test]
+    fn the_timeline_route_lists_the_transitions_that_count() {
+        use idema_term::activity::ActivityState::{Idle, Running, Waiting};
+        use std::time::SystemTime;
+
+        let before = unix_millis(SystemTime::now());
+        let service = Harness::start(true);
+        let cookie = service.pair(IPHONE);
+        let get = |query: &str| {
+            service.request(
+                "GET",
+                &format!("/idema-api/timeline{query}"),
+                &[("Cookie", cookie.as_str())],
+                None,
+            )
+        };
+        assert_eq!(
+            service
+                .request("GET", "/idema-api/timeline", &[], None)
+                .status,
+            401
+        );
+
+        let empty = get("");
+        assert_eq!(empty.status, 200);
+        let started = empty.json()["started_at"].as_u64().unwrap();
+        assert!(
+            (before..=unix_millis(SystemTime::now())).contains(&started),
+            "{started}"
+        );
+        assert_eq!(empty.json()["events"], serde_json::json!([]));
+
+        let at = SystemTime::now();
+        for (from, to) in [(Idle, Running), (Running, Waiting)] {
+            service
+                .events
+                .send(ServiceEvent::Transition {
+                    session: "idema-aaaaaaaa".into(),
+                    from,
+                    to,
+                    at,
+                })
+                .unwrap();
+        }
+        // Le service range les transitions de façon asynchrone : on attend qu'elles se voient.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let events = loop {
+            let events = get("").json()["events"].clone();
+            if events.as_array().is_some_and(|list| !list.is_empty()) {
+                break events;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no transition recorded"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let shown = unix_millis(at);
+        assert_eq!(
+            events,
+            serde_json::json!([{
+                "at": shown, "session": "idema-aaaaaaaa", "from": "running", "to": "waiting", "finished": false
+            }]),
+            "the idle to running step does not count"
+        );
+        assert_eq!(get(&format!("?since={shown}")).json()["events"], events);
+        assert_eq!(
+            get(&format!("?since={}", shown + 1)).json()["events"],
+            serde_json::json!([])
+        );
+        for bad in ["?since=abc", "?since=-1", "?since=1.5", "?since="] {
+            let reply = get(bad);
+            assert_eq!(reply.status, 400, "{bad}");
+            assert_eq!(reply.json()["error"], "bad_request", "{bad}");
+        }
     }
 
     #[test]
@@ -676,18 +927,15 @@ mod tests {
         assert_eq!(logo.status, 200);
         assert!(logo.body.starts_with(b"\x89PNG"));
 
-        for missing in [
-            "/logos/nothing.png",
-            "/logos/../index.html",
-            "/nothing",
-            "/idema-api/",
+        // Les fichiers de la page inconnus rendent 404 ; sous `/idema-api/` la garde répond avant : 401 sans cookie.
+        for (missing, status) in [
+            ("/logos/nothing.png", 404),
+            ("/logos/../index.html", 404),
+            ("/nothing", 404),
+            ("/idema-api/", 401),
         ] {
             let reply = service.request("GET", missing, &[], None);
-            assert!(
-                reply.status == 404 || reply.status == 401,
-                "{missing}: {}",
-                reply.status
-            );
+            assert_eq!(reply.status, status, "{missing}");
             assert_hardened(&reply, missing);
         }
         assert_eq!(

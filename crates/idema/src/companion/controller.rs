@@ -10,6 +10,7 @@ use idema_tmux::server::TmuxServer;
 use tokio::sync::watch;
 
 use super::auth::test_routes_enabled;
+use super::fleet::Fleet;
 use super::service::{self, ServiceDeps, ServiceHandle};
 use super::{PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
@@ -20,6 +21,8 @@ struct Running {
     config: CompanionConfig,
     events: tokio::sync::mpsc::UnboundedSender<ServiceEvent>,
     status: watch::Receiver<ServiceStatus>,
+    /// Le dernier instantané de la flotte : la route `fleet` le lit, chaque flux `events` s'y abonne.
+    fleet: watch::Sender<Arc<Fleet>>,
 }
 
 #[derive(Default)]
@@ -62,6 +65,7 @@ impl CompanionController {
         let (events, events_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (commands, commands_receiver) = mpsc::unbounded();
         let (status, status_receiver) = watch::channel(ServiceStatus::default());
+        let (fleet, fleet_receiver) = watch::channel(Arc::new(Fleet::default()));
         let handle = service::start(ServiceDeps {
             dir: dir.to_path_buf(),
             version: env!("CARGO_PKG_VERSION"),
@@ -71,6 +75,7 @@ impl CompanionController {
             events: events_receiver,
             commands,
             status,
+            fleet: fleet_receiver,
             previous,
             test_routes: test_routes_enabled(
                 std::env::var_os("IDEMA_HOME").as_deref(),
@@ -82,6 +87,7 @@ impl CompanionController {
             config: config.clone(),
             events,
             status: status_receiver,
+            fleet,
         });
         Some(commands_receiver)
     }
@@ -95,11 +101,22 @@ impl CompanionController {
         self.running.is_some()
     }
 
+    /// Publie l'instantané de la flotte ; sans effet éteint, et sans effet quand il ne dit rien de plus que le
+    /// précédent (l'heure de construction ne compte pas) : aucun flux n'est réveillé pour rien.
+    pub fn publish(&self, fleet: Fleet) {
+        let Some(running) = &self.running else {
+            return;
+        };
+        running.fleet.send_if_modified(|current| {
+            if !current.differs_from(&fleet) {
+                return false;
+            }
+            *current = Arc::new(fleet);
+            true
+        });
+    }
+
     /// Envoie un événement au service ; sans effet éteint.
-    #[allow(
-        dead_code,
-        reason = "premier émetteur à la tâche 3 (transitions de la flotte)"
-    )]
     pub fn send(&self, event: ServiceEvent) {
         if let Some(running) = &self.running {
             let _ = running.events.send(event);
@@ -128,6 +145,41 @@ mod tests {
             "/nonexistent/tmux.conf".into(),
             Vec::new(),
         ))
+    }
+
+    /// Éteint, publier ne fait rien ; allumé, seul un instantané qui change quelque chose réveille les abonnés.
+    #[test]
+    fn publishing_wakes_subscribers_only_for_a_real_change() {
+        let port = super::super::test_support::free_port();
+        let home = super::super::test_support::TempDir::new("controller-publish");
+        let scratchpad = home.0.join("scratchpad.md");
+        let mut controller = CompanionController::new();
+        let fleet = |generated_at, badge| Fleet {
+            mac: "Mac".into(),
+            generated_at,
+            badge,
+            ..Fleet::default()
+        };
+        controller.publish(fleet(1, 0));
+        assert!(!controller.is_on(), "off: nothing to publish to");
+
+        controller.sync(Some(&config(port)), Some(tmux()), &home.0, &scratchpad);
+        let mut subscriber = controller.running.as_ref().unwrap().fleet.subscribe();
+        controller.publish(fleet(1, 0));
+        assert!(subscriber.has_changed().unwrap(), "the first snapshot");
+        assert_eq!(subscriber.borrow_and_update().badge, 0);
+
+        controller.publish(fleet(2, 0));
+        assert!(
+            !subscriber.has_changed().unwrap(),
+            "only the build time moved"
+        );
+        controller.publish(fleet(3, 4));
+        assert!(subscriber.has_changed().unwrap());
+        assert_eq!(subscriber.borrow_and_update().badge, 4);
+
+        controller.sync(None, Some(tmux()), &home.0, &scratchpad);
+        controller.stopping.take().unwrap().join().unwrap();
     }
 
     /// Retirer la section garde le fil de l'ancien service ; la réactiver le lui fait joindre avant de lier le port.
