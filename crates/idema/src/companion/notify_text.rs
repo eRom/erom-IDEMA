@@ -110,19 +110,101 @@ fn cut(text: &str, max: usize) -> String {
     }
 }
 
+/// Un trait horizontal de cadre : rien que des caractères de dessin de boîte (et des blancs), dont au moins un trait
+/// horizontal. `────────`, `╭──────╮`, `╰──────╯`, `└──┴──┘`, mais ni `│  │` ni `-----`.
+fn is_frame_line(line: &str) -> bool {
+    const HORIZONTALS: [char; 9] = ['─', '━', '═', '┄', '┅', '┈', '┉', '╌', '╍'];
+    let line = line.trim();
+    !line.is_empty()
+        && line
+            .chars()
+            .all(|c| c.is_whitespace() || ('\u{2500}'..='\u{257f}').contains(&c))
+        && line.chars().any(|c| HORIZONTALS.contains(&c))
+}
+
+/// Le haut d'une boîte (`╭──╮`) : ce qui est en dessous en fait partie, ce n'est pas un pied de page.
+fn is_box_top(line: &str) -> bool {
+    line.contains(['╭', '┌', '╔', '┏'])
+}
+
+/// Le bas d'une boîte (`╰──╯`).
+fn is_box_bottom(line: &str) -> bool {
+    line.contains(['╯', '┘', '╝', '┛'])
+}
+
+/// Une invite vide : `>`, `❯` ou `›` sans rien après (le trait vertical d'un cadre mis à part).
+fn is_bare_prompt(line: &str) -> bool {
+    let line = line.trim_matches(|c: char| c.is_whitespace() || FRAME_VERTICALS.contains(&c));
+    matches!(line, ">" | "❯" | "›")
+}
+
+/// Le bloc entre deux traits est-il la boîte de saisie de l'agent : au moins une invite vide, rien d'autre que du blanc ?
+fn is_input_box(block: &[&str]) -> bool {
+    block.iter().any(|line| is_bare_prompt(line))
+        && block
+            .iter()
+            .all(|line| is_bare_prompt(line) || clean_line(line).is_none())
+}
+
+/// Combien de lignes de texte au plus peuvent se trouver entre le bas d'une boîte et la boîte de saisie (« Esc to
+/// cancel ») sans que ce soit autre chose qu'un rappel de touches.
+const HINT_LINES_MAX: usize = 2;
+
+/// Où finit le corps de l'écran (les lignes au-dessus ne sont pas du pied de page). Tout ce qui est sous le dernier trait
+/// horizontal est le pied de page de l'agent (statut, quotas, mode), tant qu'il reste du texte au-dessus ; la boîte de
+/// saisie vide qui le précède (trait, invite vide, trait) l'est aussi, et, dans ce cas, le rappel de touches d'au plus
+/// deux lignes sous le bas de la boîte qui la précède (le menu). Sans trait, ou sans texte au-dessus, tout l'écran compte.
+fn body_end(lines: &[&str]) -> usize {
+    let has_text = |range: &[&str]| range.iter().any(|line| clean_line(line).is_some());
+    let len = lines.len();
+    let Some(frame) = lines.iter().rposition(|line| is_frame_line(line)) else {
+        return len;
+    };
+    if is_box_top(lines[frame]) || !has_text(&lines[..frame]) {
+        return len;
+    }
+    let mut end = frame;
+    let input_box = lines[..frame]
+        .iter()
+        .rposition(|line| is_frame_line(line))
+        .filter(|&top| is_input_box(&lines[top + 1..frame]) && has_text(&lines[..top]));
+    if let Some(top) = input_box {
+        end = top;
+        if let Some(bottom) = lines[..end].iter().rposition(|line| is_frame_line(line))
+            && is_box_bottom(lines[bottom])
+            && lines[bottom + 1..end]
+                .iter()
+                .filter(|line| clean_line(line).is_some())
+                .count()
+                <= HINT_LINES_MAX
+            && has_text(&lines[..bottom])
+        {
+            end = bottom;
+        }
+    }
+    end
+}
+
 /// Les `count` dernières lignes utiles de l'écran, dans leur ordre : séquences ANSI retirées, blancs retirés aux deux
 /// bouts (et le trait vertical d'un cadre de TUI avec eux), lignes vides et lignes sans lettre ni chiffre (cadres, traits,
-/// invites seules) écartées, chacune coupée à 110 caractères suivis de « … ».
+/// invites seules) écartées, chacune coupée à 110 caractères suivis de « … ». Le pied de page de l'agent (sous le dernier
+/// trait horizontal de l'écran, avec sa boîte de saisie vide) n'est pas lu tant que l'écran a du texte au-dessus : c'est
+/// la question de l'agent qu'on veut, pas sa ligne de statut. Sans texte au-dessus, la règle s'applique à tout l'écran.
 pub fn useful_lines(screen: &str, count: usize) -> Vec<String> {
     let clean = strip_ansi(screen);
-    let mut lines: Vec<String> = clean
-        .lines()
-        .rev()
-        .filter_map(clean_line)
-        .take(count)
-        .collect();
-    lines.reverse();
-    lines
+    let lines: Vec<&str> = clean.lines().collect();
+    let last = |range: &[&str]| -> Vec<String> {
+        let mut found: Vec<String> = range
+            .iter()
+            .rev()
+            .filter_map(|line| clean_line(line))
+            .take(count)
+            .collect();
+        found.reverse();
+        found
+    };
+    let body = last(&lines[..body_end(&lines)]);
+    if body.is_empty() { last(&lines) } else { body }
 }
 
 /// « {agent} attend · {projet} » ou « {agent} en erreur · {projet} ». L'agent est le premier de la session ; à défaut, le
@@ -328,29 +410,27 @@ mod tests {
 
     #[test]
     fn useful_lines_skip_frames_and_colors() {
-        // Menu à la forme de Claude Code : le cadre bas et les lignes vides finales sont écartés, et le trait vertical du
-        // cadre ne reste pas collé aux lignes.
+        // Menu à la forme de Claude Code, sans pied de page : le trait du bas du cadre ferme le corps, le rappel de touches
+        // dessous n'est pas lu, le trait vertical du cadre ne reste pas collé aux lignes.
         assert_eq!(
-            useful_lines(CLAUDE_MENU, 3),
+            useful_lines(CLAUDE_MENU, 4),
             [
-                "2. Yes, and don't ask again for cargo test",
-                "3. No, and tell Claude what to do differently",
-                "Esc to cancel",
-            ]
-        );
-        // Plus de lignes : le choix courant garde son `❯`, la ligne de cadre du haut n'y est jamais.
-        assert_eq!(
-            useful_lines(CLAUDE_MENU, 6),
-            [
-                "Run the workspace tests",
                 "Do you want to proceed?",
                 "❯ 1. Yes",
                 "2. Yes, and don't ask again for cargo test",
                 "3. No, and tell Claude what to do differently",
-                "Esc to cancel",
             ]
         );
-        // Menu à la forme de Codex : couleurs 24 bits, aide grisée, `›` du choix courant.
+        assert_eq!(
+            useful_lines(CLAUDE_MENU, 3),
+            [
+                "❯ 1. Yes",
+                "2. Yes, and don't ask again for cargo test",
+                "3. No, and tell Claude what to do differently",
+            ]
+        );
+        // Menu à la forme de Codex (couleurs 24 bits, aide grisée, `›` du choix courant, aucun cadre) : sa question et
+        // ses choix, jusqu'à la ligne d'aide.
         assert_eq!(
             useful_lines(CODEX_MENU, 3),
             [
@@ -359,10 +439,17 @@ mod tests {
                 "Press enter to confirm or esc to cancel",
             ]
         );
-        assert_eq!(useful_lines(CODEX_MENU, 5)[0], "$ cargo test --workspace");
         assert_eq!(
-            useful_lines(CODEX_MENU, 4)[1],
-            "2. Yes, and don't ask again for this command (p)"
+            useful_lines(CODEX_MENU, 7),
+            [
+                ">_ Codex (v9.9.9)",
+                "Would you like to run the following command?",
+                "$ cargo test --workspace",
+                "› 1. Yes, proceed (y)",
+                "2. Yes, and don't ask again for this command (p)",
+                "3. No, and tell Codex what to do differently (esc)",
+                "Press enter to confirm or esc to cancel",
+            ]
         );
         // Aucune séquence d'échappement ni caractère de contrôle ne survit dans ce qui est rendu.
         for line in useful_lines(CLAUDE_MENU, 20)
@@ -373,24 +460,78 @@ mod tests {
         }
     }
 
-    /// Sur un écran entier de Claude Code, le menu est suivi du pied de page de l'agent : la règle (les trois dernières
-    /// lignes qui ont une lettre ou un chiffre) rend alors les trois lignes de ce pied de page, pas celles du menu.
+    /// Un écran entier de Claude Code : le menu, son rappel de touches, la boîte de saisie vide, puis le pied de page
+    /// (statut, quotas, mode). On lit la question et les choix, pas le pied de page.
     #[test]
-    fn a_claude_footer_is_what_the_rule_really_keeps() {
+    fn the_agent_footer_is_not_read_when_there_is_a_question_above() {
         let screen = format!("{CLAUDE_MENU}{CLAUDE_FOOTER}");
+        assert_eq!(
+            useful_lines(&screen, 4),
+            [
+                "Do you want to proceed?",
+                "❯ 1. Yes",
+                "2. Yes, and don't ask again for cargo test",
+                "3. No, and tell Claude what to do differently",
+            ]
+        );
         assert_eq!(
             useful_lines(&screen, 3),
             [
-                "Opus 4 ▏ ctx 12% ▏ main  14:02",
-                "weekly 41% - reset 14:00 | daily",
-                "⏵⏵ accept edits on (shift+tab to cycle)",
+                "❯ 1. Yes",
+                "2. Yes, and don't ask again for cargo test",
+                "3. No, and tell Claude what to do differently",
             ]
         );
-        // Les traits horizontaux et l'invite vide du pied de page n'y comptent pas ; le menu est juste au-dessus.
-        assert_eq!(useful_lines(&screen, 4)[0], "Esc to cancel");
         assert_eq!(
-            useful_lines(&screen, 5)[0],
-            "3. No, and tell Claude what to do differently"
+            useful_lines(&screen, 20),
+            [
+                "Bash command",
+                "cargo test --workspace",
+                "Run the workspace tests",
+                "Do you want to proceed?",
+                "❯ 1. Yes",
+                "2. Yes, and don't ask again for cargo test",
+                "3. No, and tell Claude what to do differently",
+            ]
+        );
+    }
+
+    /// Un pane de Claude Code au repos, sans menu : la fin du message de l'agent, au-dessus de la boîte de saisie vide.
+    #[test]
+    fn an_idle_claude_pane_shows_the_end_of_the_message() {
+        let screen = format!(
+            "\u{1b}[1mLes tests passent.\u{1b}[0m\n\nVeux-tu que je committe ?\n\n{CLAUDE_FOOTER}"
+        );
+        assert_eq!(
+            useful_lines(&screen, 3),
+            ["Les tests passent.", "Veux-tu que je committe ?"]
+        );
+    }
+
+    #[test]
+    fn a_screen_without_frames_keeps_its_last_three_lines() {
+        let shell = "$ ls\nfile_a\nfile_b\nfile_c\n$ \n";
+        assert_eq!(useful_lines(shell, 3), ["file_a", "file_b", "file_c"]);
+        // Un trait `-----` en ASCII n'est pas un cadre : il n'a ni lettre ni chiffre, il est écarté comme le reste.
+        assert_eq!(useful_lines("avant\n-----\napres\n", 3), ["avant", "apres"]);
+    }
+
+    #[test]
+    fn a_screen_whose_only_text_is_below_the_frame_falls_back_to_the_current_rule() {
+        // Rien au-dessus du trait : la règle s'applique à l'écran entier.
+        assert_eq!(
+            useful_lines("────────\nstatut un\nstatut deux\n", 3),
+            ["statut un", "statut deux"]
+        );
+        // Une boîte de saisie vide sans rien de lisible au-dessus : repli sur l'écran entier.
+        assert_eq!(
+            useful_lines("────────\n❯\n────────\nstatut un\nstatut deux\n", 3),
+            ["statut un", "statut deux"]
+        );
+        // Le haut d'une boîte n'est pas un pied de page : ce qui est dessous en fait partie.
+        assert_eq!(
+            useful_lines("avant\n╭──────╮\n│ Question ? │\n│ ❯ 1. Oui │\n", 3),
+            ["avant", "Question ?", "❯ 1. Oui"]
         );
     }
 
