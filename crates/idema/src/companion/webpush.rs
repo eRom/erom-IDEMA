@@ -27,6 +27,8 @@ pub const VAPID_SUB: &str = "https://github.com/eRom/erom-IDEMA";
 
 /// Taille d'enregistrement annoncée dans l'en-tête (RFC 8291 §4) : un message tient dans un seul enregistrement.
 const RECORD_SIZE: u32 = 4096;
+/// Le plus long texte qu'un service push doit accepter (RFC 8291 §4) : 4096 - 86 - 1 - 16.
+const MAX_PLAINTEXT: usize = 3993;
 /// Plus petit enregistrement qui garde de la place pour la balise GCM (16) et le délimiteur (1) : RFC 8188 §2.
 const MIN_RECORD_SIZE: u32 = 18;
 /// Longueur de l'en-tête : sel (16) + taille d'enregistrement (4) + longueur de l'identifiant (1) + clé publique (65).
@@ -146,6 +148,11 @@ pub fn encrypt_with(
 
 /// Chiffre pour un appareil avec un sel et une clé éphémère neufs ; chaque message a les siens.
 pub fn encrypt(plaintext: &[u8], ua: &UaKeys) -> Result<Vec<u8>, PushError> {
+    // RFC 8291 §4 : un service push n'a pas à accepter plus de 4096 octets de corps, soit 3993 octets de texte une fois
+    // retirés l'en-tête (86), le délimiteur (1) et la balise GCM (16).
+    if plaintext.len() > MAX_PLAINTEXT {
+        return Err(PushError::PayloadTooLarge);
+    }
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
     let sender = p256::SecretKey::random(&mut OsRng);
@@ -178,25 +185,17 @@ impl Vapid {
         fs::set_permissions(&folder, fs::Permissions::from_mode(0o700))?;
         let path = folder.join("vapid.key");
         let bytes = match fs::read(&path) {
-            Ok(bytes) => {
-                // Un fichier laissé avec des droits plus larges (restauré, copié) est resserré avant tout usage.
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-                bytes
-            }
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let key = p256::SecretKey::random(&mut OsRng);
-                let bytes = key.to_bytes().to_vec();
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&path)?;
-                file.write_all(&bytes)?;
-                file.sync_all()?;
-                bytes
+                publish_new_key(&folder, &path)?;
+                // Relue du fichier, jamais gardée en mémoire : si un autre appel a publié la sienne en premier, les
+                // deux lisent la même.
+                fs::read(&path)?
             }
             Err(error) => return Err(error),
         };
+        // Un fichier laissé avec des droits plus larges (restauré, copié) est resserré avant tout usage.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         let secret = p256::SecretKey::from_slice(&bytes).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "vapid.key is not a P-256 key")
         })?;
@@ -250,6 +249,37 @@ impl Vapid {
         self.cache.insert(audience, (now, value.clone()));
         value
     }
+}
+
+/// Crée `vapid.key` d'un coup : la clé est écrite et synchronisée dans un fichier voisin 0600 au nom unique (un reste
+/// d'un process mort ne gêne jamais), puis liée sous son nom définitif. Le lien échoue si la cible existe : le premier
+/// arrivé gagne et l'appel suivant lit sa clé. Jamais de `vapid.key` vide ou à demi écrit, même si le process meurt
+/// ou si le disque se remplit en route.
+fn publish_new_key(folder: &Path, path: &Path) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let temporary = folder.join(format!(
+        "vapid.key.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let linked = (|| {
+        let bytes = p256::SecretKey::random(&mut OsRng).to_bytes();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        match fs::hard_link(&temporary, path) {
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
+            _ => Ok(()),
+        }
+    })();
+    // Le fichier voisin ne doit pas rester : l'échec d'origine, s'il y en a un, est celui qu'on rend.
+    let _ = fs::remove_file(&temporary);
+    linked
 }
 
 /// L'origine (`https://hôte[:port]`) d'un point d'accès push, ou `None` si ce n'est pas une URL HTTP(S).
@@ -576,6 +606,58 @@ mod tests {
         std::fs::write(&file, b"short").unwrap();
         let error = Vapid::load_or_create(&home.0).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Un reste de création interrompue ne bloque rien, et deux appels simultanés finissent avec la même clé, sans
+    /// jamais laisser de fichier voisin.
+    #[test]
+    fn vapid_creation_survives_a_stale_temporary_and_concurrent_calls() {
+        let home = TempDir::new("vapid-atomic");
+        let folder = home.0.join("companion");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("vapid.key.tmp"), b"").unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = home.0.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Vapid::load_or_create(&dir).unwrap().public_key_b64url()
+                })
+            })
+            .collect();
+        let keys: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert!(keys.windows(2).all(|pair| pair[0] == pair[1]), "{keys:?}");
+        assert_eq!(
+            std::fs::metadata(folder.join("vapid.key")).unwrap().len(),
+            32
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "vapid.key" && name != "vapid.key.tmp")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn production_encryption_caps_the_plaintext_at_the_rfc_limit() {
+        let ua_private = p256::SecretKey::random(&mut OsRng);
+        let public = {
+            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            ua_private.public_key().to_encoded_point(false)
+        };
+        let ua = UaKeys::from_subscription(&subscription(public.as_bytes(), &[3u8; 16])).unwrap();
+
+        let accepted = encrypt(&vec![b'a'; 3993], &ua).unwrap();
+        assert_eq!(accepted.len(), 4096, "a full payload is exactly 4096 bytes");
+        assert_eq!(
+            encrypt(&vec![b'a'; 3994], &ua),
+            Err(PushError::PayloadTooLarge)
+        );
     }
 
     #[test]
