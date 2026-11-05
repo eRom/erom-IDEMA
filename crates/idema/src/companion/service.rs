@@ -21,7 +21,7 @@ use super::fleet::Fleet;
 use super::notify::{self, Message, Notifier};
 use super::push_send::{PushSender, override_host};
 use super::server::{AppState, router, stopped};
-use super::tailscale::{Detector, TailnetState};
+use super::tailscale::{Detector, TailnetState, with_public_url};
 use super::timeline::Timeline;
 use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
@@ -291,10 +291,10 @@ async fn serve(
     });
     tokio::spawn(notify::run(notifier, notifications, policy));
     // Les gestes de Personnaliser (code, oubli) et l'échéance du code : une tâche du runtime, qui s'arrête avec lui.
-    let known_origin = Arc::new(Mutex::new(None));
+    let known_origins = Arc::new(Mutex::new(Vec::new()));
     let origins = Arc::new(Mutex::new(KnownOrigins::new(
         public_url,
-        Arc::clone(&known_origin),
+        Arc::clone(&known_origins),
     )));
     // L'adresse tailnet : une première détection au démarrage, une de plus à chaque demande.
     let recheck = Arc::new(Notify::new());
@@ -317,7 +317,7 @@ async fn serve(
         version,
         stop: stop.clone(),
         access,
-        known_origin,
+        known_origins,
         port,
         test_routes,
         fleet,
@@ -419,22 +419,26 @@ async fn control_loop(
     }
 }
 
-/// D'où vient l'origine admise en écriture (`auth::origin_allowed`) : le `public_url` de la config, sinon l'adresse
-/// que la détection a trouvée ; ni l'un ni l'autre, et la garde admet toute origine `*.ts.net`. Le résultat est ce que
-/// lit la garde (`AppState::known_origin`).
+/// D'où viennent les origines admises en écriture (`auth::origin_allowed`) : l'union du `public_url` de la config et de
+/// l'adresse que la détection a trouvée ; ni l'un ni l'autre, et la garde admet toute origine `*.ts.net`. Le résultat
+/// est ce que lit la garde (`AppState::known_origins`).
 struct KnownOrigins {
     public_url: Option<String>,
     detected: Option<String>,
-    admitted: Arc<Mutex<Option<String>>>,
+    admitted: Arc<Mutex<Vec<String>>>,
 }
 
-/// L'origine connue : l'adresse choisie par Romain prime sur celle que la détection a vue.
-fn admitted_origin(public_url: Option<&str>, detected: Option<&str>) -> Option<String> {
-    public_url.or(detected).map(str::to_owned)
+/// Les adresses connues, réunies : celle de Romain (`public_url`) et celle que le CLI a vue.
+fn known_origins(public_url: Option<&str>, detected: Option<&str>) -> Vec<String> {
+    public_url
+        .into_iter()
+        .chain(detected)
+        .map(str::to_owned)
+        .collect()
 }
 
 impl KnownOrigins {
-    fn new(public_url: Option<String>, admitted: Arc<Mutex<Option<String>>>) -> Self {
+    fn new(public_url: Option<String>, admitted: Arc<Mutex<Vec<String>>>) -> Self {
         let origins = Self {
             public_url,
             detected: None,
@@ -452,14 +456,20 @@ impl KnownOrigins {
         changed
     }
 
-    fn set_detected(&mut self, detected: Option<String>) {
-        self.detected = detected;
+    /// Ce que le CLI vient de dire. Une adresse trouvée remplace la précédente, « pas exposé » l'efface ; une
+    /// détection qui échoue (délai dépassé, démon coupé un instant) ne dit rien de l'adresse : la dernière bonne reste.
+    fn observe(&mut self, reading: &TailnetState) {
+        match reading {
+            TailnetState::Exposed(endpoint) => self.detected = Some(endpoint.url.clone()),
+            TailnetState::NotExposed { .. } => self.detected = None,
+            TailnetState::Unknown(_) => {}
+        }
         self.publish();
     }
 
     fn publish(&self) {
         *self.admitted.lock().unwrap_or_else(PoisonError::into_inner) =
-            admitted_origin(self.public_url.as_deref(), self.detected.as_deref());
+            known_origins(self.public_url.as_deref(), self.detected.as_deref());
     }
 }
 
@@ -475,30 +485,22 @@ async fn tailnet_loop(
 ) {
     loop {
         recheck.notified().await;
-        let public_url = origins
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .public_url
-            .clone();
         let detector = Arc::clone(&detector);
-        let state = match tokio::task::spawn_blocking(move || detector(port, public_url.as_deref()))
-            .await
-        {
-            Ok(state) => state,
+        let reading = match tokio::task::spawn_blocking(move || detector(port)).await {
+            Ok(reading) => reading,
             Err(_) => TailnetState::Unknown("detection_failed".into()),
         };
-        let detected = match &state {
-            TailnetState::Exposed(endpoint) => Some(endpoint.url.clone()),
-            _ => None,
+        // Les origines admises suivent ce que le CLI a vu ; l'état affiché y ajoute le repli `public_url`, l'adresse
+        // détectée d'abord (§3.2).
+        let displayed = {
+            let mut origins = origins.lock().unwrap_or_else(PoisonError::into_inner);
+            origins.observe(&reading);
+            with_public_url(reading, origins.public_url.as_deref())
         };
-        origins
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .set_detected(detected);
         status.send_if_modified(|status| {
-            let changed = status.tailnet.as_ref() != Some(&state);
+            let changed = status.tailnet.as_ref() != Some(&displayed);
             if changed {
-                status.tailnet = Some(state);
+                status.tailnet = Some(displayed);
             }
             changed
         });
@@ -813,19 +815,39 @@ mod tests {
         }
     }
 
+    /// Ce que le CLI « voit » : un test le change, puis demande une nouvelle détection.
+    type Reading = Arc<Mutex<TailnetState>>;
+
+    fn reading(state: TailnetState) -> Reading {
+        Arc::new(Mutex::new(state))
+    }
+
+    fn set_reading(reading: &Reading, state: TailnetState) {
+        *reading.lock().unwrap() = state;
+    }
+
+    fn reading_detector(reading: &Reading) -> Detector {
+        let reading = Arc::clone(reading);
+        Arc::new(move |_| reading.lock().unwrap().clone())
+    }
+
+    fn config_with(port: u16, public_url: Option<&str>) -> ServiceEvent {
+        let extra = public_url
+            .map(|url| format!("\npublic_url = \"{url}\""))
+            .unwrap_or_default();
+        ServiceEvent::ConfigChanged(toml::from_str(&format!("port = {port}{extra}")).unwrap())
+    }
+
     #[test]
     fn the_start_detection_publishes_the_tailnet_state() {
         let port = free_port();
         let home = TempDir::new("tailnet-start");
         let (mut service_deps, _events, status, _fleet) =
             deps_in(port, home.0.clone(), None, false);
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Arc::clone(&seen);
-        service_deps.detector = Arc::new(move |asked_port, configured| {
-            recorder
-                .lock()
-                .unwrap()
-                .push((asked_port, configured.map(str::to_owned)));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&asked);
+        service_deps.detector = Arc::new(move |asked_port| {
+            recorder.lock().unwrap().push(asked_port);
             exposed(DETECTED)
         });
         assert_eq!(status.borrow().tailnet, None, "nothing before the start");
@@ -833,22 +855,18 @@ mod tests {
         wait_tailnet(&status, "the first detection", |tailnet| {
             *tailnet == Some(exposed(DETECTED))
         });
-        // Le port demandé est celui du service, et la config n'avait pas de `public_url`.
-        assert_eq!(*seen.lock().unwrap(), vec![(port, None)]);
+        // Le port demandé est celui du service.
+        assert_eq!(*asked.lock().unwrap(), vec![port]);
         handle.stop().join().unwrap();
     }
 
     #[test]
-    fn a_detected_address_narrows_the_origin_and_a_public_url_wins() {
+    fn the_admitted_origins_are_the_union_of_the_public_url_and_the_detected_address() {
         let port = free_port();
         let home = TempDir::new("tailnet-origin");
         let (mut service_deps, events, status, _fleet) = deps_in(port, home.0.clone(), None, true);
-        let configured_seen = Arc::new(Mutex::new(None));
-        let recorder = Arc::clone(&configured_seen);
-        service_deps.detector = Arc::new(move |_, configured| {
-            *recorder.lock().unwrap() = configured.map(str::to_owned);
-            exposed(DETECTED)
-        });
+        let seen = reading(exposed(DETECTED));
+        service_deps.detector = reading_detector(&seen);
         let handle = start(service_deps).expect("the service thread spawns");
         wait_tailnet(&status, "the detection", |tailnet| tailnet.is_some());
         let cookie = pair_device(port, "iPhone");
@@ -857,18 +875,76 @@ mod tests {
         assert!(admits(port, &cookie, DETECTED));
         assert!(!admits(port, &cookie, OTHER));
 
-        // Le `public_url` de la config prime sur la détection, et relance celle-ci avec lui en repli.
-        let config: CompanionConfig =
-            toml::from_str(&format!("port = {port}\npublic_url = \"{CONFIGURED}\"")).unwrap();
-        events.send(ServiceEvent::ConfigChanged(config)).unwrap();
+        // Avec un `public_url`, les deux origines passent, pas une troisième ; l'état affiché garde l'adresse
+        // détectée en premier.
+        events.send(config_with(port, Some(CONFIGURED))).unwrap();
         wait_until("the configured origin", || {
             admits(port, &cookie, CONFIGURED)
         });
-        assert!(!admits(port, &cookie, DETECTED));
+        assert!(admits(port, &cookie, DETECTED));
         assert!(!admits(port, &cookie, OTHER));
-        wait_until("the detection to see the public_url", || {
-            configured_seen.lock().unwrap().as_deref() == Some(CONFIGURED)
+        assert_eq!(status.borrow().tailnet, Some(exposed(DETECTED)));
+
+        // Le `public_url` retiré, seule l'adresse détectée reste.
+        events.send(config_with(port, None)).unwrap();
+        wait_until("the configured origin to go", || {
+            !admits(port, &cookie, CONFIGURED)
         });
+        assert!(admits(port, &cookie, DETECTED));
+        handle.stop().join().unwrap();
+    }
+
+    #[test]
+    fn a_public_url_alone_replaces_the_wildcard_and_is_displayed_when_nothing_is_detected() {
+        let port = free_port();
+        let home = TempDir::new("tailnet-public-url");
+        let (mut service_deps, events, status, _fleet) = deps_in(port, home.0.clone(), None, true);
+        let seen = reading(not_exposed());
+        service_deps.detector = reading_detector(&seen);
+        let handle = start(service_deps).expect("the service thread spawns");
+        wait_tailnet(&status, "the detection", |tailnet| tailnet.is_some());
+        let cookie = pair_device(port, "iPhone");
+        assert!(admits(port, &cookie, OTHER), "the wildcard applies");
+
+        events.send(config_with(port, Some(CONFIGURED))).unwrap();
+        wait_until("the configured origin", || !admits(port, &cookie, OTHER));
+        assert!(admits(port, &cookie, CONFIGURED));
+        wait_tailnet(&status, "the stand-in address", |tailnet| {
+            *tailnet == Some(exposed(CONFIGURED))
+        });
+        handle.stop().join().unwrap();
+    }
+
+    #[test]
+    fn a_failed_detection_keeps_the_last_good_origin_and_not_exposed_clears_it() {
+        let port = free_port();
+        let home = TempDir::new("tailnet-keep");
+        let (mut service_deps, events, status, _fleet) = deps_in(port, home.0.clone(), None, true);
+        let seen = reading(exposed(DETECTED));
+        service_deps.detector = reading_detector(&seen);
+        let handle = start(service_deps).expect("the service thread spawns");
+        wait_tailnet(&status, "the detection", |tailnet| {
+            *tailnet == Some(exposed(DETECTED))
+        });
+        let cookie = pair_device(port, "iPhone");
+
+        // Un délai dépassé passager : l'état le dit, mais l'origine du téléphone reste admise, et le joker ne revient pas.
+        let timeout = TailnetState::Unknown("timeout".into());
+        set_reading(&seen, timeout.clone());
+        events.send(ServiceEvent::RecheckTailnet).unwrap();
+        wait_tailnet(&status, "the failed detection", |tailnet| {
+            *tailnet == Some(timeout.clone())
+        });
+        assert!(admits(port, &cookie, DETECTED));
+        assert!(!admits(port, &cookie, OTHER));
+
+        // Le CLI répond et ne voit plus l'adresse : l'origine s'efface, le joker revient.
+        set_reading(&seen, not_exposed());
+        events.send(ServiceEvent::RecheckTailnet).unwrap();
+        wait_tailnet(&status, "the not-exposed reading", |tailnet| {
+            *tailnet == Some(not_exposed())
+        });
+        assert!(admits(port, &cookie, OTHER));
         handle.stop().join().unwrap();
     }
 
@@ -877,16 +953,8 @@ mod tests {
         let port = free_port();
         let home = TempDir::new("tailnet-recheck");
         let (mut service_deps, events, status, _fleet) = deps_in(port, home.0.clone(), None, true);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&calls);
-        service_deps.detector = Arc::new(move |_, _| {
-            // La première détection ne trouve rien ; Romain lance ensuite `tailscale serve`, puis « Vérifier ».
-            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-                not_exposed()
-            } else {
-                exposed(DETECTED)
-            }
-        });
+        let seen = reading(not_exposed());
+        service_deps.detector = reading_detector(&seen);
         let handle = start(service_deps).expect("the service thread spawns");
         wait_tailnet(&status, "the first detection", |tailnet| {
             *tailnet == Some(not_exposed())
@@ -894,6 +962,8 @@ mod tests {
         let cookie = pair_device(port, "iPhone");
         assert!(admits(port, &cookie, OTHER), "the wildcard applies");
 
+        // Romain lance `tailscale serve`, puis « Vérifier ».
+        set_reading(&seen, exposed(DETECTED));
         events.send(ServiceEvent::RecheckTailnet).unwrap();
         wait_tailnet(&status, "the recheck", |tailnet| {
             *tailnet == Some(exposed(DETECTED))
@@ -914,7 +984,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let release = Arc::new(AtomicBool::new(false));
         let (counter, gate) = (Arc::clone(&calls), Arc::clone(&release));
-        service_deps.detector = Arc::new(move |_, _| {
+        service_deps.detector = Arc::new(move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             while !gate.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(5));
@@ -942,12 +1012,19 @@ mod tests {
     }
 
     #[test]
-    fn the_configured_address_beats_the_detected_one() {
+    fn known_origins_unite_both_addresses() {
         assert_eq!(
-            admitted_origin(Some(CONFIGURED), Some(DETECTED)),
-            Some(CONFIGURED.into())
+            known_origins(Some(CONFIGURED), Some(DETECTED)),
+            vec![CONFIGURED.to_string(), DETECTED.to_string()]
         );
-        assert_eq!(admitted_origin(None, Some(DETECTED)), Some(DETECTED.into()));
-        assert_eq!(admitted_origin(None, None), None);
+        assert_eq!(
+            known_origins(None, Some(DETECTED)),
+            vec![DETECTED.to_string()]
+        );
+        assert_eq!(
+            known_origins(Some(CONFIGURED), None),
+            vec![CONFIGURED.to_string()]
+        );
+        assert!(known_origins(None, None).is_empty());
     }
 }

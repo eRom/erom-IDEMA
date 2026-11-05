@@ -129,7 +129,7 @@ pub fn deps_in(
         test_routes,
         push_override: None,
         // Jamais le vrai `tailscale` : un test qui veut une adresse pose son propre détecteur.
-        detector: Arc::new(|_, _| TailnetState::Unknown("not_probed".into())),
+        detector: Arc::new(|_| TailnetState::Unknown("not_probed".into())),
     };
     (deps, events_sender, status_receiver, fleet_sender)
 }

@@ -3,8 +3,9 @@
 
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -37,7 +38,7 @@ pub struct TailnetEndpoint {
 /// Ce que la détection a trouvé.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TailnetState {
-    /// Le port est mandaté (ou, faute de mieux, `public_url` l'affirme).
+    /// Le port est mandaté (ou, faute de mieux, `public_url` l'affirme : `with_public_url`).
     Exposed(TailnetEndpoint),
     /// Tailscale répond, mais rien ne mandate le port : la commande exacte à lancer.
     NotExposed { command: String },
@@ -45,8 +46,8 @@ pub enum TailnetState {
     Unknown(String),
 }
 
-/// La détection, telle que le service l'appelle : remplaçable par un test.
-pub type Detector = Arc<dyn Fn(u16, Option<&str>) -> TailnetState + Send + Sync>;
+/// La détection, telle que le service l'appelle : remplaçable par un test. Elle rend ce que le CLI a vu, sans repli.
+pub type Detector = Arc<dyn Fn(u16) -> TailnetState + Send + Sync>;
 
 pub fn system_detector() -> Detector {
     Arc::new(detect)
@@ -141,29 +142,27 @@ fn serve_command(port: u16, status: Option<&Value>) -> String {
     format!("tailscale serve --bg --https={https_port} localhost:{port}")
 }
 
-/// Détecte l'adresse tailnet de `port` ; `configured` est le `public_url` de la config, qui sert de repli quand la
-/// détection ne trouve rien. Bloquant, au plus `STATUS_TIMEOUT`.
-pub fn detect(port: u16, configured: Option<&str>) -> TailnetState {
+/// Ce que le CLI dit de `port`, bloquant et au plus `STATUS_TIMEOUT` : jamais le repli `public_url` (voir
+/// `with_public_url`), pour que l'appelant sache ce que le CLI a vu lui-même.
+pub fn detect(port: u16) -> TailnetState {
     let binary = find_binary(std::env::var("PATH").ok().as_deref());
-    detect_with(binary.as_deref(), port, configured, STATUS_TIMEOUT)
+    read_with(binary.as_deref(), port, STATUS_TIMEOUT)
 }
 
-fn detect_with(
-    binary: Option<&Path>,
-    port: u16,
-    configured: Option<&str>,
-    timeout: Duration,
-) -> TailnetState {
-    // Le `public_url` ne dit pas si Funnel est ouvert : il reste le dernier recours, jamais une preuve.
-    let stand_in = || {
-        configured.map(|url| {
-            TailnetState::Exposed(TailnetEndpoint {
-                url: url.to_string(),
-                funnel: false,
-            })
-        })
-    };
-    let unknown = |reason: &str| stand_in().unwrap_or_else(|| TailnetState::Unknown(reason.into()));
+/// Le repli de la spec (§3.2) : quand le CLI ne trouve pas d'adresse (absente, ou détection impossible), le
+/// `public_url` de la config tient lieu d'adresse. Il ne dit pas si Funnel est ouvert : jamais une preuve.
+pub fn with_public_url(state: TailnetState, public_url: Option<&str>) -> TailnetState {
+    match (state, public_url) {
+        (found @ TailnetState::Exposed(_), _) | (found, None) => found,
+        (_, Some(url)) => TailnetState::Exposed(TailnetEndpoint {
+            url: url.to_string(),
+            funnel: false,
+        }),
+    }
+}
+
+fn read_with(binary: Option<&Path>, port: u16, timeout: Duration) -> TailnetState {
+    let unknown = |reason: &str| TailnetState::Unknown(reason.into());
     let Some(binary) = binary else {
         return unknown("binary_not_found");
     };
@@ -177,25 +176,32 @@ fn detect_with(
     let Ok(status) = serde_json::from_str::<Value>(&output) else {
         return unknown("unreadable_output");
     };
-    stand_in().unwrap_or_else(|| TailnetState::NotExposed {
+    TailnetState::NotExposed {
         command: serve_command(port, Some(&status)),
-    })
+    }
 }
 
 /// Lance `tailscale serve status --json` et rend sa sortie. Un démon éteint peut faire pendre la commande : passé
-/// `timeout`, elle est tuée.
+/// `timeout`, elle est tuée avec tout son groupe de process. `tailscale` est souvent un script qui lance le vrai
+/// binaire sans `exec` : tuer le seul script laisserait le binaire tenir le tube, et le lecteur ne finirait jamais.
 fn run_status(binary: &Path, timeout: Duration) -> Result<String, String> {
     let mut child = Command::new(binary)
         .args(["serve", "status", "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        // Son propre groupe (identifiant = son pid) : de quoi tuer le script et ses descendants d'un coup.
+        .process_group(0)
         .spawn()
         .map_err(|error| format!("spawn_failed: {:?}", error.kind()))?;
     let mut stdout = child.stdout.take().ok_or("spawn_failed: no_stdout")?;
     // Lue à part : une sortie plus grande que le tube bloquerait sinon la commande avant sa fin.
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
+    #[cfg(test)]
+    let tag = binary.to_path_buf();
+    let reader = std::thread::spawn(move || {
+        #[cfg(test)]
+        let _live = tests::LiveReader::enter(tag);
         let mut text = String::new();
         let _ = sender.send(stdout.read_to_string(&mut text).map(|_| text));
     });
@@ -204,30 +210,90 @@ fn run_status(binary: &Path, timeout: Duration) -> Result<String, String> {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("timeout".into());
+            outcome => {
+                kill_group_and_reap(&mut child);
+                // Le groupe est mort : le tube est fermé, le lecteur finit tout de suite.
+                let _ = finish_reader(reader, &receiver);
+                return Err(match outcome {
+                    Err(error) => format!("wait_failed: {:?}", error.kind()),
+                    _ => "timeout".into(),
+                });
             }
-            Err(error) => return Err(format!("wait_failed: {:?}", error.kind())),
         }
     };
+    let output = finish_reader(reader, &receiver);
     if !status.success() {
         return Err(match status.code() {
             Some(code) => format!("exit_failed: {code}"),
             None => "exit_failed: signal".into(),
         });
     }
-    match receiver.recv_timeout(READ_GRACE) {
-        Ok(Ok(text)) => Ok(text),
+    match output {
+        Some(Ok(text)) => Ok(text),
         _ => Err("unreadable_output".into()),
     }
+}
+
+/// Attend la sortie du lecteur et le joint. Un descendant échappé au groupe (`setsid`) garderait le tube ouvert : au
+/// bout de `READ_GRACE` le lecteur est laissé à lui-même plutôt que d'attendre sans fin.
+fn finish_reader(
+    reader: std::thread::JoinHandle<()>,
+    receiver: &mpsc::Receiver<std::io::Result<String>>,
+) -> Option<std::io::Result<String>> {
+    let output = receiver.recv_timeout(READ_GRACE).ok();
+    if output.is_some() {
+        let _ = reader.join();
+    }
+    output
+}
+
+/// Tue le groupe du fils puis le récolte (pas de zombie). Le fils n'est pas encore récolté : son pid reste celui du
+/// groupe, qu'aucun autre process ne peut avoir pris.
+fn kill_group_and_reap(child: &mut Child) {
+    // SAFETY : `killpg` ne touche à aucune mémoire ; l'identifiant est le pid d'un fils qui n'a pas été récolté.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::companion::test_support::TempDir;
+    use std::sync::Mutex;
+
+    /// Les lecteurs de sortie vivants, par binaire : un test vérifie qu'aucun ne survit à l'appel.
+    static LIVE_READERS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(super) struct LiveReader(PathBuf);
+
+    impl LiveReader {
+        pub(super) fn enter(binary: PathBuf) -> Self {
+            LIVE_READERS.lock().unwrap().push(binary.clone());
+            Self(binary)
+        }
+    }
+
+    impl Drop for LiveReader {
+        fn drop(&mut self) {
+            let mut live = LIVE_READERS.lock().unwrap();
+            if let Some(index) = live.iter().position(|binary| *binary == self.0) {
+                live.remove(index);
+            }
+        }
+    }
+
+    /// Ce que le service affiche : la lecture du CLI, avec le repli `public_url`.
+    fn detect_with(
+        binary: Option<&Path>,
+        port: u16,
+        configured: Option<&str>,
+        timeout: Duration,
+    ) -> TailnetState {
+        with_public_url(read_with(binary, port, timeout), configured)
+    }
 
     const SERVE: &str = include_str!("fixtures/serve-status.json");
     const SERVE_FUNNEL: &str = include_str!("fixtures/serve-status-funnel.json");
@@ -470,6 +536,85 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "cut after {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_cli_reading_never_carries_the_public_url() {
+        let dir = TempDir::new("ts-raw");
+        let binary = printing(&dir, "{}");
+        assert!(matches!(
+            read_with(Some(&binary), 3910, LONG),
+            TailnetState::NotExposed { .. }
+        ));
+        assert_eq!(
+            read_with(None, 3910, LONG),
+            TailnetState::Unknown("binary_not_found".into())
+        );
+        // Le repli ne remplace que ce que le CLI n'a pas trouvé.
+        let url = "https://mac.example.ts.net:8443";
+        let found = TailnetState::Exposed(TailnetEndpoint {
+            url: "https://forge.example.ts.net:8455".into(),
+            funnel: true,
+        });
+        assert_eq!(with_public_url(found.clone(), Some(url)), found);
+        assert_eq!(with_public_url(found.clone(), None), found);
+        let unknown = TailnetState::Unknown("timeout".into());
+        assert_eq!(with_public_url(unknown.clone(), None), unknown);
+        assert_eq!(
+            with_public_url(unknown, Some(url)),
+            TailnetState::Exposed(TailnetEndpoint {
+                url: url.into(),
+                funnel: false
+            })
+        );
+    }
+
+    /// Le processus `pid` existe-t-il encore (zombie compris) ?
+    fn alive(pid: i32) -> bool {
+        // SAFETY : signal 0, aucune action : le noyau dit seulement si le process existe.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[test]
+    fn a_wrapper_script_that_does_not_exec_leaves_nothing_behind_at_the_timeout() {
+        let dir = TempDir::new("ts-wrapper");
+        let pid_file = dir.0.join("grandchild.pid");
+        // Comme `/usr/local/bin/tailscale` : un script qui lance le vrai binaire sans `exec`. Le petit-fils
+        // `sleep` garde le tube de sortie ouvert ; tuer le seul script le laisserait en vie.
+        let wrapper = script(
+            &dir,
+            "tailscale",
+            &format!("sleep 30 &\necho $! > '{}'\nwait", pid_file.display()),
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            detect_with(Some(&wrapper), 3910, None, Duration::from_millis(400)),
+            TailnetState::Unknown("timeout".into())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "returned after {:?}",
+            started.elapsed()
+        );
+        let grandchild: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the wrapper started its grandchild")
+            .trim()
+            .parse()
+            .unwrap();
+        // Le petit-fils est tué avec le groupe, puis récolté par `launchd` : un instant, pas plus.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive(grandchild) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild {grandchild} survived the timeout"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Le lecteur de sortie a fini avant le retour de l'appel.
+        assert!(
+            !LIVE_READERS.lock().unwrap().contains(&wrapper),
+            "the stdout reader outlived the call"
         );
     }
 }

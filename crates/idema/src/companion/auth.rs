@@ -150,9 +150,10 @@ pub fn token_hash(token: &[u8]) -> String {
 }
 
 /// Un en-tête `Origin` est-il admis ? Absent, oui (un client qui n'est pas un navigateur n'en envoie pas, et sans
-/// cookie il n'obtient rien). Présent : l'origine de l'adresse tailnet connue, ou à défaut de toute adresse connue
-/// n'importe quelle origine `https://*.ts.net` ; et toujours les origines locales du port.
-pub fn origin_allowed(origin: Option<&str>, known: Option<&str>, port: u16) -> bool {
+/// cookie il n'obtient rien). Présent : toujours les origines locales du port, et l'une des adresses tailnet connues
+/// (le `public_url` de la config et l'adresse détectée, réunies) ; sans aucune adresse connue, n'importe quelle origine
+/// `https://*.ts.net`.
+pub fn origin_allowed(origin: Option<&str>, known: &[&str], port: u16) -> bool {
     let Some(origin) = origin else {
         return true;
     };
@@ -160,10 +161,14 @@ pub fn origin_allowed(origin: Option<&str>, known: Option<&str>, port: u16) -> b
     {
         return true;
     }
-    match known.and_then(origin_of) {
-        Some(known) => origin == known,
-        None => is_tailnet_origin(origin),
+    let known: Vec<String> = known
+        .iter()
+        .filter_map(|address| origin_of(address))
+        .collect();
+    if known.is_empty() {
+        return is_tailnet_origin(origin);
     }
+    known.iter().any(|known| known == origin)
 }
 
 /// L'origine (`schéma://hôte[:port]`) d'une adresse, telle qu'un navigateur l'écrit dans `Origin`.
@@ -350,7 +355,7 @@ mod tests {
 
     #[test]
     fn origin_rules() {
-        let known = Some("https://forge.example.ts.net:8455");
+        let known: &[&str] = &["https://forge.example.ts.net:8455"];
         assert!(origin_allowed(
             Some("https://forge.example.ts.net:8455"),
             known,
@@ -364,17 +369,39 @@ mod tests {
         assert!(origin_allowed(None, known, 3910));
         assert!(origin_allowed(
             Some("https://x.example.ts.net:8455"),
-            None,
+            &[],
             3910
         ));
-        assert!(!origin_allowed(Some("https://evil.example"), None, 3910));
+        assert!(!origin_allowed(Some("https://evil.example"), &[], 3910));
         assert!(origin_allowed(Some("http://127.0.0.1:3910"), known, 3910));
-        assert!(origin_allowed(Some("http://localhost:3910"), None, 3910));
-        assert!(!origin_allowed(Some("http://127.0.0.1:3911"), None, 3910));
+        assert!(origin_allowed(Some("http://localhost:3910"), &[], 3910));
+        assert!(!origin_allowed(Some("http://127.0.0.1:3911"), &[], 3910));
         // La forme saisie dans `public_url` (barre finale, chemin) désigne la même origine.
         assert!(origin_allowed(
             Some("https://forge.example.ts.net:8455"),
-            Some("https://forge.example.ts.net:8455/"),
+            &["https://forge.example.ts.net:8455/"],
+            3910
+        ));
+    }
+
+    #[test]
+    fn every_known_address_is_admitted_and_the_wildcard_stays_off() {
+        // `public_url` et adresse détectée à la fois : les deux origines passent, pas une troisième.
+        let known: &[&str] = &[
+            "https://mac.example.ts.net:8443",
+            "https://forge.example.ts.net:8455",
+        ];
+        for origin in [
+            "https://mac.example.ts.net:8443",
+            "https://forge.example.ts.net:8455",
+            "http://127.0.0.1:3910",
+            "http://localhost:3910",
+        ] {
+            assert!(origin_allowed(Some(origin), known, 3910), "{origin}");
+        }
+        assert!(!origin_allowed(
+            Some("https://other.example.ts.net"),
+            known,
             3910
         ));
     }
@@ -391,7 +418,7 @@ mod tests {
             "null",
             "",
         ] {
-            assert!(!origin_allowed(Some(origin), None, 3910), "{origin}");
+            assert!(!origin_allowed(Some(origin), &[], 3910), "{origin}");
         }
     }
 

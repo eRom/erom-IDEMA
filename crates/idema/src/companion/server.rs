@@ -64,9 +64,9 @@ pub struct AppState {
     /// Passe à `true` quand le service doit s'arrêter : les flux se ferment alors d'eux-mêmes.
     pub stop: watch::Receiver<bool>,
     pub access: Arc<Access>,
-    /// L'adresse tailnet connue (`public_url`), dont l'origine est admise en écriture. Suit la config à chaud
-    /// (`ServiceEvent::ConfigChanged`).
-    pub known_origin: Arc<Mutex<Option<String>>>,
+    /// Les adresses tailnet connues (le `public_url` de la config et l'adresse détectée), dont les origines sont
+    /// admises en écriture. Suit la config et la détection à chaud.
+    pub known_origins: Arc<Mutex<Vec<String>>>,
     pub port: u16,
     /// Les routes de test existent-elles ? Décidé une fois par le contrôleur (`auth::test_routes_enabled`).
     pub test_routes: bool,
@@ -174,12 +174,13 @@ async fn guard(State(state): State<AppState>, mut request: Request, next: Next) 
 
     if write && let Some(origin) = request.headers().get(header::ORIGIN) {
         let origin = origin.to_str().ok();
-        let known_origin = state
-            .known_origin
+        let known_origins = state
+            .known_origins
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        if origin.is_none() || !origin_allowed(origin, known_origin.as_deref(), state.port) {
+        let known: Vec<&str> = known_origins.iter().map(String::as_str).collect();
+        if origin.is_none() || !origin_allowed(origin, &known, state.port) {
             return error_reply(StatusCode::FORBIDDEN, "forbidden_origin");
         }
     }
