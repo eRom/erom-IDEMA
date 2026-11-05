@@ -126,6 +126,9 @@ pub enum AckOrigin {
 pub enum InputOutcome {
     /// Tapée.
     Sent,
+    /// La première écriture est partie mais l'Entrée demandée ne l'a pas été : trop tard pour répondre juste, pane
+    /// disparu, client de contrôle sorti ou programme fini. La page dit « Envoyé sans Entrée » et relit l'écran.
+    SentWithoutEnter,
     /// Ce `command_id` a déjà été tapé dans la minute : rien n'est retapé, la page le compte pour un succès.
     Duplicate,
     /// Rien ne tourne dans le pane (prompt du shell, ou programme encore inconnu) : fermé par défaut.
@@ -144,6 +147,7 @@ impl InputOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Sent => "sent",
+            Self::SentWithoutEnter => "sent_without_enter",
             Self::Duplicate => "duplicate",
             Self::NoProgram => "no_program",
             Self::ReadOnly => "read_only",
@@ -155,6 +159,16 @@ impl InputOutcome {
     }
 }
 
+/// Une donnée venue d'une requête, sûre pour une ligne de journal : les caractères de contrôle (dont `\n`, qui fausserait
+/// la ligne) sont remplacés par `?`, la longueur est bornée. Toute ligne `companion` qui porte une donnée de requête
+/// passe par ici.
+pub fn log_safe(text: &str) -> String {
+    text.chars()
+        .take(80)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// Ce que le pane accepte, tel que l'écran le dit à la page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneProbe {
@@ -162,4 +176,18 @@ pub struct PaneProbe {
     pub accepts_input: bool,
     /// Son état (`idle`, `running`, `waiting`, `error`).
     pub state: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_value_cannot_forge_a_journal_line() {
+        assert_eq!(log_safe("idema-ab12cd34"), "idema-ab12cd34");
+        let forged = log_safe("x\ncompanion pair ok\r\u{85}\u{1b}[31m\u{7f}");
+        assert!(!forged.chars().any(char::is_control), "{forged:?}");
+        assert!(forged.starts_with("x?companion pair ok"));
+        assert_eq!(log_safe(&"a".repeat(500)).len(), 80);
+    }
 }

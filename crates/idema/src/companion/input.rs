@@ -28,6 +28,10 @@ pub const ENTER_DELAY: Duration = Duration::from_millis(80);
 /// marge d'un second : une touche ne part jamais après une réponse d'échec.
 pub const HTTP_WAIT: Duration = Duration::from_millis(2500);
 
+/// Au-delà de cet âge (depuis la réception HTTP), l'Entrée d'une saisie n'est plus tapée : il reste au moins 300 ms avant
+/// que le côté HTTP ne renonce (`HTTP_WAIT`), pour taper l'Entrée et répondre.
+pub const ENTER_DEADLINE: Duration = Duration::from_millis(2200);
+
 /// Une touche que le téléphone sait envoyer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteKey {
@@ -157,6 +161,13 @@ pub fn parse_input(body: &[u8]) -> Result<(RemoteInput, String), BadInput> {
 /// La commande est-elle arrivée trop tard (plus de 1,5 s après sa réception HTTP) pour qu'on la tape encore ?
 pub fn is_expired(received: Instant, now: Instant) -> bool {
     now.saturating_duration_since(received) > EXPIRY
+}
+
+/// L'Entrée différée d'une saisie peut-elle encore partir ? Oui jusqu'à `ENTER_DEADLINE` après la réception HTTP. Passé ce
+/// délai, le téléphone a reçu (ou va recevoir) un échec : une Entrée tapée après lui pourrait valider une invite qu'il
+/// n'a pas vue.
+pub fn enter_still_allowed(received: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(received) <= ENTER_DEADLINE
 }
 
 /// Les `command_id` tapés dans la dernière minute.
@@ -383,6 +394,27 @@ mod tests {
         assert!(!is_expired(received, received));
         // Une horloge qui recule ne périme rien.
         assert!(!is_expired(received + Duration::from_secs(5), received));
+    }
+
+    #[test]
+    fn a_delayed_enter_leaves_300_ms_before_the_http_side_gives_up() {
+        assert_eq!(ENTER_DEADLINE + Duration::from_millis(300), HTTP_WAIT);
+        let received = Instant::now();
+        assert!(enter_still_allowed(received, received));
+        assert!(enter_still_allowed(
+            received,
+            received + ENTER_DEADLINE - Duration::from_millis(1)
+        ));
+        assert!(enter_still_allowed(received, received + ENTER_DEADLINE));
+        assert!(!enter_still_allowed(
+            received,
+            received + ENTER_DEADLINE + Duration::from_millis(1)
+        ));
+        // Une commande prise à la limite de la péremption (1,5 s) et son délai de 80 ms tiennent dans la marge.
+        assert!(enter_still_allowed(
+            received,
+            received + Duration::from_millis(1500) + ENTER_DELAY
+        ));
     }
 
     #[test]

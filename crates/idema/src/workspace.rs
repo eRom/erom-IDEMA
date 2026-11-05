@@ -11,8 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures::StreamExt;
 use gpui::{
-    AnyElement, App, BoxShadow, ClipboardItem, Context, CursorStyle, DispatchPhase, Div, Entity,
-    FocusHandle, Focusable, FontWeight, HitboxBehavior, MouseButton, MouseDownEvent,
+    AnyElement, App, AsyncApp, BoxShadow, ClipboardItem, Context, CursorStyle, DispatchPhase, Div,
+    Entity, FocusHandle, Focusable, FontWeight, HitboxBehavior, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, PromptButton, PromptLevel,
     Stateful, Subscription, Task, WeakEntity, Window, actions, canvas, div, point, prelude::*, px,
     svg,
@@ -43,9 +43,11 @@ use crate::changes::panel::{
 };
 use crate::commit_message::CommitMessageSettings;
 use crate::companion::fleet::{FleetPane, SessionInput, compose_fleet, mac_name, state_label};
-use crate::companion::input::{ENTER_DELAY, Gate, RemoteInput, gate, is_expired};
+use crate::companion::input::{
+    ENTER_DELAY, Gate, RemoteInput, enter_still_allowed, gate, is_expired,
+};
 use crate::companion::{
-    AckOrigin, CompanionController, InputOutcome, PaneCommand, PaneProbe, ServiceEvent,
+    AckOrigin, CompanionController, InputOutcome, PaneCommand, PaneProbe, ServiceEvent, log_safe,
 };
 use crate::config::{
     AgentEntry, Config, ConfigError, FileWatch, IdeationConfig, ReloadEffects, SHELL_ENTRY,
@@ -680,6 +682,37 @@ const SESSIONS_POLL: Duration = Duration::from_secs(1);
 
 /// Le brut d'un arrêt du client sans raison de tmux (`%exit` nu).
 const NO_EXIT_REASON: &str = "control client exited";
+
+/// L'Entrée différée d'une saisie du téléphone : tapée seulement si elle part avant `ENTER_DEADLINE`, si le pane existe
+/// encore, si le client de contrôle de sa session n'est pas sorti et si le pane accepte toujours une saisie. Faux : rien
+/// n'a été tapé. Tout se décide sans attendre, sur le fil d'interface : aucune pause entre le contrôle et l'écriture.
+fn type_delayed_enter(
+    pane: &WeakEntity<PaneView>,
+    session: &WeakEntity<SessionView>,
+    received_at: Instant,
+    cx: &mut AsyncApp,
+) -> bool {
+    if !enter_still_allowed(received_at, Instant::now()) {
+        return false;
+    }
+    // Une session disparue ou un client sorti : l'Entrée n'arriverait pas, ou pas où le téléphone croit.
+    if session
+        .update(cx, |session, _| session.control_client_exited())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    pane.update(cx, |pane, _| pane.send_remote_enter())
+        .unwrap_or(false)
+}
+
+/// `companion input …` au journal, avec le nom de session déjà passé par `session_log_label`.
+fn log_input(session: &str, pane: u32, outcome: InputOutcome, main_thread_us: u128) {
+    hud::log_event(&format!(
+        "companion input session={session} pane={pane} outcome={} main_thread_us={main_thread_us}",
+        outcome.as_str()
+    ));
+}
 
 /// Une saisie du téléphone, telle que le service l'a transmise, et l'instant où le fil d'interface la prend.
 struct RemoteRequest {
@@ -2190,7 +2223,8 @@ impl Workspace {
                     });
                 }
                 hud::log_event(&format!(
-                    "companion ack session={session} pane={pane} main_thread_us={}",
+                    "companion ack session={} pane={pane} main_thread_us={}",
+                    self.session_log_label(&session),
                     started.elapsed().as_micros()
                 ));
                 let _ = reply.send(found);
@@ -2241,6 +2275,8 @@ impl Workspace {
             received_at,
             started,
         } = request;
+        // Le nom vient de l'URL : il n'entre au journal qu'une fois la session résolue.
+        let label = self.session_log_label(&session);
         let (outcome, delayed_enter) = match self.entry_view(&session) {
             None => (InputOutcome::UnknownSession, None),
             Some(view) => match view.read(cx).remote_pane(PaneId(pane)) {
@@ -2261,7 +2297,6 @@ impl Workspace {
                     match refused {
                         Some(outcome) => (outcome, None),
                         None => {
-                            self.companion.remember_command(&command_id, started);
                             let (sent, enter) = pane_view.update(cx, |pane, _| match &input {
                                 RemoteInput::Key { key, enter } => {
                                     (pane.send_remote_key(*key), *enter)
@@ -2271,7 +2306,12 @@ impl Workspace {
                                 }
                             });
                             if sent {
-                                (InputOutcome::Sent, enter.then_some(pane_view))
+                                // Retenu seulement une fois l'écriture faite : un échec rejoué ne passe pas pour un doublon.
+                                self.companion.remember_command(&command_id, started);
+                                (
+                                    InputOutcome::Sent,
+                                    enter.then(|| (pane_view.downgrade(), view.downgrade())),
+                                )
                             } else {
                                 (InputOutcome::NoProgram, None)
                             }
@@ -2280,26 +2320,38 @@ impl Workspace {
                 }
             },
         };
-        hud::log_event(&format!(
-            "companion input session={session} pane={pane} outcome={} main_thread_us={}",
-            outcome.as_str(),
-            started.elapsed().as_micros()
-        ));
+        let main_thread_us = started.elapsed().as_micros();
         if outcome == InputOutcome::Sent {
             self.companion
                 .send(ServiceEvent::PhoneInteraction { session });
         }
-        let Some(pane_view) = delayed_enter else {
+        let Some((pane_view, session_view)) = delayed_enter else {
+            log_input(&label, pane, outcome, main_thread_us);
             let _ = reply.send(outcome);
             return;
         };
+        // L'Entrée part 80 ms après la première écriture, et seulement si le téléphone peut encore apprendre qu'elle est
+        // partie. L'issue (journal et réponse HTTP) se décide ici, une fois l'Entrée tapée ou non.
         cx.spawn(async move |_, cx| {
             cx.background_executor().timer(ENTER_DELAY).await;
-            // Le programme a pu finir pendant ces 80 ms : `send_remote_enter` refuse alors, rien n'est tapé.
-            let _ = pane_view.update(cx, |pane, _| pane.send_remote_enter());
+            let outcome = if type_delayed_enter(&pane_view, &session_view, received_at, cx) {
+                InputOutcome::Sent
+            } else {
+                InputOutcome::SentWithoutEnter
+            };
+            log_input(&label, pane, outcome, main_thread_us);
             let _ = reply.send(outcome);
         })
         .detach();
+    }
+
+    /// Le nom de session d'une requête, tel qu'il peut figurer au journal : `?` tant qu'aucune session ne le porte.
+    fn session_log_label(&self, session: &str) -> String {
+        if self.entry_index(session).is_some() {
+            log_safe(session)
+        } else {
+            "?".to_owned()
+        }
     }
 
     /// La section `[ideation]` vient de disparaître alors qu'un bouillon est sélectionné : la première session de l'ordre

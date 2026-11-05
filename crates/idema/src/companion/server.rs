@@ -325,7 +325,10 @@ async fn ask<T>(
 fn unanswered_reply(why: Unanswered) -> Response {
     match why {
         Unanswered::Gone => error_reply(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-        // Le fil d'interface jette toute commande de plus de 1,5 s : rien n'a été tapé.
+        // Garanti : le fil d'interface jette toute commande prise plus de 1,5 s après sa réception, et ne tape plus une
+        // Entrée différée au-delà de 2,2 s (`input::enter_still_allowed`), donc aucune touche ne part après cette
+        // réponse. Pas garanti : un texte ou une touche pris avant le délai ont pu être tapés (sans leur Entrée) quand
+        // le fil d'interface a calé ensuite.
         Unanswered::TimedOut => error_reply(StatusCode::SERVICE_UNAVAILABLE, "expired"),
     }
 }
@@ -468,7 +471,8 @@ async fn screen(
     };
     let (rendered, etag, took_ms) = rendered;
     hud::log_event(&format!(
-        "companion screen session={session} pane={pane} took_ms={took_ms}"
+        "companion screen session={} pane={pane} took_ms={took_ms}",
+        super::log_safe(&session)
     ));
     let Ok(etag) = HeaderValue::from_str(&etag) else {
         return error_reply(StatusCode::INTERNAL_SERVER_ERROR, "internal");
@@ -527,7 +531,7 @@ async fn input(
 
 fn input_reply(outcome: InputOutcome) -> Response {
     let status = match outcome {
-        InputOutcome::Sent | InputOutcome::Duplicate => {
+        InputOutcome::Sent | InputOutcome::SentWithoutEnter | InputOutcome::Duplicate => {
             return json_reply(
                 StatusCode::OK,
                 serde_json::json!({ "ok": true, "outcome": outcome.as_str() }).to_string(),
@@ -1575,6 +1579,7 @@ mod tests {
     fn every_outcome_has_its_status_and_none_but_sent_and_duplicate_succeed() {
         let cases = [
             (InputOutcome::Sent, 200, "sent"),
+            (InputOutcome::SentWithoutEnter, 200, "sent_without_enter"),
             (InputOutcome::Duplicate, 200, "duplicate"),
             (InputOutcome::NoProgram, 409, "no_program"),
             (InputOutcome::ReadOnly, 409, "read_only"),
