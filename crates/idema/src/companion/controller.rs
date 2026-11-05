@@ -143,7 +143,8 @@ impl CompanionController {
     /// Romain est-il présent ? Vrai compagnon éteint : le « vu » d'IdemA ne dépend alors de rien d'autre que de la
     /// fenêtre.
     pub fn present(&self) -> bool {
-        !self.away
+        // `away` peut survivre à un démarrage raté (port pris) : sans service, l'absence ne veut plus rien dire.
+        self.running.is_none() || !self.away
     }
 
     /// Enregistre l'absence mesurée ; vrai quand l'état a changé. Sans effet éteint (aucune minuterie n'existe alors,
@@ -347,6 +348,27 @@ mod tests {
             "turning the companion off ends the absence"
         );
         controller.stopping.take().unwrap().join().unwrap();
+    }
+
+    /// Un redémarrage raté (le fil n'a pas pu naître) laisse `away` vrai sans service : compagnon éteint, Romain est
+    /// présent, quoi que `away` ait gardé.
+    #[test]
+    fn present_is_true_when_off_even_if_a_failed_restart_kept_away() {
+        let port = super::super::test_support::free_port();
+        let home = super::super::test_support::TempDir::new("controller-failed-restart");
+        let scratchpad = home.0.join("scratchpad.md");
+        let mut controller = CompanionController::new();
+        controller.sync(Some(&config(port)), Some(tmux()), &home.0, &scratchpad);
+        assert!(controller.set_away(true));
+        assert!(!controller.present());
+
+        // L'état laissé par `sync` quand `service::start` rend `None` : l'ancien service est arrêté, `away` reste.
+        let stopped = controller.stop().expect("a service was running");
+        stopped.join().unwrap();
+
+        assert!(!controller.is_on());
+        assert!(controller.away, "the failed start did not reset it");
+        assert!(controller.present(), "no service, so Romain is present");
     }
 
     /// Retirer la section garde le fil de l'ancien service ; la réactiver le lui fait joindre avant de lier le port.

@@ -18,6 +18,11 @@ mod sse;
 mod test_support;
 mod timeline;
 mod web_assets;
+#[allow(
+    dead_code,
+    reason = "consommé par les tâches 7 (envoi) et 8 (décision)"
+)]
+mod webpush;
 
 use std::time::{Instant, SystemTime};
 
