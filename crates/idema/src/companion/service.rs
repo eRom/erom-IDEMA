@@ -43,7 +43,7 @@ pub struct ServiceDeps {
     pub config: CompanionConfig,
     /// Le serveur tmux d'IdemA : l'écran d'un pane s'y capture.
     pub tmux: Arc<TmuxServer>,
-    #[allow(dead_code, reason = "lu par la tâche 9 (Scratchpad)")]
+    /// La note `scratchpad.md` du dossier d'IdemA, que la page lit et complète.
     pub scratchpad: PathBuf,
     pub events: UnboundedReceiver<ServiceEvent>,
     /// Les commandes sur un pane (saisie, acquittement, lecture), que l'espace de travail traite sur le fil d'interface.
@@ -128,6 +128,7 @@ struct Serving {
     timeline: Arc<Mutex<Timeline>>,
     tmux: Arc<TmuxServer>,
     commands: UnboundedSender<PaneCommand>,
+    scratchpad: PathBuf,
 }
 
 /// Le corps du fil.
@@ -139,6 +140,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         tmux,
         events,
         commands,
+        scratchpad,
         status,
         fleet,
         timeline,
@@ -214,6 +216,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         timeline,
         tmux,
         commands,
+        scratchpad,
     };
     let served = runtime.block_on(serve(serving, &status, access, events, stop));
     // Le runtime est abandonné ici : ses tâches restantes (flux en retard, appel bloquant) ne retiennent plus le fil.
@@ -247,6 +250,7 @@ async fn serve(
         timeline,
         tmux,
         commands,
+        scratchpad,
     } = serving;
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = match bind(address, bind_retry).await {
@@ -298,6 +302,7 @@ async fn serve(
         timeline,
         tmux,
         commands,
+        scratchpad,
         push,
         push_test_busy: Arc::new(AtomicBool::new(false)),
         inbox,

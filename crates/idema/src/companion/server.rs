@@ -1,6 +1,7 @@
 //! Les routes HTTP du service. Toutes les routes de données sont sous `/idema-api/` et passent par la garde ; les
 //! fichiers de la page sont servis à la racine, sans cookie et sans donnée.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -28,6 +29,7 @@ use super::fleet::Fleet;
 use super::input::{self, HTTP_WAIT};
 use super::notify::Message;
 use super::push_send::{Delivery, PushSender, endpoint_allowed};
+use super::scratchpad::{self, AppendError};
 use super::screen;
 use super::sse::{self, COALESCE};
 use super::timeline::Timeline;
@@ -81,6 +83,8 @@ pub struct AppState {
     pub push_test_busy: Arc<AtomicBool>,
     /// La file de la boucle des notifications : `PUT presence` y dépose le pane que la page montre.
     pub inbox: tokio::sync::mpsc::UnboundedSender<Message>,
+    /// La note `scratchpad.md` du dossier d'IdemA.
+    pub scratchpad: PathBuf,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -98,6 +102,8 @@ pub fn router(state: AppState) -> Router {
         .route("/idema-api/sessions/{name}/panes/{pane}/input", post(input))
         .route("/idema-api/sessions/{name}/panes/{pane}/ack", post(ack))
         .route("/idema-api/presence", put(presence))
+        .route("/idema-api/scratchpad", get(scratchpad_read))
+        .route("/idema-api/scratchpad/append", post(scratchpad_append))
         .route("/idema-api/client-metrics", post(client_metrics))
         .route("/idema-api/push/key", get(push_key))
         .route(
@@ -652,6 +658,52 @@ async fn client_metrics(body: Bytes) -> Response {
     };
     hud::log_event(&format!("companion client metric name={name} ms={ms}"));
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET scratchpad` : la note en texte, avec sa date de modification (millisecondes Unix, `null` tant qu'elle n'existe
+/// pas). Lecture sur un fil bloquant : la note peut être un lien vers un disque lent.
+async fn scratchpad_read(State(state): State<AppState>) -> Response {
+    let path = state.scratchpad.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        let modified_at = scratchpad::modified_millis(&path);
+        scratchpad::read(&path).map(|text| (text, modified_at))
+    })
+    .await;
+    match read {
+        Ok(Ok((text, modified_at))) => json_reply(
+            StatusCode::OK,
+            serde_json::json!({ "text": text, "modified_at": modified_at }).to_string(),
+        ),
+        _ => error_reply(StatusCode::INTERNAL_SERVER_ERROR, "scratchpad_unreadable"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppendBody {
+    line: String,
+}
+
+/// `POST scratchpad/append` : ajoute `{"line": ...}` à la fin de la note (1 à 2 000 octets, sans caractère de
+/// contrôle). Le texte de la ligne n'est jamais journalisé.
+async fn scratchpad_append(State(state): State<AppState>, body: Bytes) -> Response {
+    let Ok(AppendBody { line }) = serde_json::from_slice(&body) else {
+        return error_reply(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    let path = state.scratchpad.clone();
+    let appended = tokio::task::spawn_blocking(move || scratchpad::append_line(&path, &line)).await;
+    match appended {
+        Ok(Ok(())) => json_reply(
+            StatusCode::OK,
+            serde_json::json!({ "ok": true }).to_string(),
+        ),
+        // Le journal du §3.12 n'a pas de ligne pour la note : un échec disque se dit par son code, sans la ligne.
+        Ok(Err(failure @ AppendError::Io(_))) => {
+            error_reply(StatusCode::INTERNAL_SERVER_ERROR, failure.error_code())
+        }
+        Ok(Err(refused)) => error_reply(StatusCode::BAD_REQUEST, refused.error_code()),
+        Err(_) => error_reply(StatusCode::INTERNAL_SERVER_ERROR, "scratchpad_unwritable"),
+    }
 }
 
 /// La notification de test (spec §3.7) : un titre et un corps fixes, pour l'appareil qui la demande.
@@ -2370,5 +2422,117 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             assert!(fake.requests().is_empty(), "nothing is sent to {bad}");
         }
+    }
+
+    // ---- Scratchpad ----
+
+    const SCRATCHPAD: &str = "/idema-api/scratchpad";
+    const APPEND: &str = "/idema-api/scratchpad/append";
+
+    fn append(service: &Harness, cookie: &str, body: &str) -> Reply {
+        service.request("POST", APPEND, &[JSON, ("Cookie", cookie)], Some(body))
+    }
+
+    #[test]
+    fn the_scratchpad_reads_the_note_and_appends_a_line_at_its_end() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+
+        // Pas encore de note : texte vide et date inconnue.
+        let missing = service.request("GET", SCRATCHPAD, &[("Cookie", &phone)], None);
+        assert_eq!(missing.status, 200, "{}", missing.text());
+        assert_eq!(missing.json()["text"], "");
+        assert!(missing.json()["modified_at"].is_null());
+
+        std::fs::write(&note, "from the Mac\r\n").unwrap();
+        let reply = append(&service, &phone, r#"{"line":"from the phone é"}"#);
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        assert_eq!(
+            std::fs::read_to_string(&note).unwrap(),
+            "from the Mac\r\nfrom the phone é\r\n"
+        );
+
+        let read = service.request("GET", SCRATCHPAD, &[("Cookie", &phone)], None);
+        assert_eq!(read.status, 200);
+        assert_eq!(read.header("content-type"), Some("application/json"));
+        assert_hardened(&read, "scratchpad");
+        assert_eq!(read.json()["text"], "from the Mac\r\nfrom the phone é\r\n");
+        assert!(read.json()["modified_at"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn the_scratchpad_refuses_a_bad_line_and_leaves_the_note_alone() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+        std::fs::write(&note, "kept\n").unwrap();
+        let long = format!(r#"{{"line":"{}"}}"#, "x".repeat(2_001));
+        let cases = [
+            (r#"{"line":""}"#.to_owned(), "empty"),
+            (long, "too_long"),
+            (r#"{"line":"two\nlines"}"#.to_owned(), "control_char"),
+            (r#"{"line":"tab\there"}"#.to_owned(), "control_char"),
+            (r#"{"line":"ok","extra":1}"#.to_owned(), "bad_request"),
+            (r#"{"line":42}"#.to_owned(), "bad_request"),
+            ("not json".to_owned(), "bad_request"),
+            (String::new(), "bad_request"),
+        ];
+        for (body, code) in cases {
+            let reply = append(&service, &phone, &body);
+            assert_eq!(reply.status, 400, "{body:.40}: {}", reply.text());
+            assert_eq!(reply.json()["error"], code, "{body:.40}");
+        }
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "kept\n");
+    }
+
+    #[test]
+    fn the_scratchpad_routes_sit_behind_the_guard() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+        std::fs::write(&note, "kept\n").unwrap();
+        let body = r#"{"line":"intruder"}"#;
+
+        let anonymous = service.request("GET", SCRATCHPAD, &[], None);
+        assert_eq!(anonymous.status, 401);
+        assert!(!anonymous.text().contains("kept"));
+        let unpaired = service.request("POST", APPEND, &[JSON], Some(body));
+        assert_eq!(unpaired.status, 401);
+        let text_plain = service.request(
+            "POST",
+            APPEND,
+            &[("Content-Type", "text/plain"), ("Cookie", &phone)],
+            Some(body),
+        );
+        assert_eq!(text_plain.status, 415);
+        let foreign = service.request(
+            "POST",
+            APPEND,
+            &[JSON, ("Cookie", &phone), ("Origin", "https://evil.example")],
+            Some(body),
+        );
+        assert_eq!(foreign.status, 403);
+        for reply in [&unpaired, &text_plain, &foreign] {
+            assert_hardened(reply, "refused scratchpad write");
+        }
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "kept\n");
+    }
+
+    #[test]
+    fn the_scratchpad_follows_a_symlinked_note() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let target = service.home.0.join("dotfiles-notes.md");
+        std::fs::write(&target, "linked\n").unwrap();
+        let link = service.home.0.join("scratchpad.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(append(&service, &phone, r#"{"line":"more"}"#).status, 200);
+
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "linked\nmore\n");
+        let read = service.request("GET", SCRATCHPAD, &[("Cookie", &phone)], None);
+        assert_eq!(read.json()["text"], "linked\nmore\n");
     }
 }

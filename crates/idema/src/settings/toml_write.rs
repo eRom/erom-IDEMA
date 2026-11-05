@@ -71,7 +71,7 @@ fn io_error(what: &str, error: &io::Error) -> ConfigError {
     }
 }
 
-fn write_atomically(target: &Path, text: &str) -> io::Result<()> {
+pub(crate) fn write_atomically(target: &Path, text: &str) -> io::Result<()> {
     let name = target
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;

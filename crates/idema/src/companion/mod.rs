@@ -14,6 +14,7 @@ mod notify;
 mod notify_text;
 pub mod presence;
 mod push_send;
+pub mod scratchpad;
 pub mod screen;
 mod server;
 pub mod service;
