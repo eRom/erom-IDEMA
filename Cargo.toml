@@ -53,12 +53,16 @@ objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std"
 block2 = "0.6"
 raw-window-handle = "0.6"
 
-# gpui-base 0.7.3 recopié tel que publié, plus un seul patch : le retour à la ligne de l'éditeur mesure les lignes
-# simples par sommes de largeurs de caractère au lieu de façonner chaque préfixe sondé avec CoreText (30 à 40 fois plus
-# rapide, mêmes coupures ; `text_wrapper.rs`, blocs marqués « IdemA »). Sans lui, un fichier de 1 Mo gèle l'interface
-# 3 s à l'ouverture et près de 2 s à chaque changement de largeur. Le patch se relit par
-# `diff -ru ~/.cargo/registry/src/index.crates.io-*/gpui-base-0.7.3 vendor/gpui-base` (gpui-base 0.8.0 a le même
-# `text_wrapper.rs`) ; à une montée de version, recopier la nouvelle, réappliquer le patch, puis rejouer le banc local
-# de l'éditeur (`tests/perf/editor-bench/run.sh <racine>`, hors dépôt public comme les tests d'acceptance).
+# gpui-base 0.7.3 recopié tel que publié, plus un seul patch : en police monospace, le retour à la ligne mesure les
+# lignes simples par sommes de largeurs de caractère (celles qui empruntent une police de secours seulement si leur
+# largeur totale concorde), au lieu de façonner chaque préfixe sondé avec CoreText (près de 30 fois plus rapide ;
+# `text_wrapper.rs`, blocs marqués « IdemA »). Sans lui, un fichier de 1 Mo
+# gèle l'interface 3 s à l'ouverture et près de 2 s à chaque changement de largeur. Le patch se relit par
+# `diff -ru ~/.cargo/registry/src/index.crates.io-*/gpui-base-0.7.3 vendor/gpui-base`.
+# Montée de version : 0.8.0 a le même `text_wrapper.rs`, 0.8.1 le modifie (taquets de tabulation) et 0.9.0 le réécrit
+# (cache des coupures au redimensionnement, PR longbridge/gpui-kit#3691, mais toujours un façonnage par préfixe à
+# l'ouverture) en épinglant gpui-pre 0.3.11. Le patch ne se réapplique donc pas tel quel : le reporter à la main, puis
+# rejouer le banc local de l'éditeur (`tests/perf/editor-bench/run.sh <racine>`, hors dépôt public comme les tests
+# d'acceptance), dont la sonde recopie le patch et doit être mise à jour avec lui.
 [patch.crates-io]
 gpui-base = { path = "vendor/gpui-base" }

@@ -1,3 +1,5 @@
+// Modifié pour IdemA le 2026-11-05 (licence Apache-2.0, §4 b) : le retour à la ligne mesure les lignes simples par
+// sommes de largeurs de caractère ; chaque modification est marquée « IdemA ».
 use super::inline_line::InputLine;
 use gpui::Half;
 use std::borrow::Cow;
@@ -27,9 +29,10 @@ pub enum WrappingIndent {
     Same,
 }
 
-/// IdemA : vrai pour un caractère dont la largeur façonnée seule est celle qu'il prend dans la ligne : ni marque
-/// combinante, ni liant, ni sélecteur de variante, ni tabulation ou contrôle, ni écriture à mise en forme contextuelle,
-/// ni CJK ou emoji (gpui-base garde pour eux sa mesure exacte). Latin, ponctuation, flèches, symboles et filets.
+/// IdemA : les plages où la largeur façonnée d'un caractère seul peut être celle qu'il prend dans la ligne : latin,
+/// ponctuation, devises, flèches, symboles et filets. Ni marque combinante, ni liant, ni sélecteur de variante, ni
+/// tabulation ou contrôle, ni écriture à mise en forme contextuelle, ni CJK. Une ligne où un caractère vient d'une
+/// police de secours (emoji, symbole absent de la police) n'est admise qu'après contrôle de sa largeur totale.
 fn is_simple_char(c: char) -> bool {
     matches!(c,
         ' '..='~'
@@ -45,30 +48,62 @@ fn is_simple_char(c: char) -> bool {
     )
 }
 
-/// IdemA : les largeurs de caractère d'une police, façonnées une fois chacune.
+/// IdemA : les largeurs de caractère d'une police monospace, façonnées une fois chacune, en `f64` pour que leurs sommes
+/// ne dérivent pas sur une ligne de centaines de milliers de caractères (en `f32`, au-delà de 4 millions de pixels, un
+/// cumul ne se représente plus qu'au demi-pixel).
 struct CharWidths {
     text_system: std::sync::Arc<gpui::TextSystem>,
     font_id: gpui::FontId,
     font_size: Pixels,
-    ascii: [Option<Pixels>; 128],
-    other: std::collections::HashMap<char, Pixels>,
+    /// Faux pour une police proportionnelle : l'approche (kerning) change les largeurs dans la ligne, aucune ligne ne
+    /// prend alors le chemin rapide.
+    monospace: bool,
+    ascii: [Option<CharWidth>; 128],
+    other: std::collections::HashMap<char, CharWidth>,
+}
+
+/// IdemA : la largeur façonnée d'un caractère seul, et s'il est dans la police elle-même. Hors de la police, CoreText
+/// le prend dans une police de secours choisie pour toute une suite, pas caractère par caractère : sa largeur seule
+/// peut alors différer de celle qu'il prend dans la ligne.
+#[derive(Clone, Copy)]
+struct CharWidth {
+    width: f64,
+    in_font: bool,
+}
+
+/// IdemA : ce que `CharWidths::cumulate` sait d'une ligne.
+enum Cumulated {
+    /// Police proportionnelle : la mesure façonnée s'impose.
+    Proportional,
+    /// Tous les caractères sont dans la police : les sommes valent la mesure façonnée.
+    InFont,
+    /// Au moins un caractère vient d'une police de secours : les sommes ne valent qu'après contrôle de la largeur totale.
+    WithFallback,
 }
 
 impl CharWidths {
     fn new(text_system: std::sync::Arc<gpui::TextSystem>, font: &Font, font_size: Pixels) -> Self {
         let font_id = text_system.resolve_font(font);
-        Self {
+        let mut widths = Self {
             text_system,
             font_id,
             font_size,
+            monospace: false,
             ascii: [None; 128],
             other: Default::default(),
-        }
+        };
+        let (narrow, wide) = (widths.width('i'), widths.width('W'));
+        widths.monospace =
+            narrow.in_font && wide.in_font && (narrow.width - wide.width).abs() < 1e-3;
+        widths
     }
 
-    fn width(&mut self, c: char) -> Pixels {
+    fn width(&mut self, c: char) -> CharWidth {
         let (text_system, font_id, font_size) = (&self.text_system, self.font_id, self.font_size);
-        let shape = || text_system.layout_width(font_id, font_size, c);
+        let shape = || CharWidth {
+            width: f64::from(f32::from(text_system.layout_width(font_id, font_size, c))),
+            in_font: text_system.advance(font_id, font_size, c).is_ok(),
+        };
         match self.ascii.get_mut(c as usize) {
             Some(slot) => *slot.get_or_insert_with(shape),
             None => *self.other.entry(c).or_insert_with(shape),
@@ -76,16 +111,33 @@ impl CharWidths {
     }
 
     /// Remplit `cumulative` : la largeur du texte avant chaque frontière de caractère de `line` (et à sa fin).
-    fn cumulate(&mut self, line: &str, cumulative: &mut Vec<Pixels>) {
+    fn cumulate(&mut self, line: &str, cumulative: &mut Vec<f64>) -> Cumulated {
+        if !self.monospace {
+            return Cumulated::Proportional;
+        }
         cumulative.clear();
-        cumulative.resize(line.len() + 1, px(0.));
-        let mut total = px(0.);
+        cumulative.resize(line.len() + 1, 0.);
+        let mut total = 0.;
+        let mut fallback = false;
         for (ix, c) in line.char_indices() {
             cumulative[ix] = total;
-            total += self.width(c);
+            let width = self.width(c);
+            total += width.width;
+            fallback |= !width.in_font;
         }
         cumulative[line.len()] = total;
+        if fallback {
+            Cumulated::WithFallback
+        } else {
+            Cumulated::InFont
+        }
     }
+}
+
+/// IdemA : la somme des largeurs par caractère vaut-elle la largeur de la ligne façonnée d'un bloc ? La tolérance suit
+/// la précision d'un `f32` sur une longue ligne.
+fn sums_match(sum: f64, shaped: Pixels) -> bool {
+    (sum - f64::from(f32::from(shaped))).abs() <= 0.01 + sum * 1e-6
 }
 
 /// Choose Unicode line-break opportunities using the same shaped widths as
@@ -472,39 +524,50 @@ impl TextWrapper {
                     offset = range.end;
                 }
                 if fragments.is_empty() {
-                    // IdemA : une ligne simple se mesure par sommes cumulées, sans façonner chaque préfixe sondé ;
-                    // les coupures sont les mêmes, à une fraction du coût.
+                    let shaped_width = |text: &str| {
+                        text_system
+                            .layout_line(
+                                text,
+                                font_size,
+                                &[gpui::TextRun {
+                                    len: text.len(),
+                                    font: font.clone(),
+                                    color: gpui::black(),
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                }],
+                                None,
+                            )
+                            .width
+                    };
+                    // IdemA : une ligne simple en police monospace se mesure par sommes cumulées, sans façonner chaque
+                    // préfixe sondé ; si une police de secours y prend part, seulement quand la ligne façonnée d'un bloc
+                    // a la largeur des sommes.
                     if line_str.chars().all(is_simple_char) {
-                        char_widths.cumulate(line_str, &mut cumulative);
-                        return measured_wrap_boundaries(
-                            line_str,
-                            wrap_width,
-                            wrapping_indent,
-                            |range| cumulative[range.end] - cumulative[range.start],
-                        );
+                        let fast = match char_widths.cumulate(line_str, &mut cumulative) {
+                            Cumulated::Proportional => false,
+                            Cumulated::InFont => true,
+                            Cumulated::WithFallback => {
+                                sums_match(cumulative[line_str.len()], shaped_width(line_str))
+                            }
+                        };
+                        if fast {
+                            return measured_wrap_boundaries(
+                                line_str,
+                                wrap_width,
+                                wrapping_indent,
+                                |range| {
+                                    px((cumulative[range.end] - cumulative[range.start]) as f32)
+                                },
+                            );
+                        }
                     }
                     return measured_wrap_boundaries(
                         line_str,
                         wrap_width,
                         wrapping_indent,
-                        |range| {
-                            let text = &line_str[range];
-                            text_system
-                                .layout_line(
-                                    text,
-                                    font_size,
-                                    &[gpui::TextRun {
-                                        len: text.len(),
-                                        font: font.clone(),
-                                        color: gpui::black(),
-                                        background_color: None,
-                                        underline: None,
-                                        strikethrough: None,
-                                    }],
-                                    None,
-                                )
-                                .width
-                        },
+                        |range| shaped_width(&line_str[range]),
                     );
                 }
                 if offset < line_str.len() {
