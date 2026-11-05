@@ -33,3 +33,5 @@ chrono.workspace = true
 objc2-web-kit.workspace = true
 block2.workspace = true
 raw-window-handle.workspace = true
+tokio.workspace = true
+axum.workspace = true

@@ -1140,6 +1140,16 @@ impl PaneView {
         self.activity.at_prompt()
     }
 
+    /// Une saisie venue du compagnon (sonde 2) : le chemin d'une frappe de l'utilisateur, donc la même règle de lecture
+    /// seule. Faux : rien n'est parti.
+    pub fn send_remote_input(&mut self, bytes: &[u8]) -> bool {
+        if !input_reaches_program(self.read_only) {
+            return false;
+        }
+        self.send_user_input(bytes);
+        true
+    }
+
     /// Les programmes encore en cours au premier plan, pour confirmer une fermeture.
     pub fn running_programs(&self) -> Vec<String> {
         running_programs_of(

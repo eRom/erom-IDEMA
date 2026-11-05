@@ -7,6 +7,7 @@ mod browser;
 mod changes;
 mod column;
 mod commit_message;
+mod companion;
 mod config;
 mod dock;
 mod errors;
