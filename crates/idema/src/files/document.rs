@@ -86,7 +86,7 @@ pub fn read_document(path: &Path) -> io::Result<Opened> {
 }
 
 /// `Crlf` quand les fins de ligne `\r\n` l'emportent sur les `\n` nus ; un fichier sans fin de ligne reste `Lf`.
-fn detect_line_ending(raw: &str) -> LineEnding {
+pub(crate) fn detect_line_ending(raw: &str) -> LineEnding {
     let crlf = raw.matches("\r\n").count();
     let lf_only = raw.matches('\n').count() - crlf;
     if crlf > lf_only {
@@ -238,7 +238,7 @@ fn save_checked(
 
 /// Un fichier existant que l'utilisateur ne peut pas ouvrir en écriture n'est pas réécrit : le `rename` d'un
 /// temporaire ne s'en soucierait pas, la sauvegarde atomique contournerait le refus. L'ouverture ne tronque rien.
-fn refuse_read_only(target: &Path) -> io::Result<()> {
+pub(crate) fn refuse_read_only(target: &Path) -> io::Result<()> {
     match OpenOptions::new().write(true).open(target) {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Err(error),
         _ => Ok(()),

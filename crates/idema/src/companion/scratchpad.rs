@@ -1,10 +1,11 @@
 //! Le Scratchpad vu du téléphone : lire `scratchpad.md` et y ajouter une ligne. Le volet du Mac relit le disque et le
 //! disque gagne (`scratchpad/store.rs`) : on n'a donc rien à lui signaler.
 
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
+use crate::files::document::{self, LineEnding, MAX_EDITABLE_BYTES};
 use crate::settings::toml_write;
 
 /// La plus longue ligne admise, en octets (spec §3.9).
@@ -31,14 +32,42 @@ impl AppendError {
     }
 }
 
-/// Le texte de la note. Une note absente se lit vide (le Mac la crée au premier ajout) ; un octet qui n'est pas de
-/// l'UTF-8 s'affiche en U+FFFD plutôt que de rendre la note illisible.
-pub fn read(path: &Path) -> io::Result<String> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error),
+/// Les octets de la note, `None` si elle n'existe pas. Un tube, un périphérique ou un dossier est refusé avant toute
+/// ouverture (ouvrir un tube attend un écrivain, donc bloquerait le fil), et une note de plus de 5 Mo (la borne de
+/// l'éditeur du Mac) n'est pas chargée : `FileTooLarge`.
+fn read_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the note is not a regular file",
+        ));
     }
+    if meta.len() > MAX_EDITABLE_BYTES {
+        return Err(io::ErrorKind::FileTooLarge.into());
+    }
+    // La note a pu grossir entre la mesure et la lecture : la lecture se borne elle-même.
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_EDITABLE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_EDITABLE_BYTES {
+        return Err(io::ErrorKind::FileTooLarge.into());
+    }
+    Ok(Some(bytes))
+}
+
+/// Le texte de la note. Une note absente se lit vide (le Mac la crée au premier ajout) ; un octet qui n'est pas de
+/// l'UTF-8 s'affiche en U+FFFD plutôt que de rendre la note illisible. Une note de plus de 5 Mo rend
+/// `ErrorKind::FileTooLarge`, un fichier qui n'est pas ordinaire (tube, dossier) `InvalidInput`.
+pub fn read(path: &Path) -> io::Result<String> {
+    Ok(read_bytes(path)?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default())
 }
 
 /// La date de dernière modification de la note (lien suivi), en millisecondes depuis l'époque Unix ; `None` si elle
@@ -52,9 +81,13 @@ pub fn modified_millis(path: &Path) -> Option<u64> {
 /// ajouts du téléphone qui s'entrecroisent perdraient une ligne.
 static APPEND_LOCK: Mutex<()> = Mutex::new(());
 
-/// Ajoute `line` à la fin de la note : un saut de ligne avant si la note n'en finit pas par un, la fin de ligne du
-/// fichier (CRLF si sa première ligne en porte un, LF sinon), puis écriture atomique sur la cible réelle (un lien
-/// symbolique est suivi, comme pour `config.toml`), qui garde les droits du fichier.
+/// Ajoute `line` à la fin de la note : un saut de ligne avant si la note n'en finit pas par un, la fin de ligne
+/// majoritaire du fichier (règle du Mac, `document::detect_line_ending`), puis écriture atomique sur la cible réelle
+/// (un lien symbolique est suivi, comme pour `config.toml`), qui garde les droits du fichier.
+///
+/// Refusés en `Io`, sans rien écrire, ce que l'éditeur du Mac refuse aussi : un lien dont la cible manque (l'écriture
+/// atomique remplacerait le lien par un fichier), une note en lecture seule, un fichier qui n'est pas ordinaire, une
+/// note qui dépasserait 5 Mo, une note qui n'est pas de l'UTF-8.
 pub fn append_line(path: &Path, line: &str) -> Result<(), AppendError> {
     if line.is_empty() {
         return Err(AppendError::Empty);
@@ -66,24 +99,37 @@ pub fn append_line(path: &Path, line: &str) -> Result<(), AppendError> {
         return Err(AppendError::ControlChar);
     }
     let _guard = APPEND_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut text = match std::fs::read(&target) {
-        Ok(bytes) => String::from_utf8(bytes)
+    let io_error = |error: io::Error| AppendError::Io(error.to_string());
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        // Un lien dont la cible manque : écrire au chemin du lien le remplacerait par un fichier ordinaire, et la note
+        // divergerait des dotfiles quand la cible reviendra.
+        Err(_) if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) => {
+            return Err(AppendError::Io("the note is a dangling symlink".into()));
+        }
+        Err(_) => path.to_path_buf(),
+    };
+    let mut text = match read_bytes(&target).map_err(io_error)? {
+        Some(bytes) => String::from_utf8(bytes)
             .map_err(|_| AppendError::Io("the note is not valid UTF-8".into()))?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(AppendError::Io(error.to_string())),
+        None => String::new(),
     };
-    let eol = if text.find('\n').is_some_and(|at| text[..at].ends_with('\r')) {
-        "\r\n"
-    } else {
-        "\n"
+    document::refuse_read_only(&target).map_err(io_error)?;
+    let eol = match document::detect_line_ending(&text) {
+        LineEnding::Crlf => "\r\n",
+        LineEnding::Lf => "\n",
     };
-    if !text.is_empty() && !text.ends_with('\n') {
+    let needs_break = !text.is_empty() && !text.ends_with('\n');
+    let added = line.len() + eol.len() * (1 + usize::from(needs_break));
+    if (text.len() + added) as u64 > MAX_EDITABLE_BYTES {
+        return Err(io_error(io::ErrorKind::FileTooLarge.into()));
+    }
+    if needs_break {
         text.push_str(eol);
     }
     text.push_str(line);
     text.push_str(eol);
-    toml_write::write_atomically(&target, &text).map_err(|error| AppendError::Io(error.to_string()))
+    toml_write::write_atomically(&target, &text).map_err(io_error)
 }
 
 #[cfg(test)]
@@ -232,5 +278,106 @@ mod tests {
         for index in 0..8 {
             assert!(text.contains(&format!("line {index}\n")), "{text:?}");
         }
+    }
+
+    #[test]
+    fn append_never_replaces_a_dangling_symlink() {
+        let dir = TempDir::new("scratchpad");
+        let missing = dir.0.join("dotfiles").join("notes.md");
+        let link = dir.0.join("scratchpad.md");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+        assert!(matches!(
+            append_line(&link, "lost"),
+            Err(AppendError::Io(_))
+        ));
+
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_eq!(
+            fs::read_dir(&dir.0).unwrap().count(),
+            1,
+            "no temporary left"
+        );
+    }
+
+    #[test]
+    fn append_refuses_a_read_only_note() {
+        let dir = TempDir::new("scratchpad");
+        let path = note(&dir, "locked\n");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(matches!(
+            append_line(&path, "more"),
+            Err(AppendError::Io(_))
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "locked\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    #[test]
+    fn append_follows_the_majority_line_ending_like_the_mac() {
+        let dir = TempDir::new("scratchpad");
+        let path = note(&dir, "a\r\nb\r\nc\n");
+        append_line(&path, "d").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\r\nb\r\nc\nd\r\n");
+        // Un seul CRLF contre deux LF nus : la majorité est LF, comme `document.rs`.
+        let path = note(&dir, "a\nb\nc\r\n");
+        append_line(&path, "d").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\nb\nc\r\nd\n");
+        // Égalité : LF.
+        let path = note(&dir, "a\r\nb\n");
+        append_line(&path, "c").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\r\nb\nc\n");
+    }
+
+    #[test]
+    fn append_refuses_to_grow_a_note_past_the_editable_size() {
+        let dir = TempDir::new("scratchpad");
+        let limit = usize::try_from(MAX_EDITABLE_BYTES).unwrap();
+        let path = dir.0.join("scratchpad.md");
+        fs::write(&path, vec![b'a'; limit]).unwrap();
+        assert!(matches!(append_line(&path, "x"), Err(AppendError::Io(_))));
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_EDITABLE_BYTES);
+        // Pile à la borne (3 octets : la ligne et son saut) : accepté.
+        let mut text = vec![b'a'; limit - 4];
+        text.push(b'\n');
+        fs::write(&path, text).unwrap();
+        append_line(&path, "xy").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_EDITABLE_BYTES);
+    }
+
+    #[test]
+    fn read_refuses_a_note_past_the_editable_size() {
+        let dir = TempDir::new("scratchpad");
+        let path = dir.0.join("scratchpad.md");
+        let limit = usize::try_from(MAX_EDITABLE_BYTES).unwrap();
+        fs::write(&path, vec![b'a'; limit]).unwrap();
+        assert_eq!(read(&path).unwrap().len(), limit);
+        fs::write(&path, vec![b'a'; limit + 1]).unwrap();
+        assert_eq!(read(&path).unwrap_err().kind(), io::ErrorKind::FileTooLarge);
+    }
+
+    /// Un tube comme note : ni la lecture ni l'ajout ne s'y bloquent (l'ouverture d'un tube attend un écrivain).
+    #[test]
+    fn a_fifo_note_is_refused_without_blocking() {
+        let dir = TempDir::new("scratchpad");
+        let path = dir.0.join("scratchpad.md");
+        let made = std::process::Command::new("mkfifo").arg(&path).status();
+        assert!(made.unwrap().success());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let read_failed = read(&probe).is_err();
+            let append_failed = matches!(append_line(&probe, "x"), Err(AppendError::Io(_)));
+            let _ = sender.send((read_failed, append_failed));
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("a FIFO note must not block");
+        assert_eq!(outcome, (true, true));
     }
 }

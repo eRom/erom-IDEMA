@@ -674,6 +674,9 @@ async fn scratchpad_read(State(state): State<AppState>) -> Response {
             StatusCode::OK,
             serde_json::json!({ "text": text, "modified_at": modified_at }).to_string(),
         ),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::FileTooLarge => {
+            error_reply(StatusCode::PAYLOAD_TOO_LARGE, "scratchpad_too_large")
+        }
         _ => error_reply(StatusCode::INTERNAL_SERVER_ERROR, "scratchpad_unreadable"),
     }
 }
@@ -2534,5 +2537,42 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "linked\nmore\n");
         let read = service.request("GET", SCRATCHPAD, &[("Cookie", &phone)], None);
         assert_eq!(read.json()["text"], "linked\nmore\n");
+    }
+
+    #[test]
+    fn the_scratchpad_refuses_what_the_mac_editor_would_refuse() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+
+        // Une note de plus de 5 Mo : 413 en lecture, 500 à l'ajout, rien n'est chargé ni écrit.
+        let big = vec![b'a'; 5 * 1024 * 1024 + 1];
+        std::fs::write(&note, &big).unwrap();
+        let read = service.request("GET", SCRATCHPAD, &[("Cookie", &phone)], None);
+        assert_eq!(read.status, 413, "{}", read.text());
+        assert_eq!(read.json()["error"], "scratchpad_too_large");
+        let refused = append(&service, &phone, r#"{"line":"more"}"#);
+        assert_eq!(refused.status, 500);
+        assert_eq!(refused.json()["error"], "scratchpad_unwritable");
+        assert_eq!(std::fs::read(&note).unwrap(), big);
+        std::fs::remove_file(&note).unwrap();
+
+        // Un lien dont la cible manque : le lien reste, rien n'est créé.
+        let missing = service.home.0.join("dotfiles-missing.md");
+        std::os::unix::fs::symlink(&missing, &note).unwrap();
+        let refused = append(&service, &phone, r#"{"line":"more"}"#);
+        assert_eq!(refused.status, 500);
+        assert_eq!(refused.json()["error"], "scratchpad_unwritable");
+        assert_eq!(std::fs::read_link(&note).unwrap(), missing);
+        assert!(!missing.exists());
+        std::fs::remove_file(&note).unwrap();
+
+        // Une note en lecture seule.
+        std::fs::write(&note, "locked\n").unwrap();
+        std::fs::set_permissions(&note, std::os::unix::fs::PermissionsExt::from_mode(0o444))
+            .unwrap();
+        let refused = append(&service, &phone, r#"{"line":"more"}"#);
+        assert_eq!(refused.status, 500);
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "locked\n");
     }
 }
