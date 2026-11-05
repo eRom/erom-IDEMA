@@ -17,6 +17,7 @@ use super::fleet::Fleet;
 use super::input::RecentCommands;
 use super::push_send::{OVERRIDE_VAR, override_endpoint};
 use super::service::{self, ServiceDeps, ServiceHandle};
+use super::tailscale;
 use super::timeline::Timeline;
 use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
@@ -130,6 +131,7 @@ impl CompanionController {
                 std::env::var_os("IDEMA_HOME").as_deref(),
                 std::env::var_os("IDEMA_COMPANION_TEST_ROUTES").as_deref(),
             ),
+            detector: tailscale::system_detector(),
             push_override: override_endpoint(
                 std::env::var(OVERRIDE_VAR).ok().as_deref(),
                 std::env::var("IDEMA_HOME").ok().as_deref(),

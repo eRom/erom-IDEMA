@@ -161,7 +161,8 @@ impl Access {
             | ServiceEvent::Presence { .. }
             | ServiceEvent::EpisodeOpened { .. }
             | ServiceEvent::EpisodeClosed { .. }
-            | ServiceEvent::ConfigChanged(_) => {}
+            | ServiceEvent::ConfigChanged(_)
+            | ServiceEvent::RecheckTailnet => {}
         }
     }
 

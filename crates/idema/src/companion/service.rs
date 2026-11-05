@@ -12,7 +12,7 @@ use std::time::Duration;
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::{Either, select};
 use idema_tmux::server::TmuxServer;
-use tokio::sync::{mpsc::UnboundedReceiver, watch};
+use tokio::sync::{Notify, mpsc::UnboundedReceiver, watch};
 
 use super::access::Access;
 use super::devices::DeviceStore;
@@ -21,6 +21,7 @@ use super::fleet::Fleet;
 use super::notify::{self, Message, Notifier};
 use super::push_send::{PushSender, override_host};
 use super::server::{AppState, router, stopped};
+use super::tailscale::{Detector, TailnetState};
 use super::timeline::Timeline;
 use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
@@ -62,6 +63,8 @@ pub struct ServiceDeps {
     /// L'adresse qui remplace celle de chaque abonnement à l'envoi, décidée par le contrôleur
     /// (`push_send::override_endpoint`) : toujours `None` hors instance d'acceptation.
     pub push_override: Option<String>,
+    /// La détection de l'adresse tailnet (`tailscale::system_detector`) ; un test y met une réponse à lui.
+    pub detector: Detector,
 }
 
 /// La poignée que garde le contrôleur : de quoi demander l'arrêt, puis joindre le fil.
@@ -118,7 +121,8 @@ enum Served {
 struct Serving {
     port: u16,
     version: &'static str,
-    known_origin: Option<String>,
+    public_url: Option<String>,
+    detector: Detector,
     policy: Policy,
     test_routes: bool,
     push: Option<Arc<PushSender>>,
@@ -147,6 +151,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         previous,
         test_routes,
         push_override,
+        detector,
         ..
     } = deps;
     let status = Arc::new(status);
@@ -203,7 +208,8 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         port,
         version,
         policy: notify::policy_of(&config),
-        known_origin: config.public_url,
+        public_url: config.public_url,
+        detector,
         test_routes,
         push,
         push_override,
@@ -218,7 +224,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         commands,
         scratchpad,
     };
-    let served = runtime.block_on(serve(serving, &status, access, events, stop));
+    let served = runtime.block_on(serve(serving, Arc::clone(&status), access, events, stop));
     // Le runtime est abandonné ici : ses tâches restantes (flux en retard, appel bloquant) ne retiennent plus le fil.
     runtime.shutdown_timeout(RUNTIME_STOP_TIMEOUT);
     match served {
@@ -232,7 +238,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
 /// Lie la prise et sert jusqu'au signal d'arrêt.
 async fn serve(
     serving: Serving,
-    status: &watch::Sender<ServiceStatus>,
+    status: Arc<watch::Sender<ServiceStatus>>,
     access: Arc<Access>,
     events: UnboundedReceiver<ServiceEvent>,
     stop: watch::Receiver<bool>,
@@ -240,7 +246,8 @@ async fn serve(
     let Serving {
         port,
         version,
-        known_origin,
+        public_url,
+        detector,
         policy,
         test_routes,
         push,
@@ -257,7 +264,7 @@ async fn serve(
         Ok(listener) => listener,
         Err(error) => {
             let (token, detail) = bind_reason(&error);
-            fail(status, port, token, detail);
+            fail(&status, port, token, detail);
             return Served::NeverListened;
         }
     };
@@ -284,11 +291,26 @@ async fn serve(
     });
     tokio::spawn(notify::run(notifier, notifications, policy));
     // Les gestes de Personnaliser (code, oubli) et l'échéance du code : une tâche du runtime, qui s'arrête avec lui.
-    let known_origin = Arc::new(Mutex::new(known_origin));
+    let known_origin = Arc::new(Mutex::new(None));
+    let origins = Arc::new(Mutex::new(KnownOrigins::new(
+        public_url,
+        Arc::clone(&known_origin),
+    )));
+    // L'adresse tailnet : une première détection au démarrage, une de plus à chaque demande.
+    let recheck = Arc::new(Notify::new());
+    recheck.notify_one();
+    tokio::spawn(tailnet_loop(
+        Arc::clone(&recheck),
+        detector,
+        port,
+        Arc::clone(&status),
+        Arc::clone(&origins),
+    ));
     tokio::spawn(control_loop(
         events,
         Arc::clone(&access),
-        Arc::clone(&known_origin),
+        origins,
+        recheck,
         inbox.clone(),
     ));
     let state = AppState {
@@ -338,13 +360,15 @@ async fn serve(
 }
 
 /// Distribue les événements de l'espace de travail : les gestes de Personnaliser vont à l'état d'accès, les épisodes, la
-/// présence et la config à la boucle des notifications (la config met aussi à jour l'origine admise en écriture) ; fait
-/// disparaître le code d'appairage à son échéance. S'arrête quand l'espace de travail ferme la file (service retiré).
-/// Sans code en cours, la tâche dort sur la file : aucune minuterie.
+/// présence et la config à la boucle des notifications (la config met aussi à jour l'origine admise en écriture, et
+/// relance la détection si le `public_url` a changé) ; fait disparaître le code d'appairage à son échéance. S'arrête
+/// quand l'espace de travail ferme la file (service retiré). Sans code en cours, la tâche dort sur la file : aucune
+/// minuterie.
 async fn control_loop(
     mut events: UnboundedReceiver<ServiceEvent>,
     access: Arc<Access>,
-    known_origin: Arc<Mutex<Option<String>>>,
+    origins: Arc<Mutex<KnownOrigins>>,
+    recheck: Arc<Notify>,
     notifications: tokio::sync::mpsc::UnboundedSender<Message>,
 ) {
     loop {
@@ -377,14 +401,107 @@ async fn control_loop(
                 let _ = tokio::task::spawn_blocking(move || access.handle(event)).await;
             }
             ServiceEvent::ConfigChanged(config) => {
-                *known_origin.lock().unwrap_or_else(PoisonError::into_inner) =
-                    config.public_url.clone();
+                let changed = origins
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .set_public_url(config.public_url.clone());
+                if changed {
+                    // Le `public_url` sert de repli à la détection : son résultat peut changer.
+                    recheck.notify_one();
+                }
                 let _ = notifications.send(Message::Event(ServiceEvent::ConfigChanged(config)));
             }
+            ServiceEvent::RecheckTailnet => recheck.notify_one(),
             event => {
                 let _ = notifications.send(Message::Event(event));
             }
         }
+    }
+}
+
+/// D'où vient l'origine admise en écriture (`auth::origin_allowed`) : le `public_url` de la config, sinon l'adresse
+/// que la détection a trouvée ; ni l'un ni l'autre, et la garde admet toute origine `*.ts.net`. Le résultat est ce que
+/// lit la garde (`AppState::known_origin`).
+struct KnownOrigins {
+    public_url: Option<String>,
+    detected: Option<String>,
+    admitted: Arc<Mutex<Option<String>>>,
+}
+
+/// L'origine connue : l'adresse choisie par Romain prime sur celle que la détection a vue.
+fn admitted_origin(public_url: Option<&str>, detected: Option<&str>) -> Option<String> {
+    public_url.or(detected).map(str::to_owned)
+}
+
+impl KnownOrigins {
+    fn new(public_url: Option<String>, admitted: Arc<Mutex<Option<String>>>) -> Self {
+        let origins = Self {
+            public_url,
+            detected: None,
+            admitted,
+        };
+        origins.publish();
+        origins
+    }
+
+    /// Rend vrai si le `public_url` a changé.
+    fn set_public_url(&mut self, public_url: Option<String>) -> bool {
+        let changed = self.public_url != public_url;
+        self.public_url = public_url;
+        self.publish();
+        changed
+    }
+
+    fn set_detected(&mut self, detected: Option<String>) {
+        self.detected = detected;
+        self.publish();
+    }
+
+    fn publish(&self) {
+        *self.admitted.lock().unwrap_or_else(PoisonError::into_inner) =
+            admitted_origin(self.public_url.as_deref(), self.detected.as_deref());
+    }
+}
+
+/// Détecte l'adresse tailnet à chaque réveil de `recheck` et publie le résultat. `Notify` garde une demande arrivée
+/// pendant une détection : elles se fondent en une seule, et aucune ne se perd. La commande bloque (jusqu'à 5 s si le
+/// démon est arrêté) : elle tourne hors du runtime.
+async fn tailnet_loop(
+    recheck: Arc<Notify>,
+    detector: Detector,
+    port: u16,
+    status: Arc<watch::Sender<ServiceStatus>>,
+    origins: Arc<Mutex<KnownOrigins>>,
+) {
+    loop {
+        recheck.notified().await;
+        let public_url = origins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .public_url
+            .clone();
+        let detector = Arc::clone(&detector);
+        let state = match tokio::task::spawn_blocking(move || detector(port, public_url.as_deref()))
+            .await
+        {
+            Ok(state) => state,
+            Err(_) => TailnetState::Unknown("detection_failed".into()),
+        };
+        let detected = match &state {
+            TailnetState::Exposed(endpoint) => Some(endpoint.url.clone()),
+            _ => None,
+        };
+        origins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_detected(detected);
+        status.send_if_modified(|status| {
+            let changed = status.tailnet.as_ref() != Some(&state);
+            if changed {
+                status.tailnet = Some(state);
+            }
+            changed
+        });
     }
 }
 
@@ -628,5 +745,209 @@ mod tests {
         let (_stream, head) = get(port, "/idema-api/health", "");
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         second.stop().join().unwrap();
+    }
+
+    // La détection de l'adresse tailnet et l'origine qu'elle fait admettre.
+
+    use crate::companion::tailscale::TailnetEndpoint;
+    use crate::companion::test_support::request;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const DETECTED: &str = "https://forge.example.ts.net:8455";
+    const CONFIGURED: &str = "https://mac.example.ts.net:8443";
+    const OTHER: &str = "https://other.example.ts.net";
+
+    fn exposed(url: &str) -> TailnetState {
+        TailnetState::Exposed(TailnetEndpoint {
+            url: url.into(),
+            funnel: false,
+        })
+    }
+
+    fn not_exposed() -> TailnetState {
+        TailnetState::NotExposed {
+            command: "tailscale serve --bg --https=8455 localhost:1".into(),
+        }
+    }
+
+    /// Attend que `done` soit vraie, 5 s au plus.
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Le statut `tailnet` que le service publie, une fois `done` vraie.
+    fn wait_tailnet(
+        status: &watch::Receiver<ServiceStatus>,
+        what: &str,
+        done: impl Fn(&Option<TailnetState>) -> bool,
+    ) {
+        wait_until(what, || done(&status.borrow().tailnet));
+    }
+
+    /// Le code HTTP d'une écriture authentifiée qui présente cette origine.
+    fn write_from(port: u16, cookie: &str, origin: &str) -> u16 {
+        request(
+            port,
+            "POST",
+            "/idema-api/client-metrics",
+            &[
+                ("Cookie", cookie),
+                ("Content-Type", "application/json"),
+                ("Origin", origin),
+            ],
+            Some(r#"{"name":"shell_ready","ms":120}"#),
+        )
+        .status
+    }
+
+    /// Une origine admise rend 204, une origine refusée 403.
+    fn admits(port: u16, cookie: &str, origin: &str) -> bool {
+        match write_from(port, cookie, origin) {
+            204 => true,
+            403 => false,
+            other => panic!("{origin}: unexpected status {other}"),
+        }
+    }
+
+    #[test]
+    fn the_start_detection_publishes_the_tailnet_state() {
+        let port = free_port();
+        let home = TempDir::new("tailnet-start");
+        let (mut service_deps, _events, status, _fleet) =
+            deps_in(port, home.0.clone(), None, false);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        service_deps.detector = Arc::new(move |asked_port, configured| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((asked_port, configured.map(str::to_owned)));
+            exposed(DETECTED)
+        });
+        assert_eq!(status.borrow().tailnet, None, "nothing before the start");
+        let handle = start(service_deps).expect("the service thread spawns");
+        wait_tailnet(&status, "the first detection", |tailnet| {
+            *tailnet == Some(exposed(DETECTED))
+        });
+        // Le port demandé est celui du service, et la config n'avait pas de `public_url`.
+        assert_eq!(*seen.lock().unwrap(), vec![(port, None)]);
+        handle.stop().join().unwrap();
+    }
+
+    #[test]
+    fn a_detected_address_narrows_the_origin_and_a_public_url_wins() {
+        let port = free_port();
+        let home = TempDir::new("tailnet-origin");
+        let (mut service_deps, events, status, _fleet) = deps_in(port, home.0.clone(), None, true);
+        let configured_seen = Arc::new(Mutex::new(None));
+        let recorder = Arc::clone(&configured_seen);
+        service_deps.detector = Arc::new(move |_, configured| {
+            *recorder.lock().unwrap() = configured.map(str::to_owned);
+            exposed(DETECTED)
+        });
+        let handle = start(service_deps).expect("the service thread spawns");
+        wait_tailnet(&status, "the detection", |tailnet| tailnet.is_some());
+        let cookie = pair_device(port, "iPhone");
+
+        // L'adresse détectée est la seule origine tailnet admise : le joker `*.ts.net` ne joue plus.
+        assert!(admits(port, &cookie, DETECTED));
+        assert!(!admits(port, &cookie, OTHER));
+
+        // Le `public_url` de la config prime sur la détection, et relance celle-ci avec lui en repli.
+        let config: CompanionConfig =
+            toml::from_str(&format!("port = {port}\npublic_url = \"{CONFIGURED}\"")).unwrap();
+        events.send(ServiceEvent::ConfigChanged(config)).unwrap();
+        wait_until("the configured origin", || {
+            admits(port, &cookie, CONFIGURED)
+        });
+        assert!(!admits(port, &cookie, DETECTED));
+        assert!(!admits(port, &cookie, OTHER));
+        wait_until("the detection to see the public_url", || {
+            configured_seen.lock().unwrap().as_deref() == Some(CONFIGURED)
+        });
+        handle.stop().join().unwrap();
+    }
+
+    #[test]
+    fn nothing_known_keeps_the_ts_net_wildcard_until_a_recheck_finds_the_address() {
+        let port = free_port();
+        let home = TempDir::new("tailnet-recheck");
+        let (mut service_deps, events, status, _fleet) = deps_in(port, home.0.clone(), None, true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        service_deps.detector = Arc::new(move |_, _| {
+            // La première détection ne trouve rien ; Romain lance ensuite `tailscale serve`, puis « Vérifier ».
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                not_exposed()
+            } else {
+                exposed(DETECTED)
+            }
+        });
+        let handle = start(service_deps).expect("the service thread spawns");
+        wait_tailnet(&status, "the first detection", |tailnet| {
+            *tailnet == Some(not_exposed())
+        });
+        let cookie = pair_device(port, "iPhone");
+        assert!(admits(port, &cookie, OTHER), "the wildcard applies");
+
+        events.send(ServiceEvent::RecheckTailnet).unwrap();
+        wait_tailnet(&status, "the recheck", |tailnet| {
+            *tailnet == Some(exposed(DETECTED))
+        });
+        assert!(admits(port, &cookie, DETECTED));
+        assert!(
+            !admits(port, &cookie, OTHER),
+            "the wildcard no longer applies"
+        );
+        handle.stop().join().unwrap();
+    }
+
+    #[test]
+    fn a_slow_detection_blocks_nothing_and_requests_during_it_fold_into_one() {
+        let port = free_port();
+        let home = TempDir::new("tailnet-slow");
+        let (mut service_deps, events, status, _fleet) = deps_in(port, home.0.clone(), None, false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let (counter, gate) = (Arc::clone(&calls), Arc::clone(&release));
+        service_deps.detector = Arc::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            while !gate.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            exposed(DETECTED)
+        });
+        let handle = start(service_deps).expect("the service thread spawns");
+        wait_until("the first detection to start", || {
+            calls.load(Ordering::SeqCst) == 1
+        });
+
+        // La détection bloque son fil, pas le service.
+        let (_stream, head) = get(port, "/idema-api/health", "");
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        for _ in 0..5 {
+            events.send(ServiceEvent::RecheckTailnet).unwrap();
+        }
+        release.store(true, Ordering::SeqCst);
+        wait_tailnet(&status, "the detection", |tailnet| tailnet.is_some());
+        // Les cinq demandes faites pendant la première détection ne font qu'une détection de plus.
+        wait_until("the folded recheck", || calls.load(Ordering::SeqCst) == 2);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        handle.stop().join().unwrap();
+    }
+
+    #[test]
+    fn the_configured_address_beats_the_detected_one() {
+        assert_eq!(
+            admitted_origin(Some(CONFIGURED), Some(DETECTED)),
+            Some(CONFIGURED.into())
+        );
+        assert_eq!(admitted_origin(None, Some(DETECTED)), Some(DETECTED.into()));
+        assert_eq!(admitted_origin(None, None), None);
     }
 }

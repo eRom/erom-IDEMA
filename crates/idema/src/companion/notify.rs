@@ -134,10 +134,11 @@ fn apply(message: Message, episodes: &mut Episodes, notifier: &Notifier) {
             ServiceEvent::PhoneInteraction { session } => episodes.phone_interaction(&session),
             ServiceEvent::Presence { away } => episodes.set_away(away),
             ServiceEvent::ConfigChanged(config) => episodes.set_policy(policy_of(&config)),
-            // Les gestes de Personnaliser regardent l'accès, pas les épisodes.
+            // Les gestes de Personnaliser regardent l'accès et la détection, pas les épisodes.
             ServiceEvent::StartPairing
             | ServiceEvent::CancelPairing
-            | ServiceEvent::ForgetDevice { .. } => {}
+            | ServiceEvent::ForgetDevice { .. }
+            | ServiceEvent::RecheckTailnet => {}
         },
         Message::Watch {
             device,

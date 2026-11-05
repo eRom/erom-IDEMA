@@ -19,6 +19,7 @@ pub mod screen;
 mod server;
 pub mod service;
 mod sse;
+pub mod tailscale;
 #[cfg(test)]
 mod test_support;
 mod timeline;
@@ -33,6 +34,7 @@ use crate::config::CompanionConfig;
 pub use controller::CompanionController;
 use episodes::EpisodeKind;
 use input::RemoteInput;
+use tailscale::TailnetState;
 
 /// Ce que le service dit de lui à l'espace de travail (et, plus tard, à Personnaliser).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -42,6 +44,8 @@ pub struct ServiceStatus {
     pub pairing: Option<PairingDisplay>,
     /// Les appareils appairés, du plus ancien au plus récent.
     pub devices: Vec<DeviceSummary>,
+    /// L'adresse tailnet du service. `None` tant que la première détection n'a pas rendu sa réponse.
+    pub tailnet: Option<TailnetState>,
 }
 
 /// Où en est la prise du service.
@@ -106,6 +110,10 @@ pub enum ServiceEvent {
     /// La section `[companion]` a changé sans changer de port : le service suit sans redémarrer (les flux restent
     /// ouverts). Un changement de port, lui, redémarre le service.
     ConfigChanged(CompanionConfig),
+    /// Relancer la détection de l'adresse tailnet (le bouton « Vérifier » de Personnaliser). Plusieurs demandes
+    /// rapprochées ne font qu'une détection de plus.
+    #[allow(dead_code, reason = "émis par Personnaliser (tâche 11)")]
+    RecheckTailnet,
 }
 
 /// Ce que le service demande au fil d'interface : une commande sur un pane, avec sa réponse `oneshot`.

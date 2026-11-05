@@ -48,6 +48,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::fleet::Fleet;
 use super::service::{self, ServiceDeps, ServiceHandle};
+use super::tailscale::TailnetState;
 use super::timeline::Timeline;
 use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
@@ -127,6 +128,8 @@ pub fn deps_in(
         previous,
         test_routes,
         push_override: None,
+        // Jamais le vrai `tailscale` : un test qui veut une adresse pose son propre détecteur.
+        detector: Arc::new(|_, _| TailnetState::Unknown("not_probed".into())),
     };
     (deps, events_sender, status_receiver, fleet_sender)
 }

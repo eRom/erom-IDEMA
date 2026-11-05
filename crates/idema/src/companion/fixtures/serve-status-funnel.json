@@ -1,0 +1,119 @@
+{
+  "TCP": {
+    "443": {
+      "HTTPS": true
+    },
+    "8443": {
+      "HTTPS": true
+    },
+    "8445": {
+      "HTTPS": true
+    },
+    "8446": {
+      "HTTPS": true
+    },
+    "8448": {
+      "HTTPS": true
+    },
+    "8449": {
+      "HTTPS": true
+    },
+    "8450": {
+      "HTTPS": true
+    },
+    "8451": {
+      "HTTPS": true
+    },
+    "8452": {
+      "HTTPS": true
+    },
+    "8454": {
+      "HTTPS": true
+    },
+    "8455": {
+      "HTTPS": true
+    }
+  },
+  "Web": {
+    "forge.example.ts.net:443": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://localhost:7900"
+        }
+      }
+    },
+    "forge.example.ts.net:8443": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://localhost:7979"
+        }
+      }
+    },
+    "forge.example.ts.net:8445": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://localhost:7902"
+        }
+      }
+    },
+    "forge.example.ts.net:8446": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://localhost:7903"
+        }
+      }
+    },
+    "forge.example.ts.net:8448": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://localhost:7905"
+        }
+      }
+    },
+    "forge.example.ts.net:8449": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://localhost:7906"
+        }
+      }
+    },
+    "forge.example.ts.net:8450": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://127.0.0.1:7767"
+        }
+      }
+    },
+    "forge.example.ts.net:8451": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://localhost:7910"
+        }
+      }
+    },
+    "forge.example.ts.net:8452": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://localhost:7908"
+        }
+      }
+    },
+    "forge.example.ts.net:8454": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://localhost:7911"
+        }
+      }
+    },
+    "forge.example.ts.net:8455": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://localhost:3910"
+        }
+      }
+    }
+  },
+  "AllowFunnel": {
+    "forge.example.ts.net:8455": true
+  }
+}
