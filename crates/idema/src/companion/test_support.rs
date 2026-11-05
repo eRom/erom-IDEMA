@@ -570,6 +570,19 @@ impl FakePush {
     /// `reply` : le code et le corps à rendre, ou `None` pour se taire. `watched` : un dossier dont on note le contenu
     /// à chaque requête.
     pub fn start_watching(reply: Option<(u16, String)>, watched: Option<PathBuf>) -> Self {
+        Self::start_inner(reply, watched, Duration::ZERO)
+    }
+
+    /// Répond 201 après `delay` : un envoi qui dure, pour jouer deux appels qui se chevauchent.
+    pub fn start_slow(delay: Duration) -> Self {
+        Self::start_inner(Some((201, String::new())), None, delay)
+    }
+
+    fn start_inner(
+        reply: Option<(u16, String)>,
+        watched: Option<PathBuf>,
+        delay: Duration,
+    ) -> Self {
         use std::sync::atomic::{AtomicBool, Ordering};
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -591,7 +604,14 @@ impl FakePush {
                                 watched.clone(),
                             );
                             std::thread::spawn(move || {
-                                serve_one(stream, &requests, &reply, &stop, watched.as_deref());
+                                serve_one(
+                                    stream,
+                                    &requests,
+                                    &reply,
+                                    &stop,
+                                    watched.as_deref(),
+                                    delay,
+                                );
                             });
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -652,6 +672,7 @@ fn serve_one(
     reply: &Mutex<Option<(u16, String)>>,
     stop: &std::sync::atomic::AtomicBool,
     watched: Option<&std::path::Path>,
+    delay: Duration,
 ) {
     use std::os::unix::fs::PermissionsExt;
     stream.set_nonblocking(false).unwrap();
@@ -713,6 +734,7 @@ fn serve_one(
             watched: listing,
         });
     }
+    std::thread::sleep(delay);
     let answer = reply.lock().unwrap().clone();
     match answer {
         Some((status, text)) => {

@@ -94,13 +94,14 @@ pub fn classify(status: Option<u16>, body: &str) -> Delivery {
 /// `fcm.googleapis.com`, `updates.push.services.mozilla.com`, `*.notify.windows.com` : l'URL est celle que le téléphone
 /// annonce, et c'est vers elle que le Mac enverra, il ne doit pas pouvoir viser une adresse locale.
 pub fn endpoint_allowed(endpoint: &str) -> bool {
-    // Seulement de l'ASCII visible, sans guillemet ni antislash : un point d'accès légitime n'en porte jamais, et ce
-    // qui s'en écarte finirait réécrit par l'analyse de l'URL ou changerait la ligne de configuration de curl.
+    // Seulement de l'ASCII visible, sans guillemet, antislash, crochet ni accolade : un point d'accès légitime n'en
+    // porte jamais, et ce qui s'en écarte finirait réécrit par l'analyse de l'URL, changerait la ligne de configuration
+    // de curl ou y serait lu comme un motif de globbing (`[1-99999]` : cent mille envois d'une notification).
     if endpoint.is_empty()
         || endpoint.len() > ENDPOINT_MAX_LEN
         || !endpoint
             .bytes()
-            .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\\')
+            .all(|byte| byte.is_ascii_graphic() && !b"\"\\[]{}".contains(&byte))
     {
         return false;
     }
@@ -167,10 +168,25 @@ fn target_url(override_url: Option<&str>, endpoint: &str) -> String {
     target
 }
 
-/// La configuration que curl lit sur son entrée standard (`-K -`). Chaque valeur passe par l'échappement du message
+/// Le protocole que curl accepte pour ce message : celui de l'adresse visée, jamais l'autre. Un point d'accès réel
+/// est en `https` (`endpoint_allowed`) ; `http` n'apparaît que sous l'adresse de remplacement d'une instance
+/// d'acceptation.
+fn allowed_protocol(endpoint: &str) -> &'static str {
+    if endpoint.starts_with("http://") {
+        "http"
+    } else {
+        "https"
+    }
+}
+
+/// La configuration que curl lit sur son entrée standard (`-K -`). `globoff` en premier : sans lui curl développe les
+/// `[1-3]` et `{a,b}` d'une URL en autant de transferts. Chaque valeur passe par l'échappement du message
 /// de commit : un guillemet, un antislash ou un saut de ligne dans une URL ou un en-tête n'ouvre aucune directive.
 pub(crate) fn curl_config(message: &PushMessage, body_file: &Path, max_time: u32) -> String {
-    let mut config = String::from("silent\nproto = \"=http,https\"\n");
+    let mut config = format!(
+        "silent\ngloboff\nproto = \"={}\"\n",
+        allowed_protocol(&message.endpoint)
+    );
     config.push_str(&format!("url = \"{}\"\n", escape_value(&message.endpoint)));
     for (name, value) in &message.headers {
         config.push_str(&format!(
@@ -330,8 +346,8 @@ impl PushSender {
     }
 
     /// Chiffre, signe et envoie `payload` à cet abonnement (bloquant), avec le `Topic` de `session`. Rend le verdict
-    /// et le code HTTP s'il y en a un. Un abonnement abîmé ou hors des hôtes admis n'envoie rien (`Failed`) ; une
-    /// charge qui ne tient pas dans un enregistrement non plus (`TooLarge`).
+    /// et le code HTTP s'il y en a un. Un abonnement abîmé ou hors des hôtes admis n'envoie rien et rend `Gone` sans
+    /// code HTTP (à retirer) ; une charge qui ne tient pas dans un enregistrement non plus (`TooLarge`).
     pub fn deliver(
         &self,
         subscription: &Subscription,
@@ -341,6 +357,11 @@ impl PushSender {
         let message = match self.build(subscription, session, payload) {
             Ok(message) => message,
             Err(PushError::PayloadTooLarge) => return (Delivery::TooLarge, None),
+            // Un abonnement gardé que l'on refuse d'envoyer (hôte hors liste, clés abîmées : `devices.json` est un
+            // fichier) ne marchera jamais : `Gone` sans code HTTP, l'appelant le retire (`reason=invalid`).
+            Err(PushError::BadEndpoint | PushError::BadSubscription(_)) => {
+                return (Delivery::Gone, None);
+            }
             Err(_) => return (Delivery::Failed, None),
         };
         let (status, body) = send(&message, &self.dir);
@@ -447,6 +468,13 @@ mod tests {
             "https://web.push.apple.com/a\"b",
             "https://web.push.apple.com/\u{e9}",
             "https://[::1]/x",
+            // Les motifs de globbing de curl : `[1-99999]` ferait cent mille envois d'une seule notification.
+            "https://fcm.googleapis.com/fcm/send/x[1-99999]",
+            "https://web.push.apple.com/x[1-3]",
+            "https://web.push.apple.com/x]",
+            "https://web.push.apple.com/{a,b}",
+            "https://web.push.apple.com/x}",
+            "https://web.push.apple.com/?t={a}",
         ] {
             assert!(!endpoint_allowed(endpoint), "{endpoint:?}");
         }
@@ -531,6 +559,7 @@ mod tests {
             directives,
             [
                 "silent",
+                "globoff",
                 "proto",
                 "url",
                 "header",
@@ -565,6 +594,38 @@ mod tests {
             "Authorization: vapid t=a.b.c, k=d\nheader = \"X-Evil: 2"
         );
         assert!(config.contains("max-time = 10"), "{config}");
+    }
+
+    #[test]
+    fn curl_accepts_only_the_protocol_of_the_target() {
+        let config_for = |endpoint: &str| {
+            let message = PushMessage {
+                endpoint: endpoint.to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+            curl_config(&message, Path::new("/tmp/x.body"), 10)
+        };
+        assert!(config_for("https://web.push.apple.com/x").contains("proto = \"=https\"\n"));
+        assert!(config_for("http://127.0.0.1:4000/x").contains("proto = \"=http\"\n"));
+        // Tout le reste retombe sur https : curl refusera un `file://` ou un `ftp://`.
+        assert!(config_for("file:///etc/passwd").contains("proto = \"=https\"\n"));
+    }
+
+    /// curl développe `[1-3]` et `{a,b}` d'une URL lue par `-K` en autant de transferts, sauf `globoff`.
+    #[test]
+    fn an_endpoint_with_glob_patterns_is_sent_exactly_once() {
+        let home = TempDir::new("send-glob");
+        let fake = FakePush::start(201, "");
+        let (status, _) = send(&message_to(fake.port, "/p[1-3]{a,b}"), &home.0);
+        assert_eq!(status, Some(201));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            fake.requests().len(),
+            1,
+            "{:?}",
+            fake.requests().iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
     }
 
     fn message_to(port: u16, path: &str) -> PushMessage {
@@ -739,10 +800,21 @@ mod tests {
             p256dh: "AAAA".into(),
             auth: "AAAA".into(),
         };
-        assert_eq!(sender.deliver(&broken, "s", b"x"), (Delivery::Failed, None));
+        // Un abonnement que l'on ne saura jamais envoyer rend `Gone` sans code HTTP : l'appelant le retire.
+        assert_eq!(sender.deliver(&broken, "s", b"x"), (Delivery::Gone, None));
         let (mut phone, _) = phone();
-        phone.endpoint = "ftp://web.push.apple.com/x".into();
-        assert_eq!(sender.deliver(&phone, "s", b"x"), (Delivery::Failed, None));
+        for endpoint in [
+            "ftp://web.push.apple.com/x",
+            "https://evil.example/x",
+            "https://fcm.googleapis.com/fcm/send/x[1-99999]",
+        ] {
+            phone.endpoint = endpoint.into();
+            assert_eq!(
+                sender.deliver(&phone, "s", b"x"),
+                (Delivery::Gone, None),
+                "{endpoint}"
+            );
+        }
         assert!(fake.requests().is_empty());
     }
 

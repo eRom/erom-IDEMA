@@ -4,6 +4,7 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -270,6 +271,7 @@ async fn serve(
         tmux,
         commands,
         push,
+        push_test_busy: Arc::new(AtomicBool::new(false)),
     };
     let server = axum::serve(listener, router(state))
         .with_graceful_shutdown(stopped(stop.clone()))

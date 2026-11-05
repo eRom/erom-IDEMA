@@ -1,6 +1,7 @@
 //! Les routes HTTP du service. Toutes les routes de données sont sous `/idema-api/` et passent par la garde ; les
 //! fichiers de la page sont servis à la racine, sans cookie et sans donnée.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -74,6 +75,8 @@ pub struct AppState {
     pub commands: UnboundedSender<PaneCommand>,
     /// L'envoi des notifications. `None` : la clé VAPID est illisible, les routes push répondent 503.
     pub push: Option<Arc<PushSender>>,
+    /// Un envoi de test est-il en cours ? Un seul à la fois : chacun tient un fil bloquant jusqu'à 10 s.
+    pub push_test_busy: Arc<AtomicBool>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -697,6 +700,24 @@ async fn push_unsubscribe(
     }
 }
 
+/// La place de l'unique envoi de test en cours : prise avant l'envoi, rendue à sa chute (même si l'appelant a raccroché
+/// et que le fil bloquant finit seul).
+struct TestSendSlot(Arc<AtomicBool>);
+
+impl TestSendSlot {
+    fn take(busy: &Arc<AtomicBool>) -> Option<Self> {
+        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| Self(Arc::clone(busy)))
+    }
+}
+
+impl Drop for TestSendSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// `POST push/test` : envoie « Notification de test » à l'appareil qui demande, et à lui seul. La réponse dit ce que
 /// le service push a répondu ; un abonnement qu'il déclare mort est retiré, comme à un vrai envoi.
 async fn push_test(
@@ -709,8 +730,12 @@ async fn push_test(
     let Some(subscription) = state.access.subscription_of(&caller.id) else {
         return error_reply(StatusCode::CONFLICT, "not_subscribed");
     };
+    let Some(slot) = TestSendSlot::take(&state.push_test_busy) else {
+        return error_reply(StatusCode::TOO_MANY_REQUESTS, "test_in_progress");
+    };
     let access = Arc::clone(&state.access);
     let sent = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         let payload = serde_json::json!({
             "title": TEST_TITLE,
             "body": TEST_BODY,
@@ -729,11 +754,13 @@ async fn push_test(
             ));
         }
         if delivery == Delivery::Gone {
-            // L'abonnement est mort ou n'est plus le nôtre : le retirer, la page se réabonnera.
+            // L'abonnement est mort, n'est plus le nôtre, ou n'a jamais été envoyable (sans code HTTP : hôte hors
+            // liste ou clés abîmées dans `devices.json`) : le retirer, la page se réabonnera.
+            let reason = status.map_or_else(|| "invalid".to_owned(), |code| format!("http_{code}"));
             match access.remove_endpoint(&subscription.endpoint) {
-                Ok(true) => hud::log_event(&format!(
-                    "companion subscription removed reason=http_{status_text}"
-                )),
+                Ok(true) => {
+                    hud::log_event(&format!("companion subscription removed reason={reason}"))
+                }
                 Ok(false) => {}
                 Err(_) => {} // `remove_endpoint` a déjà écrit l'échec au journal
             }
@@ -2231,5 +2258,65 @@ mod tests {
             b"short",
             "a damaged key is never replaced"
         );
+    }
+
+    #[test]
+    fn only_one_test_push_runs_at_a_time() {
+        let fake = FakePush::start_slow(Duration::from_millis(1500));
+        let service = Arc::new(Harness::start_with_push(
+            TempDir::new("push-busy"),
+            fake.url(),
+        ));
+        let phone = service.pair(IPHONE);
+        put_subscription(&service, &phone, "https://web.push.apple.com/QXX-busy");
+
+        let first = {
+            let (service, phone) = (Arc::clone(&service), phone.clone());
+            std::thread::spawn(move || {
+                service.request("POST", TEST_PUSH, &[JSON, ("Cookie", &phone)], Some("{}"))
+            })
+        };
+        // La requête est arrivée au service push : l'envoi est en cours.
+        fake.wait_for(1);
+        let second = service.request("POST", TEST_PUSH, &[JSON, ("Cookie", &phone)], Some("{}"));
+        assert_eq!(second.status, 429, "{}", second.text());
+        assert_eq!(second.json()["error"], "test_in_progress");
+
+        assert_eq!(first.join().unwrap().status, 200);
+        assert_eq!(fake.requests().len(), 1, "the refused call sent nothing");
+        // L'envoi fini, la place est rendue.
+        let third = service.request("POST", TEST_PUSH, &[JSON, ("Cookie", &phone)], Some("{}"));
+        assert_eq!(third.status, 200, "{}", third.text());
+    }
+
+    /// `devices.json` est un fichier : un abonnement que `build` refuse (hôte hors liste, motif de globbing) ne doit
+    /// pas rester, retenté à chaque épisode pour rien.
+    #[test]
+    fn a_stored_subscription_that_cannot_be_sent_is_removed() {
+        for bad in [
+            "https://evil.example/x",
+            "https://fcm.googleapis.com/fcm/send/x[1-99999]",
+        ] {
+            let first = Harness::start(true);
+            let phone = first.pair(IPHONE);
+            put_subscription(&first, &phone, "https://web.push.apple.com/QXX-stored");
+            let home = first.stop();
+            let path = home.0.join("companion/devices.json");
+            let edited = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("https://web.push.apple.com/QXX-stored", bad);
+            std::fs::write(&path, edited).unwrap();
+
+            let fake = FakePush::start(201, "");
+            let service = Harness::start_with_push(home, fake.url());
+            assert_eq!(me(&service, &phone)["subscribed"], true, "{bad}");
+            let reply = service.request("POST", TEST_PUSH, &[JSON, ("Cookie", &phone)], Some("{}"));
+            assert_eq!(reply.status, 502, "{bad}");
+            assert_eq!(reply.json()["result"], "gone", "{bad}");
+            assert_eq!(stored_endpoints(&service), [None], "{bad}");
+            assert_eq!(me(&service, &phone)["subscribed"], false, "{bad}");
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(fake.requests().is_empty(), "nothing is sent to {bad}");
+        }
     }
 }
