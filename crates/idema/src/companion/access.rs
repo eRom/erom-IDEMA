@@ -157,6 +157,8 @@ impl Access {
             }
             // La présence de Romain (tâche 8) consomme ce geste ; l'accès n'a rien à en faire.
             ServiceEvent::PhoneInteraction { .. } => {}
+            // Idem pour l'absence de Romain : le service ne l'exploite qu'avec la notification (tâche 8).
+            ServiceEvent::Presence { .. } => {}
         }
     }
 

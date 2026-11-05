@@ -9,6 +9,7 @@ pub mod controller;
 mod devices;
 pub mod fleet;
 pub mod input;
+pub mod presence;
 pub mod screen;
 mod server;
 pub mod service;
@@ -83,6 +84,9 @@ pub enum ServiceEvent {
     /// Une saisie ou un acquittement venus du téléphone ont touché cette session : Romain agit depuis l'iPhone
     /// (consommé par la présence, tâche 8).
     PhoneInteraction { session: String },
+    /// Romain est devenu absent (`away`) ou présent : seul le changement part, jamais un état répété (consommé par
+    /// les notifications, tâche 8).
+    Presence { away: bool },
 }
 
 /// Ce que le service demande au fil d'interface : une commande sur un pane, avec sa réponse `oneshot`.

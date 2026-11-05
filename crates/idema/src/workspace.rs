@@ -46,6 +46,7 @@ use crate::companion::fleet::{FleetPane, SessionInput, compose_fleet, mac_name, 
 use crate::companion::input::{
     ENTER_DELAY, Gate, RemoteInput, enter_still_allowed, gate, is_expired,
 };
+use crate::companion::presence;
 use crate::companion::{
     AckOrigin, CompanionController, InputOutcome, PaneCommand, PaneProbe, ServiceEvent, log_safe,
 };
@@ -167,6 +168,9 @@ pub const KEY_CONTEXT: &str = "Workspace";
 
 /// Pas de la surveillance de `config.toml` : une relecture n'a lieu que si la date ou la taille du fichier a bougé.
 const CONFIG_POLL: Duration = Duration::from_secs(1);
+
+/// Pas de l'évaluation de la présence de Romain, compagnon allumé seulement (spec §3.2).
+const PRESENCE_POLL: Duration = Duration::from_secs(5);
 
 /// Retrait gauche de l'en-tête quand la barre est repliée : il laisse la place aux feux et au bouton de la barre.
 const COLLAPSED_HEADER_INSET: f32 = 132.;
@@ -847,6 +851,8 @@ pub struct Workspace {
     companion: CompanionController,
     /// La tâche qui traite sur le fil d'interface les commandes que le service du compagnon lui envoie.
     _companion_task: Option<Task<()>>,
+    /// La minuterie de présence (5 s) : elle n'existe que tant que le service du compagnon tourne, et tombe avec lui.
+    _presence_task: Option<Task<()>>,
     /// `companion disabled reason=tmux_unavailable` est déjà au journal pour cette section : une ligne par état, pas une
     /// par rechargement de la config.
     companion_unavailable_logged: bool,
@@ -1093,6 +1099,7 @@ impl Workspace {
             _attach_task: None,
             companion: CompanionController::new(),
             _companion_task: None,
+            _presence_task: None,
             companion_unavailable_logged: false,
             _config_task: config_task,
             _branch_task: None,
@@ -1208,7 +1215,7 @@ impl Workspace {
                 self.adopt_projects(&sessions);
                 self.refresh_missing(cx);
                 self.server = Some(Arc::clone(&server));
-                self.sync_companion(cx);
+                self.sync_companion(window, cx);
                 self.entries = session_entries(&sessions, &panes);
                 self.publish_fleet(cx);
                 self.drop_hidden_selection();
@@ -1237,7 +1244,7 @@ impl Workspace {
             }
             Err(error) => {
                 self.startup_error = Some(StartupError::from(error));
-                self.sync_companion(cx);
+                self.sync_companion(window, cx);
             }
         }
         cx.notify();
@@ -2107,7 +2114,7 @@ impl Workspace {
                 let ideation_was_on = self.ideation().is_some();
                 self.config = config;
                 self.config_error = None;
-                self.sync_companion(cx);
+                self.sync_companion(window, cx);
                 // Les lanceurs (logos) et le libellé des bouillons viennent de la config.
                 self.publish_fleet(cx);
                 if effects.theme || effects.terminal_font {
@@ -2144,7 +2151,7 @@ impl Workspace {
     /// Aligne le service du compagnon sur la config : le démarre, l'arrête ou le redémarre. Il ne démarre qu'avec le
     /// serveur tmux prêt ; si l'amorçage a échoué, la section est dite sans effet au journal, une fois : de nouveau
     /// seulement si la section est retirée puis remise.
-    fn sync_companion(&mut self, cx: &mut Context<Self>) {
+    fn sync_companion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.config.companion.is_none() {
             self.companion_unavailable_logged = false;
         } else if self.server.is_none()
@@ -2175,10 +2182,51 @@ impl Workspace {
                         }
                     }
                 }));
+                // La minuterie de présence naît avec le service (un redémarrage remplace la précédente).
+                self._presence_task = Some(cx.spawn_in(window, async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(PRESENCE_POLL).await;
+                        if this
+                            .update_in(cx, |this, window, cx| this.evaluate_presence(window, cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }));
             }
-            None if !self.companion.is_on() => self._companion_task = None,
+            None if !self.companion.is_on() => {
+                self._companion_task = None;
+                // Plus de service : plus de minuterie, et Romain redevient présent (le « vu » d'avant).
+                if self._presence_task.take().is_some() {
+                    self.update_seen(window, cx);
+                }
+            }
             None => {}
         }
+    }
+
+    /// Un tour de la présence de Romain : absent après `away_after_seconds` sans entrée, ou écran verrouillé. À un
+    /// changement, le service est prévenu et « vu » est recalculé (absent, aucune session n'est vue).
+    fn evaluate_presence(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(section) = &self.config.companion else {
+            return;
+        };
+        let away = presence::is_away(
+            presence::hid_idle_seconds(),
+            presence::screen_locked(),
+            section.away_after_seconds,
+        );
+        if !self.companion.set_away(away) {
+            return;
+        }
+        hud::log_event(if away {
+            "companion presence away"
+        } else {
+            "companion presence present"
+        });
+        self.companion.send(ServiceEvent::Presence { away });
+        self.update_seen(window, cx);
     }
 
     /// Une commande du service du compagnon, traitée sur le fil d'interface.
@@ -2649,7 +2697,12 @@ impl Workspace {
     /// droit agrandi (Terminal ou Fichiers), la colonne principale n'est plus à l'écran : aucune ne l'est (spec §5.3).
     fn update_seen(&mut self, window: &Window, cx: &mut Context<Self>) {
         // La galerie couvre le centre : aucune session n'est vue, comme sous un volet agrandi.
-        let active = window.is_window_active() && !self.panel_maximized() && !self.artifacts_shown;
+        // Compagnon allumé et Romain absent : aucune session n'est vue, pour qu'une session laissée au centre puisse
+        // passer en « attend ». Éteint, `present()` est toujours vrai.
+        let active = window.is_window_active()
+            && self.companion.present()
+            && !self.panel_maximized()
+            && !self.artifacts_shown;
         let selected = self.selected_name().map(str::to_owned);
         let views: Vec<(bool, Entity<SessionView>)> = self
             .entries

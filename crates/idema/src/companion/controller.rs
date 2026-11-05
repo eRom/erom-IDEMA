@@ -38,6 +38,9 @@ pub struct CompanionController {
     /// Les `command_id` tapés dans la dernière minute : un service qui redémarre ne fait pas oublier une saisie, et
     /// l'espace de travail, seul à taper, est seul à y toucher.
     recent: RecentCommands,
+    /// Romain est absent (inactivité ou écran verrouillé). Faux tant que rien ne tourne : le compagnon éteint, rien ne
+    /// change au « vu » d'IdemA. Gardé d'un redémarrage du service à l'autre (port changé) : Romain n'a pas bougé.
+    away: bool,
     /// Le fil d'un service arrêté que personne n'a encore joint. Il n'existe que tant que rien ne tourne : un
     /// service qui démarre le reçoit comme `previous` et le joint avant de lier sa prise, donc une réactivation
     /// rapide ne dispute jamais le port à l'ancien fil.
@@ -64,6 +67,7 @@ impl CompanionController {
             running: None,
             timeline: Arc::new(Mutex::new(Timeline::new(started_at))),
             recent: RecentCommands::default(),
+            away: false,
             stopping: None,
         }
     }
@@ -88,6 +92,7 @@ impl CompanionController {
         }
         let previous = self.stop().or_else(|| self.stopping.take());
         let Some((config, tmux)) = wanted else {
+            self.away = false;
             self.stopping = previous;
             return None;
         };
@@ -119,6 +124,10 @@ impl CompanionController {
             status: status_receiver,
             fleet,
         });
+        // Un service redémarré (port changé) ne sait pas que Romain était déjà absent.
+        if self.away {
+            self.send(ServiceEvent::Presence { away: true });
+        }
         Some(commands_receiver)
     }
 
@@ -129,6 +138,22 @@ impl CompanionController {
 
     pub fn is_on(&self) -> bool {
         self.running.is_some()
+    }
+
+    /// Romain est-il présent ? Vrai compagnon éteint : le « vu » d'IdemA ne dépend alors de rien d'autre que de la
+    /// fenêtre.
+    pub fn present(&self) -> bool {
+        !self.away
+    }
+
+    /// Enregistre l'absence mesurée ; vrai quand l'état a changé. Sans effet éteint (aucune minuterie n'existe alors,
+    /// et `present()` reste vrai).
+    pub fn set_away(&mut self, away: bool) -> bool {
+        if self.running.is_none() || self.away == away {
+            return false;
+        }
+        self.away = away;
+        true
     }
 
     /// Publie l'instantané de la flotte ; sans effet éteint, et sans effet quand il ne dit rien de plus que le
@@ -291,6 +316,36 @@ mod tests {
         assert_eq!(subscriber.borrow_and_update().badge, 4);
 
         controller.sync(None, Some(tmux()), &home.0, &scratchpad);
+        controller.stopping.take().unwrap().join().unwrap();
+    }
+
+    /// Éteint, Romain est toujours présent et rien ne s'enregistre ; allumé, `set_away` rend vrai au seul changement ;
+    /// éteindre le compagnon rend la présence.
+    #[test]
+    fn presence_follows_the_service_and_is_always_true_when_off() {
+        let port = super::super::test_support::free_port();
+        let home = super::super::test_support::TempDir::new("controller-presence");
+        let scratchpad = home.0.join("scratchpad.md");
+        let mut controller = CompanionController::new();
+
+        assert!(controller.present());
+        assert!(!controller.set_away(true), "off: nothing is recorded");
+        assert!(controller.present());
+
+        controller.sync(Some(&config(port)), Some(tmux()), &home.0, &scratchpad);
+        assert!(controller.present(), "on: present until measured away");
+        assert!(controller.set_away(true));
+        assert!(!controller.present());
+        assert!(!controller.set_away(true), "no change, no event");
+        assert!(controller.set_away(false));
+        assert!(controller.present());
+
+        assert!(controller.set_away(true));
+        controller.sync(None, Some(tmux()), &home.0, &scratchpad);
+        assert!(
+            controller.present(),
+            "turning the companion off ends the absence"
+        );
         controller.stopping.take().unwrap().join().unwrap();
     }
 
