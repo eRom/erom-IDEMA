@@ -26,6 +26,7 @@ use super::auth::{COOKIE_NAME, cookie_header, origin_allowed};
 use super::devices::Subscription;
 use super::fleet::Fleet;
 use super::input::{self, HTTP_WAIT};
+use super::notify::Message;
 use super::push_send::{Delivery, PushSender, endpoint_allowed};
 use super::screen;
 use super::sse::{self, COALESCE};
@@ -61,8 +62,9 @@ pub struct AppState {
     /// Passe à `true` quand le service doit s'arrêter : les flux se ferment alors d'eux-mêmes.
     pub stop: watch::Receiver<bool>,
     pub access: Arc<Access>,
-    /// L'adresse tailnet connue (`public_url`), dont l'origine est admise en écriture.
-    pub known_origin: Option<String>,
+    /// L'adresse tailnet connue (`public_url`), dont l'origine est admise en écriture. Suit la config à chaud
+    /// (`ServiceEvent::ConfigChanged`).
+    pub known_origin: Arc<Mutex<Option<String>>>,
     pub port: u16,
     /// Les routes de test existent-elles ? Décidé une fois par le contrôleur (`auth::test_routes_enabled`).
     pub test_routes: bool,
@@ -77,6 +79,8 @@ pub struct AppState {
     pub push: Option<Arc<PushSender>>,
     /// Un envoi de test est-il en cours ? Un seul à la fois : chacun tient un fil bloquant jusqu'à 10 s.
     pub push_test_busy: Arc<AtomicBool>,
+    /// La file de la boucle des notifications : `PUT presence` y dépose le pane que la page montre.
+    pub inbox: tokio::sync::mpsc::UnboundedSender<Message>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -93,6 +97,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/idema-api/sessions/{name}/panes/{pane}/input", post(input))
         .route("/idema-api/sessions/{name}/panes/{pane}/ack", post(ack))
+        .route("/idema-api/presence", put(presence))
         .route("/idema-api/client-metrics", post(client_metrics))
         .route("/idema-api/push/key", get(push_key))
         .route(
@@ -163,7 +168,12 @@ async fn guard(State(state): State<AppState>, mut request: Request, next: Next) 
 
     if write && let Some(origin) = request.headers().get(header::ORIGIN) {
         let origin = origin.to_str().ok();
-        if origin.is_none() || !origin_allowed(origin, state.known_origin.as_deref(), state.port) {
+        let known_origin = state
+            .known_origin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if origin.is_none() || !origin_allowed(origin, known_origin.as_deref(), state.port) {
             return error_reply(StatusCode::FORBIDDEN, "forbidden_origin");
         }
     }
@@ -581,6 +591,37 @@ async fn ack(
         Ok(false) => error_reply(StatusCode::NOT_FOUND, "not_found"),
         Err(why) => unanswered_reply(why),
     }
+}
+
+/// Le plus long nom de session admis dans une déclaration : un nom tmux d'IdemA en fait 15.
+const PRESENCE_SESSION_MAX_LEN: usize = 200;
+
+#[derive(Deserialize)]
+struct PresenceBody {
+    session: String,
+    pane: u32,
+}
+
+/// `PUT presence` : le pane que la page montre au premier plan (`{"session": ..., "pane": ...}`), ou `null` quand elle
+/// n'en montre plus. Tant que la déclaration tient (30 s), une attente ou une erreur de ce pane est acquittée aussitôt
+/// et n'est pas notifiée (spec §3.6). Elle n'a pas à nommer une session qui existe : elle ne fait que se comparer aux
+/// épisodes.
+async fn presence(State(state): State<AppState>, body: Bytes) -> Response {
+    let declared = match serde_json::from_slice::<Option<PresenceBody>>(&body) {
+        Ok(Some(PresenceBody { session, pane }))
+            if !session.is_empty() && session.len() <= PRESENCE_SESSION_MAX_LEN =>
+        {
+            Some((session, pane))
+        }
+        Ok(None) => None,
+        _ => return error_reply(StatusCode::BAD_REQUEST, "bad_request"),
+    };
+    // La boucle ne se ferme qu'avec le service : un envoi qui échoue n'a plus personne à servir.
+    let _ = state.inbox.send(Message::Watch(declared));
+    json_reply(
+        StatusCode::OK,
+        serde_json::json!({ "ok": true }).to_string(),
+    )
 }
 
 #[derive(Deserialize)]

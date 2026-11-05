@@ -182,7 +182,7 @@ pub struct Config {
 }
 
 /// Section `[companion]` : le service local que la page installée sur l'iPhone interroge.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompanionConfig {
     /// Port local, lié à `127.0.0.1` seulement.

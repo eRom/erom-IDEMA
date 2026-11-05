@@ -7,8 +7,11 @@ mod access;
 mod auth;
 pub mod controller;
 mod devices;
+pub mod episodes;
 pub mod fleet;
 pub mod input;
+mod notify;
+mod notify_text;
 pub mod presence;
 mod push_send;
 pub mod screen;
@@ -25,7 +28,9 @@ use std::time::{Instant, SystemTime};
 
 use tokio::sync::oneshot;
 
+use crate::config::CompanionConfig;
 pub use controller::CompanionController;
+use episodes::EpisodeKind;
 use input::RemoteInput;
 
 /// Ce que le service dit de lui à l'espace de travail (et, plus tard, à Personnaliser).
@@ -83,12 +88,23 @@ pub enum ServiceEvent {
     CancelPairing,
     /// Oublier un appareil et son abonnement : sa requête suivante prend 401.
     ForgetDevice { id: String },
-    /// Une saisie ou un acquittement venus du téléphone ont touché cette session : Romain agit depuis l'iPhone
-    /// (consommé par la présence, tâche 8).
+    /// Une saisie ou un acquittement venus du téléphone ont touché cette session : Romain agit depuis l'iPhone,
+    /// l'anti-rafale de la session repart de zéro (`episodes::Episodes::phone_interaction`).
     PhoneInteraction { session: String },
-    /// Romain est devenu absent (`away`) ou présent : seul le changement part, jamais un état répété (consommé par
-    /// les notifications, tâche 8).
+    /// Romain est devenu absent (`away`) ou présent : seul le changement part, jamais un état répété.
     Presence { away: bool },
+    /// Une session entre dans un épisode « attend » ou « erreur » (IdemA en sonnerait, ou elle passe en erreur) ; `pane`
+    /// est le plus urgent de ses panes.
+    EpisodeOpened {
+        session: String,
+        pane: u32,
+        kind: EpisodeKind,
+    },
+    /// L'épisode est fini : l'état a quitté « attend » ou « erreur », ou la session a disparu.
+    EpisodeClosed { session: String, kind: EpisodeKind },
+    /// La section `[companion]` a changé sans changer de port : le service suit sans redémarrer (les flux restent
+    /// ouverts). Un changement de port, lui, redémarre le service.
+    ConfigChanged(CompanionConfig),
 }
 
 /// Ce que le service demande au fil d'interface : une commande sur un pane, avec sa réponse `oneshot`.
@@ -123,7 +139,6 @@ pub enum PaneCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckOrigin {
     Phone,
-    #[allow(dead_code, reason = "émis par la présence de Romain (tâches 6 à 8)")]
     Watched,
 }
 

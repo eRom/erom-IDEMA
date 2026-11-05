@@ -5,7 +5,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -16,7 +16,9 @@ use tokio::sync::{mpsc::UnboundedReceiver, watch};
 
 use super::access::Access;
 use super::devices::DeviceStore;
+use super::episodes::Policy;
 use super::fleet::Fleet;
+use super::notify::{self, Message, Notifier};
 use super::push_send::{PushSender, override_host};
 use super::server::{AppState, router, stopped};
 use super::timeline::Timeline;
@@ -85,6 +87,12 @@ pub fn start(deps: ServiceDeps) -> Option<ServiceHandle> {
 }
 
 impl ServiceHandle {
+    /// Le fil du service, pour un test qui veut savoir si c'est toujours le même.
+    #[cfg(test)]
+    pub fn thread_id(&self) -> std::thread::ThreadId {
+        self.thread.thread().id()
+    }
+
     /// Envoie le signal et rend aussitôt le fil à joindre : le fil d'interface ne bloque jamais. Le fil se termine en
     /// 1,5 s au plus, port libéré ; le contrôleur le passe au service suivant, qui le joint avant de lier la prise.
     pub fn stop(self) -> JoinHandle<()> {
@@ -111,6 +119,7 @@ struct Serving {
     port: u16,
     version: &'static str,
     known_origin: Option<String>,
+    policy: Policy,
     test_routes: bool,
     push: Option<Arc<PushSender>>,
     push_override: Option<String>,
@@ -191,6 +200,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
     let serving = Serving {
         port,
         version,
+        policy: notify::policy_of(&config),
         known_origin: config.public_url,
         test_routes,
         push,
@@ -228,6 +238,7 @@ async fn serve(
         port,
         version,
         known_origin,
+        policy,
         test_routes,
         push,
         push_override,
@@ -257,8 +268,25 @@ async fn serve(
             override_host(url)
         ));
     }
+    // La boucle des notifications : les épisodes, la présence de Romain, le pane que la page regarde.
+    let (inbox, notifications) = tokio::sync::mpsc::unbounded_channel();
+    let notifier = Arc::new(Notifier {
+        access: Arc::clone(&access),
+        push: push.clone(),
+        fleet: fleet.clone(),
+        tmux: Arc::clone(&tmux),
+        commands: commands.clone(),
+        inbox: inbox.clone(),
+    });
+    tokio::spawn(notify::run(notifier, notifications, policy));
     // Les gestes de Personnaliser (code, oubli) et l'échéance du code : une tâche du runtime, qui s'arrête avec lui.
-    tokio::spawn(control_loop(events, Arc::clone(&access)));
+    let known_origin = Arc::new(Mutex::new(known_origin));
+    tokio::spawn(control_loop(
+        events,
+        Arc::clone(&access),
+        Arc::clone(&known_origin),
+        inbox.clone(),
+    ));
     let state = AppState {
         version,
         stop: stop.clone(),
@@ -272,6 +300,7 @@ async fn serve(
         commands,
         push,
         push_test_busy: Arc::new(AtomicBool::new(false)),
+        inbox,
     };
     let server = axum::serve(listener, router(state))
         .with_graceful_shutdown(stopped(stop.clone()))
@@ -303,10 +332,16 @@ async fn serve(
     }
 }
 
-/// Applique les gestes de Personnaliser à l'état d'accès, et fait disparaître le code d'appairage à son échéance.
-/// S'arrête quand l'espace de travail ferme la file (service retiré). Sans code en cours, la tâche dort sur la file :
-/// aucune minuterie.
-async fn control_loop(mut events: UnboundedReceiver<ServiceEvent>, access: Arc<Access>) {
+/// Distribue les événements de l'espace de travail : les gestes de Personnaliser vont à l'état d'accès, les épisodes, la
+/// présence et la config à la boucle des notifications (la config met aussi à jour l'origine admise en écriture) ; fait
+/// disparaître le code d'appairage à son échéance. S'arrête quand l'espace de travail ferme la file (service retiré).
+/// Sans code en cours, la tâche dort sur la file : aucune minuterie.
+async fn control_loop(
+    mut events: UnboundedReceiver<ServiceEvent>,
+    access: Arc<Access>,
+    known_origin: Arc<Mutex<Option<String>>>,
+    notifications: tokio::sync::mpsc::UnboundedSender<Message>,
+) {
     loop {
         let event = match access.pairing_deadline() {
             Some(deadline) => {
@@ -328,9 +363,23 @@ async fn control_loop(mut events: UnboundedReceiver<ServiceEvent>, access: Arc<A
         let Some(event) = event else {
             return;
         };
-        let access = Arc::clone(&access);
-        // L'oubli d'un appareil écrit sur disque : hors du runtime.
-        let _ = tokio::task::spawn_blocking(move || access.handle(event)).await;
+        match event {
+            ServiceEvent::StartPairing
+            | ServiceEvent::CancelPairing
+            | ServiceEvent::ForgetDevice { .. } => {
+                let access = Arc::clone(&access);
+                // L'oubli d'un appareil écrit sur disque : hors du runtime.
+                let _ = tokio::task::spawn_blocking(move || access.handle(event)).await;
+            }
+            ServiceEvent::ConfigChanged(config) => {
+                *known_origin.lock().unwrap_or_else(PoisonError::into_inner) =
+                    config.public_url.clone();
+                let _ = notifications.send(Message::Event(ServiceEvent::ConfigChanged(config)));
+            }
+            event => {
+                let _ = notifications.send(Message::Event(event));
+            }
+        }
     }
 }
 

@@ -42,6 +42,7 @@ use crate::changes::panel::{
     render_panel as render_changes_panel, target_menu,
 };
 use crate::commit_message::CommitMessageSettings;
+use crate::companion::episodes::{EpisodeChange, EpisodeKind, episode_changes, urgent_pane};
 use crate::companion::fleet::{FleetPane, SessionInput, compose_fleet, mac_name, state_label};
 use crate::companion::input::{
     ENTER_DELAY, Gate, RemoteInput, enter_still_allowed, gate, is_expired,
@@ -2271,9 +2272,13 @@ impl Workspace {
                     });
                 }
                 hud::log_event(&format!(
-                    "companion ack session={} pane={pane} main_thread_us={}",
+                    "companion ack session={} pane={pane} main_thread_us={} origin={}",
                     self.session_log_label(&session),
-                    started.elapsed().as_micros()
+                    started.elapsed().as_micros(),
+                    match origin {
+                        AckOrigin::Phone => "phone",
+                        AckOrigin::Watched => "watched",
+                    }
                 ));
                 let _ = reply.send(found);
             }
@@ -4285,14 +4290,57 @@ impl Workspace {
         let now = SystemTime::now();
         entry.enter_state(current, now);
         let name = entry.summary.name.clone();
-        if is_alerting_session(entry.summary.ideation, ideation_enabled)
-            && should_chime(previous, current, view.read(cx).is_seen())
-        {
+        let alerting = is_alerting_session(entry.summary.ideation, ideation_enabled);
+        let chimes = alerting && should_chime(previous, current, view.read(cx).is_seen());
+        if chimes {
             self.chime(&format!("session={name}"));
         }
         self.report_transition(&name, previous, current, now);
         self.refresh_badge(cx);
+        // Après le badge : la flotte publiée porte déjà le compte d'après la transition, que la notification affiche.
+        self.report_episodes(&name, view, (previous, current), chimes, alerting, cx);
         cx.notify();
+    }
+
+    /// Dit au compagnon ce que le passage de `states.0` à `states.1` change aux épisodes de la session (spec §3.7) :
+    /// un épisode « attend » quand le son retentirait (`chimes`, que le son soit coupé ou non), un épisode « erreur »
+    /// au passage en erreur d'une session qui compte au badge, et la clôture de celui que l'état vient de quitter.
+    /// Le pane d'un épisode est le plus urgent des panes de la session. Sans effet compagnon éteint.
+    fn report_episodes(
+        &self,
+        session: &str,
+        view: &Entity<SessionView>,
+        states: (ActivityState, ActivityState),
+        chimes: bool,
+        alerting: bool,
+        cx: &App,
+    ) {
+        if !self.companion.is_on() {
+            return;
+        }
+        for change in episode_changes(states.0, states.1, chimes, alerting) {
+            match change {
+                EpisodeChange::Close(kind) => self.companion.send(ServiceEvent::EpisodeClosed {
+                    session: session.to_owned(),
+                    kind,
+                }),
+                EpisodeChange::Open(kind) => {
+                    let panes: Vec<(u32, bool, ActivityState)> = view
+                        .read(cx)
+                        .pane_states(cx)
+                        .into_iter()
+                        .map(|(pane, active, state)| (pane.0, active, state))
+                        .collect();
+                    if let Some(pane) = urgent_pane(&panes, kind) {
+                        self.companion.send(ServiceEvent::EpisodeOpened {
+                            session: session.to_owned(),
+                            pane,
+                            kind,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// Le son d'un passage en « attend » : coupé par `sound_on_wait = false`. Le son peut ne pas partir (un autre
@@ -4327,6 +4375,12 @@ impl Workspace {
         }
         let name = entry.summary.name.clone();
         self.chime(&format!("session={name} pane=%{}", pane.0));
+        // Le son aurait retenti : c'est un épisode « attend » de ce pane, vu ou non.
+        self.companion.send(ServiceEvent::EpisodeOpened {
+            session: name,
+            pane: pane.0,
+            kind: EpisodeKind::Waiting,
+        });
         cx.notify();
     }
 

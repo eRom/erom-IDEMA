@@ -155,10 +155,13 @@ impl Access {
             ServiceEvent::ForgetDevice { id } => {
                 self.forget(&id);
             }
-            // La présence de Romain (tâche 8) consomme ce geste ; l'accès n'a rien à en faire.
-            ServiceEvent::PhoneInteraction { .. } => {}
-            // Idem pour l'absence de Romain : le service ne l'exploite qu'avec la notification (tâche 8).
-            ServiceEvent::Presence { .. } => {}
+            // Les épisodes, la présence et la config ne regardent pas l'accès : la boucle des notifications
+            // (`notify::run`) les reçoit avant lui (`service::control_loop`).
+            ServiceEvent::PhoneInteraction { .. }
+            | ServiceEvent::Presence { .. }
+            | ServiceEvent::EpisodeOpened { .. }
+            | ServiceEvent::EpisodeClosed { .. }
+            | ServiceEvent::ConfigChanged(_) => {}
         }
     }
 
@@ -273,6 +276,16 @@ impl Access {
             .iter()
             .find(|device| device.id == id)
             .and_then(|device| device.subscription.clone())
+    }
+
+    /// Les abonnements push de tous les appareils, du plus ancien appairage au plus récent : à chacun sa notification.
+    pub fn subscriptions(&self) -> Vec<Subscription> {
+        self.lock()
+            .devices
+            .devices()
+            .iter()
+            .filter_map(|device| device.subscription.clone())
+            .collect()
     }
 
     /// Pose l'abonnement de l'appareil (un `endpoint` n'est gardé qu'une fois, chez le dernier qui l'a donné). Écrit

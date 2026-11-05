@@ -12,6 +12,7 @@ use idema_tmux::server::TmuxServer;
 use tokio::sync::watch;
 
 use super::auth::test_routes_enabled;
+use super::episodes::{EpisodeKind, episode_state};
 use super::fleet::Fleet;
 use super::input::RecentCommands;
 use super::push_send::{OVERRIDE_VAR, override_endpoint};
@@ -86,9 +87,17 @@ impl CompanionController {
         scratchpad: &Path,
     ) -> Option<mpsc::UnboundedReceiver<PaneCommand>> {
         let wanted = config.zip(tmux);
-        if let (Some(running), Some((config, _))) = (&self.running, &wanted)
-            && running.config == **config
+        // Seul un changement de port redémarre le service. Les autres réglages (notifications, seuil d'absence, adresse
+        // publique) lui sont dits tels quels : ses flux ouverts ne tombent pas.
+        if let (Some(running), Some((config, _))) = (self.running.as_mut(), &wanted)
+            && running.config.port == config.port
         {
+            if running.config != **config {
+                running.config = (*config).clone();
+                let _ = running
+                    .events
+                    .send(ServiceEvent::ConfigChanged((*config).clone()));
+            }
             return None;
         }
         let previous = self.stop().or_else(|| self.stopping.take());
@@ -196,6 +205,15 @@ impl CompanionController {
     pub fn record_reset(&self, session: &str, from: ActivityState, at: SystemTime) {
         if self.running.is_some() {
             self.lock_timeline().reset(session, from, at);
+            // L'épisode en cours, s'il y en avait un, n'a plus de session à notifier.
+            for kind in [EpisodeKind::Waiting, EpisodeKind::Error] {
+                if episode_state(kind) == from {
+                    self.send(ServiceEvent::EpisodeClosed {
+                        session: session.to_owned(),
+                        kind,
+                    });
+                }
+            }
         }
     }
 
@@ -286,6 +304,56 @@ mod tests {
             ]
         );
         assert_eq!(controller.lock_timeline().started_at(), 1_800_000_000_000);
+
+        controller.sync(None, Some(tmux()), &home.0, &scratchpad);
+        controller.stopping.take().unwrap().join().unwrap();
+    }
+
+    /// Seul un changement de port redémarre le service ; les réglages de notification, le seuil d'absence et l'adresse
+    /// publique lui parviennent par `ConfigChanged`, sans redémarrage (ses flux restent ouverts).
+    #[test]
+    fn only_a_port_change_restarts_the_service() {
+        let home = super::super::test_support::TempDir::new("controller-restart");
+        let scratchpad = home.0.join("scratchpad.md");
+        let mut controller = CompanionController::new();
+        let first = super::super::test_support::free_port();
+        let started = controller.sync(Some(&config(first)), Some(tmux()), &home.0, &scratchpad);
+        assert!(started.is_some(), "the section appears: a service starts");
+        let thread_of = |controller: &CompanionController| {
+            controller.running.as_ref().unwrap().handle.thread_id()
+        };
+        let original = thread_of(&controller);
+
+        // Un réglage change : le même service reste, la config qu'il suit est la nouvelle, aucune file de commandes
+        // nouvelle n'est rendue.
+        let changed: CompanionConfig = toml::from_str(&format!(
+            "port = {first}\nnotify_waiting = false\nnotify_error = false\naway_after_seconds = 5\npublic_url = \"https://mac.tailnet.ts.net:8455\""
+        ))
+        .unwrap();
+        assert!(
+            controller
+                .sync(Some(&changed), Some(tmux()), &home.0, &scratchpad)
+                .is_none()
+        );
+        assert_eq!(thread_of(&controller), original, "same service");
+        assert_eq!(controller.running.as_ref().unwrap().config, changed);
+        // La même config une seconde fois ne change rien non plus.
+        assert!(
+            controller
+                .sync(Some(&changed), Some(tmux()), &home.0, &scratchpad)
+                .is_none()
+        );
+        assert_eq!(thread_of(&controller), original);
+
+        // Le port change : un nouveau service, sur un nouveau fil.
+        let second = super::super::test_support::free_port();
+        assert_ne!(first, second);
+        let mut moved = changed.clone();
+        moved.port = second;
+        let restarted = controller.sync(Some(&moved), Some(tmux()), &home.0, &scratchpad);
+        assert!(restarted.is_some(), "a port change restarts the service");
+        assert_ne!(thread_of(&controller), original);
+        assert_eq!(controller.running.as_ref().unwrap().config, moved);
 
         controller.sync(None, Some(tmux()), &home.0, &scratchpad);
         controller.stopping.take().unwrap().join().unwrap();

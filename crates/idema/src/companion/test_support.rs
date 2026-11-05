@@ -196,7 +196,7 @@ impl Harness {
         Self::start_full(home, true, None, Some(push_override))
     }
 
-    fn start_full(
+    pub fn start_full(
         home: TempDir,
         test_routes: bool,
         tmux: Option<Arc<TmuxServer>>,
@@ -750,5 +750,77 @@ fn serve_one(
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+    }
+}
+
+/// Les clés d'un téléphone de test : de quoi s'abonner (`subscription_body`) et lire ce que le service lui envoie
+/// (`decrypt`, RFC 8291 côté agent utilisateur, depuis la clé privée et la clé publique de l'expéditeur lue dans l'en-tête).
+pub struct PhoneKeys {
+    private: p256::SecretKey,
+    auth: [u8; 16],
+}
+
+impl PhoneKeys {
+    pub fn new() -> Self {
+        let mut auth = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut auth);
+        Self {
+            private: p256::SecretKey::random(&mut rand::rngs::OsRng),
+            auth,
+        }
+    }
+
+    /// Le corps de `PushSubscription.toJSON()` pour ce téléphone et ce point d'accès.
+    pub fn subscription_body(&self, endpoint: &str) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let public = self.private.public_key().to_encoded_point(false);
+        serde_json::json!({
+            "endpoint": endpoint,
+            "expirationTime": null,
+            "keys": { "p256dh": B64.encode(public.as_bytes()), "auth": B64.encode(self.auth) },
+        })
+        .to_string()
+    }
+
+    /// Le texte clair d'un message `aes128gcm` reçu par ce téléphone.
+    pub fn decrypt(&self, body: &[u8]) -> Vec<u8> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use hkdf::Hkdf;
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use sha2::Sha256;
+
+        let salt = &body[..16];
+        let id_len = body[20] as usize;
+        let as_public = &body[21..21 + id_len];
+        let ciphertext = &body[21 + id_len..];
+        let sender = p256::PublicKey::from_sec1_bytes(as_public).unwrap();
+        let shared =
+            p256::ecdh::diffie_hellman(self.private.to_nonzero_scalar(), sender.as_affine());
+        let ua_public = self.private.public_key().to_encoded_point(false);
+        let mut key_info = b"WebPush: info\0".to_vec();
+        key_info.extend_from_slice(ua_public.as_bytes());
+        key_info.extend_from_slice(as_public);
+        let mut ikm = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(&self.auth), shared.raw_secret_bytes())
+            .expand(&key_info, &mut ikm)
+            .unwrap();
+        let prk = Hkdf::<Sha256>::new(Some(salt), &ikm);
+        let mut cek = [0u8; 16];
+        prk.expand(b"Content-Encoding: aes128gcm\0", &mut cek)
+            .unwrap();
+        let mut nonce = [0u8; 12];
+        prk.expand(b"Content-Encoding: nonce\0", &mut nonce)
+            .unwrap();
+        let mut padded = aes_gcm::Aes128Gcm::new_from_slice(&cek)
+            .unwrap()
+            .decrypt(aes_gcm::Nonce::from_slice(&nonce), ciphertext)
+            .unwrap();
+        while padded.last() == Some(&0) {
+            padded.pop();
+        }
+        assert_eq!(padded.pop(), Some(0x02), "last record delimiter");
+        padded
     }
 }
