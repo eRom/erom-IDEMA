@@ -58,6 +58,13 @@ tokio = { version = "=1.53.3", default-features = false, features = ["rt", "net"
 # axum 0.8.9 sans ses features par défaut (ni JSON, ni formulaire, ni tracing) : `query` lit les paramètres d'URL, et
 # les corps sont lus à la main pour répondre 400 à tout ce qui n'est pas exactement la forme attendue.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "query"] }
+# Appairage du compagnon : empreinte SHA-256 des jetons d'appareil (le jeton n'est jamais gardé).
+sha2 = { version = "=0.10.9", default-features = false, features = ["std"] }
+# Hasard cryptographique des codes d'appairage et des jetons : `OsRng` et `RngCore` seulement (rand 0.8, celui que
+# p256 0.13 exigera pour le push ; jamais le rand 0.9 déjà compilé).
+rand = { version = "=0.8.8", default-features = false, features = ["getrandom", "std"] }
+# Jeton d'appareil en base64url sans remplissage (cookie) ; déjà compilé pour macOS.
+base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
 
 # gpui-base 0.7.3 recopié tel que publié, plus un seul patch : en police monospace, le retour à la ligne mesure les
 # lignes simples par sommes de largeurs de caractère (celles qui empruntent une police de secours seulement si leur

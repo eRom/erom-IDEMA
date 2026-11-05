@@ -786,6 +786,9 @@ pub struct Workspace {
     companion: CompanionController,
     /// La tâche qui traite sur le fil d'interface les commandes que le service du compagnon lui envoie.
     _companion_task: Option<Task<()>>,
+    /// `companion disabled reason=tmux_unavailable` est déjà au journal pour cette section : une ligne par état, pas une
+    /// par rechargement de la config.
+    companion_unavailable_logged: bool,
     _config_task: Task<()>,
     _branch_task: Option<Task<()>>,
     /// Le volet droit ouvert, s'il y en a un. Fermé, chacun garde ses entités : les shells du Terminal et les volets
@@ -1029,6 +1032,7 @@ impl Workspace {
             _attach_task: None,
             companion: CompanionController::new(),
             _companion_task: None,
+            companion_unavailable_logged: false,
             _config_task: config_task,
             _branch_task: None,
             right_panel: None,
@@ -2070,11 +2074,17 @@ impl Workspace {
     }
 
     /// Aligne le service du compagnon sur la config : le démarre, l'arrête ou le redémarre. Il ne démarre qu'avec le
-    /// serveur tmux prêt ; si l'amorçage a échoué, la section est dite sans effet au journal.
+    /// serveur tmux prêt ; si l'amorçage a échoué, la section est dite sans effet au journal, une fois : de nouveau
+    /// seulement si la section est retirée puis remise.
     fn sync_companion(&mut self, cx: &mut Context<Self>) {
-        if self.server.is_none() && self.startup_error.is_some() && self.config.companion.is_some()
+        if self.config.companion.is_none() {
+            self.companion_unavailable_logged = false;
+        } else if self.server.is_none()
+            && self.startup_error.is_some()
+            && !self.companion_unavailable_logged
         {
             hud::log_event("companion disabled reason=tmux_unavailable");
+            self.companion_unavailable_logged = true;
         }
         let scratchpad = scratchpad_path(&self.dir);
         let started = self.companion.sync(

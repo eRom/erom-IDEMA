@@ -13,6 +13,8 @@ use futures::future::{Either, select};
 use idema_tmux::server::TmuxServer;
 use tokio::sync::{mpsc::UnboundedReceiver, watch};
 
+use super::access::Access;
+use super::devices::DeviceStore;
 use super::server::{AppState, router, stopped};
 use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
@@ -29,21 +31,26 @@ const RESTART_BIND_RETRY: Duration = Duration::from_secs(1);
 const RUNTIME_STOP_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Tout ce que le fil du service reçoit de l'espace de travail. Chaque tâche suivante ajoute le champ dont elle a besoin.
-// Les champs ci-dessous sont lus par les tâches suivantes (appairage, flotte, saisie, scratchpad) : ils sont posés
-// ici une fois pour toutes pour que le contrôleur n'ait plus à changer de forme.
-#[allow(dead_code, reason = "lus par les tâches 2 à 11 du compagnon")]
 pub struct ServiceDeps {
     pub dir: PathBuf,
     pub version: &'static str,
     pub config: CompanionConfig,
+    #[allow(
+        dead_code,
+        reason = "lu par la tâche 4 (écran, saisie et acquittement d'un pane)"
+    )]
     pub tmux: Arc<TmuxServer>,
+    #[allow(dead_code, reason = "lu par la tâche 9 (Scratchpad)")]
     pub scratchpad: PathBuf,
     pub events: UnboundedReceiver<ServiceEvent>,
+    #[allow(dead_code, reason = "lu par la tâche 4 (commandes sur un pane)")]
     pub commands: UnboundedSender<PaneCommand>,
     pub status: watch::Sender<ServiceStatus>,
     /// Le fil du service précédent, quand celui-ci le remplace : le nouveau le joint (sur son propre fil, jamais celui
     /// de l'interface) avant de lier la prise, pour ne pas la trouver encore occupée.
     pub previous: Option<JoinHandle<()>>,
+    /// Les routes de test existent-elles ? Décidé par le contrôleur (`auth::test_routes_enabled`).
+    pub test_routes: bool,
 }
 
 /// La poignée que garde le contrôleur : de quoi demander l'arrêt, puis joindre le fil.
@@ -52,14 +59,20 @@ pub struct ServiceHandle {
     thread: JoinHandle<()>,
 }
 
-/// Lance le fil du service. Il lie la prise, puis sert jusqu'au signal d'arrêt.
-pub fn start(deps: ServiceDeps) -> ServiceHandle {
+/// Lance le fil du service. Il lie la prise, puis sert jusqu'au signal d'arrêt. `None` si le système refuse le fil :
+/// la section reste sans effet, et le journal le dit.
+pub fn start(deps: ServiceDeps) -> Option<ServiceHandle> {
     let (stop, stop_receiver) = watch::channel(false);
-    let thread = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("companion".into())
-        .spawn(move || run(deps, stop_receiver))
-        .expect("the companion thread spawns");
-    ServiceHandle { stop, thread }
+        .spawn(move || run(deps, stop_receiver));
+    match spawned {
+        Ok(thread) => Some(ServiceHandle { stop, thread }),
+        Err(_) => {
+            hud::log_event("companion disabled reason=thread_spawn_failed");
+            None
+        }
+    }
 }
 
 impl ServiceHandle {
@@ -72,15 +85,40 @@ impl ServiceHandle {
     }
 }
 
+/// Comment `serve` s'est terminé.
+enum Served {
+    /// La prise n'a jamais été liée.
+    NeverListened,
+    /// Arrêt demandé, serveur fini à temps.
+    Stopped,
+    /// Arrêt demandé, mais le serveur n'a pas fini en une seconde : il a été abandonné.
+    TimedOut,
+    /// Le serveur s'est arrêté de lui-même.
+    ServerError,
+}
+
+/// Ce que `serve` a besoin de savoir, hors l'état et les canaux.
+struct Serving {
+    port: u16,
+    version: &'static str,
+    known_origin: Option<String>,
+    test_routes: bool,
+    bind_retry: Duration,
+}
+
 /// Le corps du fil.
 fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
     let ServiceDeps {
+        dir,
         version,
         config,
+        events,
         status,
         previous,
+        test_routes,
         ..
     } = deps;
+    let status = Arc::new(status);
     let restarted = previous.is_some();
     if let Some(previous) = previous {
         let _ = previous.join();
@@ -90,52 +128,95 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         return;
     }
     let port = config.port;
+    // Les appareils sont lus une fois le fil précédent fini : il n'y a jamais deux écrivains de `devices.json`.
+    let devices = match DeviceStore::open(&dir) {
+        Ok(devices) => devices,
+        Err(error) => {
+            fail(
+                &status,
+                port,
+                "devices_unavailable",
+                format!("devices_unavailable: {error}"),
+            );
+            return;
+        }
+    };
+    let access = Arc::new(Access::new(devices, Arc::clone(&status)));
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            fail(&status, port, format!("runtime_failed: {error}"));
+            fail(
+                &status,
+                port,
+                "runtime_failed",
+                format!("runtime_failed: {error}"),
+            );
             return;
         }
     };
-    let bind_retry = if restarted {
-        RESTART_BIND_RETRY
-    } else {
-        Duration::ZERO
+    let serving = Serving {
+        port,
+        version,
+        known_origin: config.public_url,
+        test_routes,
+        bind_retry: if restarted {
+            RESTART_BIND_RETRY
+        } else {
+            Duration::ZERO
+        },
     };
-    let listened = runtime.block_on(serve(port, version, &status, stop, bind_retry));
+    let served = runtime.block_on(serve(serving, &status, access, events, stop));
     // Le runtime est abandonné ici : ses tâches restantes (flux en retard, appel bloquant) ne retiennent plus le fil.
     runtime.shutdown_timeout(RUNTIME_STOP_TIMEOUT);
-    if listened {
-        hud::log_event("companion stopped");
+    match served {
+        Served::NeverListened => {}
+        Served::Stopped => hud::log_event("companion stopped"),
+        Served::TimedOut => hud::log_event("companion stopped reason=timeout"),
+        Served::ServerError => hud::log_event("companion stopped reason=server_error"),
     }
 }
 
-/// Lie la prise et sert jusqu'au signal d'arrêt. Vrai quand le service a écouté.
+/// Lie la prise et sert jusqu'au signal d'arrêt.
 async fn serve(
-    port: u16,
-    version: &'static str,
+    serving: Serving,
     status: &watch::Sender<ServiceStatus>,
+    access: Arc<Access>,
+    events: UnboundedReceiver<ServiceEvent>,
     stop: watch::Receiver<bool>,
-    bind_retry: Duration,
-) -> bool {
+) -> Served {
+    let Serving {
+        port,
+        version,
+        known_origin,
+        test_routes,
+        bind_retry,
+    } = serving;
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let listener = match bind(address, bind_retry).await {
         Ok(listener) => listener,
         Err(error) => {
-            fail(status, port, bind_reason(&error));
-            return false;
+            let (token, detail) = bind_reason(&error);
+            fail(status, port, token, detail);
+            return Served::NeverListened;
         }
     };
-    status.send_replace(ServiceStatus {
-        listen: ListenState::Listening { port },
-    });
+    status.send_modify(|status| status.listen = ListenState::Listening { port });
     hud::log_event(&format!("companion listening addr={address}"));
+    if test_routes {
+        hud::log_event("companion test routes active");
+    }
+    // Les gestes de Personnaliser (code, oubli) et l'échéance du code : une tâche du runtime, qui s'arrête avec lui.
+    tokio::spawn(control_loop(events, Arc::clone(&access)));
     let state = AppState {
         version,
         stop: stop.clone(),
+        access,
+        known_origin,
+        port,
+        test_routes,
     };
     let server = axum::serve(listener, router(state))
         .with_graceful_shutdown(stopped(stop.clone()))
@@ -151,14 +232,51 @@ async fn serve(
                 .is_err()
             {
                 server.abort();
-                hud::log_event("companion stop timed out");
+                return Served::TimedOut;
             }
+            Served::Stopped
         }
         Either::Right((outcome, _)) => {
-            hud::log_event(&format!("companion server ended unexpectedly: {outcome:?}"));
+            status.send_modify(|status| {
+                status.listen = ListenState::Failed {
+                    port,
+                    reason: format!("server_error: {outcome:?}"),
+                };
+            });
+            Served::ServerError
         }
     }
-    true
+}
+
+/// Applique les événements de l'espace de travail à l'état d'accès, et fait disparaître le code d'appairage à son
+/// échéance. S'arrête quand l'espace de travail ferme la file (service retiré). Sans code en cours, la tâche dort
+/// sur la file : aucune minuterie.
+async fn control_loop(mut events: UnboundedReceiver<ServiceEvent>, access: Arc<Access>) {
+    loop {
+        let event = match access.pairing_deadline() {
+            Some(deadline) => {
+                let waiting = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    events.recv(),
+                );
+                match waiting.await {
+                    Ok(event) => event,
+                    Err(_) => {
+                        let access = Arc::clone(&access);
+                        let _ = tokio::task::spawn_blocking(move || access.expire_pairing()).await;
+                        continue;
+                    }
+                }
+            }
+            None => events.recv().await,
+        };
+        let Some(event) = event else {
+            return;
+        };
+        let access = Arc::clone(&access);
+        // L'oubli d'un appareil écrit sur disque : hors du runtime.
+        let _ = tokio::task::spawn_blocking(move || access.handle(event)).await;
+    }
 }
 
 /// Lie la prise ; un port pris est réessayé pendant `retry_for` avant d'être rendu comme une erreur.
@@ -177,19 +295,23 @@ async fn bind(address: SocketAddr, retry_for: Duration) -> io::Result<tokio::net
     }
 }
 
-/// La prise n'a pas pu être liée, ou le runtime n'a pas pu naître : le service ne tourne pas, et le dit.
-fn fail(status: &watch::Sender<ServiceStatus>, port: u16, reason: String) {
-    hud::log_event(&format!("companion disabled reason={reason} port={port}"));
-    status.send_replace(ServiceStatus {
-        listen: ListenState::Failed { port, reason },
+/// Le service ne tourne pas : le journal dit pourquoi en un mot (`reason=`), l'état de la prise porte le détail.
+fn fail(status: &watch::Sender<ServiceStatus>, port: u16, token: &str, detail: String) {
+    hud::log_event(&format!("companion disabled reason={token} port={port}"));
+    status.send_modify(|status| {
+        status.listen = ListenState::Failed {
+            port,
+            reason: detail,
+        };
     });
 }
 
-/// La raison courte d'un bind refusé : `port_in_use` est celle que Personnaliser sait dire en français.
-fn bind_reason(error: &io::Error) -> String {
+/// Pourquoi un bind est refusé : le mot du journal, et le détail de l'état. `port_in_use` est la raison que
+/// Personnaliser sait dire en français.
+fn bind_reason(error: &io::Error) -> (&'static str, String) {
     match error.kind() {
-        io::ErrorKind::AddrInUse => "port_in_use".into(),
-        _ => format!("bind_failed: {error}"),
+        io::ErrorKind::AddrInUse => ("port_in_use", "port_in_use".into()),
+        _ => ("bind_failed", format!("bind_failed: {error}")),
     }
 }
 
@@ -200,77 +322,21 @@ mod tests {
     use std::net::TcpStream;
     use std::time::Instant;
 
-    /// Un port libre, hors de la plage éphémère du système (dès 49152) : les connexions sortantes des autres tests
-    /// du processus y prendraient sinon leur port local. Le sondage est une connexion refusée : aucune prise n'est
-    /// créée sur le port, donc aucun process lancé par un autre test ne peut en hériter.
-    fn free_port() -> u16 {
-        use std::sync::atomic::{AtomicU16, Ordering};
-        static NEXT: AtomicU16 = AtomicU16::new(0);
-        loop {
-            let offset = NEXT.fetch_add(1, Ordering::Relaxed) % 5000;
-            let port = 30000 + (std::process::id() % 5000) as u16 + offset;
-            if TcpStream::connect(("127.0.0.1", port)).is_err() {
-                return port;
-            }
-        }
-    }
+    use crate::companion::test_support::{
+        TempDir, deps, deps_in, free_port, pair_device, wait_for,
+    };
 
-    fn deps(
-        port: u16,
-        previous: Option<JoinHandle<()>>,
-    ) -> (ServiceDeps, watch::Receiver<ServiceStatus>) {
-        let (_events_sender, events) = tokio::sync::mpsc::unbounded_channel();
-        let (commands, _commands_receiver) = futures::channel::mpsc::unbounded();
-        let (status, status_receiver) = watch::channel(ServiceStatus {
-            listen: ListenState::Starting,
-        });
-        let config: CompanionConfig = toml::from_str(&format!("port = {port}")).unwrap();
-        let tmux = Arc::new(TmuxServer::new(
-            "/nonexistent/tmux".into(),
-            "idema-test-companion",
-            "/nonexistent/tmux.conf".into(),
-            Vec::new(),
-        ));
-        let deps = ServiceDeps {
-            dir: std::env::temp_dir(),
-            version: "test",
-            config,
-            tmux,
-            scratchpad: std::env::temp_dir().join("scratchpad.md"),
-            events,
-            commands,
-            status,
-            previous,
-        };
-        (deps, status_receiver)
-    }
-
-    /// Attend que l'état de la prise vérifie `done`.
-    fn wait_for(
-        status: &mut watch::Receiver<ServiceStatus>,
-        done: impl Fn(&ListenState) -> bool,
-    ) -> ListenState {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let current = status.borrow().listen.clone();
-            if done(&current) {
-                return current;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "service state stuck at {current:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Une requête GET en HTTP/1.1, lue jusqu'à la fin de l'en-tête.
-    fn get(port: u16, path: &str) -> (TcpStream, String) {
+    /// Une requête GET en HTTP/1.1, lue jusqu'à la fin de l'en-tête ; `cookie` est la paire `nom=valeur` à présenter.
+    fn get(port: u16, path: &str, cookie: &str) -> (TcpStream, String) {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\n\r\n"
+        )
+        .unwrap();
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
@@ -307,13 +373,16 @@ mod tests {
     #[test]
     fn stop_frees_the_port_even_with_an_open_stream() {
         let port = free_port();
-        let (service_deps, mut status) = deps(port, None);
-        let handle = start(service_deps);
+        let home = TempDir::new("stop");
+        let (service_deps, _events, mut status) = deps_in(port, home.0.clone(), None, true);
+        let handle = start(service_deps).expect("the service thread spawns");
         wait_for(&mut status, |state| {
             *state == ListenState::Listening { port }
         });
+        // Le flux `events` demande un cookie : un appareil est appairé par la route de test.
+        let cookie = pair_device(port, "iPhone");
 
-        let (mut health, head) = get(port, "/idema-api/health");
+        let (mut health, head) = get(port, "/idema-api/health", "");
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         let length: usize = head
             .lines()
@@ -328,7 +397,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body, serde_json::json!({ "ok": true, "version": "test" }));
 
-        let (mut stream, head) = get(port, "/idema-api/events");
+        let (mut stream, head) = get(port, "/idema-api/events", &cookie);
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert!(head.contains("text/event-stream"), "{head}");
         assert!(
@@ -358,12 +427,36 @@ mod tests {
         assert!(rest.ends_with(b"0\r\n\r\n"), "{rest:?}");
     }
 
+    /// Les appareils ne peuvent pas être lus (ici, le dossier d'IdemA est un fichier) : le service ne tourne pas, au
+    /// lieu de repartir d'une liste vide qui défairait tous les appairages.
+    #[test]
+    fn unreadable_devices_stop_the_service_before_it_listens() {
+        let port = free_port();
+        let home = TempDir::new("no-folder");
+        let not_a_folder = home.0.join("file");
+        std::fs::write(&not_a_folder, b"x").unwrap();
+        let (service_deps, _events, mut status) = deps_in(port, not_a_folder, None, false);
+        let handle = start(service_deps).expect("the service thread spawns");
+        let state = wait_for(&mut status, |state| {
+            matches!(state, ListenState::Failed { .. })
+        });
+        let ListenState::Failed { reason, .. } = state else {
+            unreachable!()
+        };
+        assert!(reason.starts_with("devices_unavailable"), "{reason}");
+        handle.stop().join().unwrap();
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "nothing listens"
+        );
+    }
+
     #[test]
     fn a_taken_port_is_reported_and_the_thread_ends() {
         let port = free_port();
         let _taken = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let (service_deps, mut status) = deps(port, None);
-        let handle = start(service_deps);
+        let (service_deps, mut status, _home) = deps(port, None);
+        let handle = start(service_deps).expect("the service thread spawns");
         let state = wait_for(&mut status, |state| {
             matches!(state, ListenState::Failed { .. })
         });
@@ -380,13 +473,13 @@ mod tests {
     #[test]
     fn a_service_stopped_before_it_binds_never_listens() {
         let port = free_port();
-        let (service_deps, status) = deps(
+        let (service_deps, status, _home) = deps(
             port,
             Some(std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_millis(300));
             })),
         );
-        let handle = start(service_deps);
+        let handle = start(service_deps).expect("the service thread spawns");
         handle.stop().join().unwrap();
         assert_eq!(status.borrow().listen, ListenState::Starting);
         bind_again(port).expect("nothing ever listened on the port");
@@ -400,8 +493,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             drop(holder);
         });
-        let (service_deps, mut status) = deps(port, Some(std::thread::spawn(|| {})));
-        let handle = start(service_deps);
+        let (service_deps, mut status, _home) = deps(port, Some(std::thread::spawn(|| {})));
+        let handle = start(service_deps).expect("the service thread spawns");
         wait_for(&mut status, |state| {
             *state == ListenState::Listening { port }
         });
@@ -412,18 +505,18 @@ mod tests {
     #[test]
     fn a_restart_waits_for_the_previous_thread_before_binding() {
         let port = free_port();
-        let (first_deps, mut first_status) = deps(port, None);
-        let first = start(first_deps);
+        let (first_deps, mut first_status, _first_home) = deps(port, None);
+        let first = start(first_deps).expect("the service thread spawns");
         wait_for(&mut first_status, |state| {
             *state == ListenState::Listening { port }
         });
         let previous = first.stop();
-        let (second_deps, mut second_status) = deps(port, Some(previous));
-        let second = start(second_deps);
+        let (second_deps, mut second_status, _second_home) = deps(port, Some(previous));
+        let second = start(second_deps).expect("the service thread spawns");
         wait_for(&mut second_status, |state| {
             *state == ListenState::Listening { port }
         });
-        let (_stream, head) = get(port, "/idema-api/health");
+        let (_stream, head) = get(port, "/idema-api/health", "");
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         second.stop().join().unwrap();
     }

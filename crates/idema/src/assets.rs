@@ -363,6 +363,14 @@ pub fn logo_path(name: &str) -> Option<&'static str> {
         .map(|(path, _, _)| *path)
 }
 
+/// Les octets PNG du logo `name` (« claude »), s'il existe : le compagnon les sert tels quels à la page du téléphone.
+pub fn logo_bytes(name: &str) -> Option<&'static [u8]> {
+    LOGOS
+        .iter()
+        .find(|(_, logo, _)| *logo == name)
+        .map(|(_, _, bytes)| *bytes)
+}
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if let Some(icon) = Icon::ALL.iter().find(|icon| icon.path() == path) {
@@ -402,8 +410,10 @@ mod tests {
             assert_eq!(logo_path(name), Some(*path));
             let bytes = Assets.load(path).unwrap().unwrap();
             assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "{path}");
+            assert_eq!(logo_bytes(name), Some(&*bytes), "{name}");
         }
         assert_eq!(logo_path("antigravity"), None);
+        assert_eq!(logo_bytes("antigravity"), None);
     }
 
     #[test]
