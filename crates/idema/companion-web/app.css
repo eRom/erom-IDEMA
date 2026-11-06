@@ -19,7 +19,7 @@
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 [hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font: 400 17px/1.35 var(--font); -webkit-text-size-adjust: 100%; overscroll-behavior: none; }
-#app { display: flex; flex-direction: column; height: 100dvh; padding-top: var(--safe-top); }
+#app { display: flex; flex-direction: column; height: 100dvh; height: 100lvh; padding-top: var(--safe-top); }
 h1 { margin: 0 0 var(--u); font-size: 22px; font-weight: 700; line-height: 1.2; }
 p { margin: 0; }
 .muted { color: var(--text-2); font-size: 15px; }
