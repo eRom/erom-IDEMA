@@ -41,6 +41,8 @@ Quand on n'écrit presque plus de code soi-même, la journée ressemble à ceci 
 
 **Et le reste.** Un bloc-notes Markdown unique toujours à portée (⌘J). Une fenêtre Personnaliser pour les réglages d'IdemA et ceux de Claude Code (serveurs MCP, plugins, marketplaces, skills). La commande `idema <dossier>` et l'action Finder « Ouvrir dans IdemA ».
 
+![Interface IdemA](assets/screenshots/idema-main.png)
+
 ## Installation
 
 ### Prérequis
@@ -164,6 +166,10 @@ IdemA peut vous prévenir sur l'iPhone quand un agent attend, et vous laisser lu
 5. Activez les notifications.
 
 Un Mac en veille, ou IdemA fermé, n'envoie aucune notification.
+
+| Liste des compagnons | Panneau du compagnon |
+| :---: | :---: |
+| ![Liste des compagnons](assets/screenshots/compagnon-list.png) | ![Panneau du compagnon](assets/screenshots/compagnon-pane.png) |
 
 ## Statut
 
