@@ -2,8 +2,11 @@
 //! cookie ni donnée. Chacun porte un `ETag` (empreinte de son contenu) pour que le navigateur revalide sans retélécharger.
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::sync::{Mutex, OnceLock};
 
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 
 use crate::assets::logo_bytes;
@@ -14,6 +17,17 @@ pub struct Asset {
     pub bytes: &'static [u8],
     pub content_type: &'static str,
     /// Entre guillemets, comme l'exige l'en-tête.
+    pub etag: &'static str,
+    /// La représentation gzip, pour les fichiers de texte (les images sont déjà compressées).
+    pub gzip: Option<Gzipped>,
+}
+
+/// Un fichier compressé une fois pour toutes, avec son propre `ETag` : le même contenu sous deux codages n'a pas le
+/// même identifiant, sans quoi un cache pourrait rejouer l'un pour l'autre.
+#[derive(Debug, Clone, Copy)]
+pub struct Gzipped {
+    pub bytes: &'static [u8],
+    /// L'`ETag` du fichier brut, suffixé `-gz` (toujours entre guillemets).
     pub etag: &'static str,
 }
 
@@ -163,6 +177,7 @@ pub fn asset(path: &str) -> Option<Asset> {
             bytes,
             content_type,
             etag: etag_of(path, bytes),
+            gzip: gzipped(path, content_type),
         });
     }
     let name = path.strip_prefix("/logos/")?.strip_suffix(".png")?;
@@ -171,7 +186,44 @@ pub fn asset(path: &str) -> Option<Asset> {
         bytes,
         content_type: "image/png",
         etag: etag_of(path, bytes),
+        gzip: None,
     })
+}
+
+/// La représentation gzip d'un fichier de la liste, calculée une seule fois pour tous (au premier fichier demandé) : les
+/// fichiers sont embarqués, donc la compression ne dépend de rien d'autre que du binaire. Les images n'en ont pas.
+fn gzipped(path: &str, content_type: &str) -> Option<Gzipped> {
+    static ALL: OnceLock<HashMap<&'static str, Gzipped>> = OnceLock::new();
+    if content_type == PNG {
+        return None;
+    }
+    let all = ALL.get_or_init(|| {
+        FILES
+            .iter()
+            .filter(|(_, _, content_type)| *content_type != PNG)
+            .map(|(path, bytes, _)| {
+                let mut encoder =
+                    GzEncoder::new(Vec::with_capacity(bytes.len() / 3), Compression::best());
+                // Écrire dans un `Vec` ne peut pas échouer.
+                encoder
+                    .write_all(bytes)
+                    .expect("gzip into memory cannot fail");
+                let zipped = encoder.finish().expect("gzip into memory cannot fail");
+                let etag = etag_of(path, bytes);
+                let gz_etag: &'static str =
+                    Box::leak(format!("{}-gz\"", etag.trim_end_matches('"')).into_boxed_str());
+                let bytes: &'static [u8] = Box::leak(zipped.into_boxed_slice());
+                (
+                    *path,
+                    Gzipped {
+                        bytes,
+                        etag: gz_etag,
+                    },
+                )
+            })
+            .collect()
+    });
+    all.get(path).copied()
 }
 
 /// L'`ETag` d'un fichier, calculé une fois par chemin (la chaîne vit autant que le process : le nombre de chemins
@@ -356,6 +408,54 @@ mod tests {
         assert_ne!(
             asset("/logos/claude.png").unwrap().etag,
             asset("/logos/codex.png").unwrap().etag
+        );
+    }
+
+    #[test]
+    fn every_text_file_has_a_gzip_twin_and_images_have_none() {
+        use std::io::Read as _;
+        for (path, bytes, content_type) in FILES {
+            let served = asset(path).unwrap();
+            if *content_type == PNG {
+                assert!(served.gzip.is_none(), "{path}");
+                continue;
+            }
+            let twin = served
+                .gzip
+                .unwrap_or_else(|| panic!("{path} has no gzip twin"));
+            let mut inflated = Vec::new();
+            flate2::read::GzDecoder::new(twin.bytes)
+                .read_to_end(&mut inflated)
+                .unwrap();
+            assert_eq!(&inflated, bytes, "{path}");
+            assert_ne!(twin.etag, served.etag, "{path}");
+            assert!(
+                twin.etag.starts_with('"') && twin.etag.ends_with("-gz\""),
+                "{path}"
+            );
+        }
+        assert!(asset("/logos/claude.png").unwrap().gzip.is_none());
+    }
+
+    /// Le plafond de la page (rulings R21-R22) : la somme des tailles gzip, fichier par fichier, des fichiers de texte
+    /// de l'app, soit les octets que le Mac envoie. Lancer avec `-- --nocapture` pour lire la somme.
+    const GZIP_CEILING: usize = 49_152;
+
+    #[test]
+    fn the_gzipped_app_stays_under_the_ceiling() {
+        let mut sum = 0;
+        for (path, _, content_type) in FILES {
+            if *content_type == PNG {
+                continue;
+            }
+            let size = asset(path).unwrap().gzip.unwrap().bytes.len();
+            println!("gzip {size:>6} {path}");
+            sum += size;
+        }
+        println!("gzip {sum:>6} total (ceiling {GZIP_CEILING})");
+        assert!(
+            sum <= GZIP_CEILING,
+            "the gzipped app weighs {sum} bytes, over the {GZIP_CEILING} ceiling"
         );
     }
 }

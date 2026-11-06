@@ -943,7 +943,9 @@ async fn test_forget(State(state): State<AppState>, headers: HeaderMap, body: By
     }
 }
 
-/// Les fichiers de la page, avec `ETag` et 304 ; tout autre chemin est un 404 (JSON sous `/idema-api/`).
+/// Les fichiers de la page, avec `ETag` et 304 ; tout autre chemin est un 404 (JSON sous `/idema-api/`). Un client qui
+/// accepte gzip reçoit la version compressée à l'avance (son propre `ETag`, `Vary: Accept-Encoding`) ; le 304 se juge
+/// sur la représentation qui serait envoyée.
 async fn app_files(method: Method, uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path();
     // Une route de l'API qui n'existe pas (ou qui n'existe pas sans les routes de test) : 404, quelle que soit la méthode.
@@ -956,19 +958,29 @@ async fn app_files(method: Method, uri: Uri, headers: HeaderMap) -> Response {
     let Some(asset) = web_assets::asset(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let etag = HeaderValue::from_static(asset.etag);
+    let zipped = asset.gzip.filter(|_| accepts_gzip(&headers));
+    let (bytes, etag_text) = match zipped {
+        Some(zipped) => (zipped.bytes, zipped.etag),
+        None => (asset.bytes, asset.etag),
+    };
+    let etag = HeaderValue::from_static(etag_text);
     let cache = HeaderValue::from_static("no-cache");
+    let vary = HeaderValue::from_static("Accept-Encoding");
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|sent| etag_matches(sent, asset.etag))
+        .is_some_and(|sent| etag_matches(sent, etag_text))
     {
         let mut response = StatusCode::NOT_MODIFIED.into_response();
-        response.headers_mut().insert(header::ETAG, etag);
-        response.headers_mut().insert(header::CACHE_CONTROL, cache);
+        let out = response.headers_mut();
+        out.insert(header::ETAG, etag);
+        out.insert(header::CACHE_CONTROL, cache);
+        if asset.gzip.is_some() {
+            out.insert(header::VARY, vary);
+        }
         return response;
     }
-    let mut response = (StatusCode::OK, asset.bytes).into_response();
+    let mut response = (StatusCode::OK, bytes).into_response();
     let out = response.headers_mut();
     out.insert(
         header::CONTENT_TYPE,
@@ -976,6 +988,12 @@ async fn app_files(method: Method, uri: Uri, headers: HeaderMap) -> Response {
     );
     out.insert(header::ETAG, etag);
     out.insert(header::CACHE_CONTROL, cache);
+    if asset.gzip.is_some() {
+        out.insert(header::VARY, vary);
+    }
+    if zipped.is_some() {
+        out.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    }
     response
 }
 
@@ -1513,6 +1531,127 @@ mod tests {
             service.request("POST", "/", &[JSON], Some("{}")).status,
             405
         );
+    }
+
+    fn inflate(body: &[u8]) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut inflated = Vec::new();
+        flate2::read::GzDecoder::new(body)
+            .read_to_end(&mut inflated)
+            .expect("a valid gzip body");
+        inflated
+    }
+
+    #[test]
+    fn app_files_are_gzipped_only_when_asked_with_their_own_etag() {
+        let service = Harness::start(false);
+        let zip = [("Accept-Encoding", "br, gzip")];
+
+        // Les fichiers de texte : le brut sans demande, le gzip avec, deux `ETag` distincts, `Vary` dans les deux cas.
+        for path in [
+            "/",
+            "/app.css",
+            "/sw.js",
+            "/js/main.js",
+            "/manifest.webmanifest",
+        ] {
+            let plain = service.request("GET", path, &[], None);
+            let zipped = service.request("GET", path, &zip, None);
+            assert_eq!(plain.status, 200, "{path}");
+            assert_eq!(plain.header("content-encoding"), None, "{path}");
+            assert_eq!(plain.header("vary"), Some("Accept-Encoding"), "{path}");
+            assert_eq!(zipped.status, 200, "{path}");
+            assert_eq!(zipped.header("content-encoding"), Some("gzip"), "{path}");
+            assert_eq!(zipped.header("vary"), Some("Accept-Encoding"), "{path}");
+            assert_eq!(
+                zipped.header("content-type"),
+                plain.header("content-type"),
+                "{path}"
+            );
+            assert_eq!(zipped.header("cache-control"), Some("no-cache"), "{path}");
+            assert_hardened(&plain, path);
+            assert_hardened(&zipped, path);
+            // Les mêmes octets une fois décompressés ; le gzip pèse moins que le brut.
+            assert_eq!(inflate(&zipped.body), plain.body, "{path}");
+            assert!(zipped.body.len() < plain.body.len(), "{path}");
+            let plain_etag = plain.header("etag").unwrap();
+            let zipped_etag = zipped.header("etag").unwrap();
+            assert_ne!(plain_etag, zipped_etag, "{path}");
+            assert_eq!(
+                zipped_etag,
+                format!("{}-gz\"", plain_etag.trim_end_matches('"')),
+                "{path}"
+            );
+        }
+
+        // `gzip;q=0` et `identity` refusent la compression ; `*` l'accepte.
+        for refused in ["gzip;q=0, identity", "identity", "br"] {
+            let reply = service.request("GET", "/app.css", &[("Accept-Encoding", refused)], None);
+            assert_eq!(reply.header("content-encoding"), None, "{refused}");
+        }
+        let any = service.request("GET", "/app.css", &[("Accept-Encoding", "*")], None);
+        assert_eq!(any.header("content-encoding"), Some("gzip"));
+
+        // Les images ne sont jamais recompressées, même demandées.
+        for png in ["/icons/icon-180.png", "/logos/claude.png"] {
+            let reply = service.request("GET", png, &zip, None);
+            assert_eq!(reply.status, 200, "{png}");
+            assert_eq!(reply.header("content-encoding"), None, "{png}");
+            assert_eq!(reply.header("vary"), None, "{png}");
+            assert!(reply.body.starts_with(b"\x89PNG"), "{png}");
+            assert_hardened(&reply, png);
+        }
+    }
+
+    #[test]
+    fn app_files_revalidate_per_representation() {
+        let service = Harness::start(false);
+        let zip = ("Accept-Encoding", "gzip");
+        let plain_etag = service
+            .request("GET", "/js/main.js", &[], None)
+            .header("etag")
+            .unwrap()
+            .to_owned();
+        let zipped_etag = service
+            .request("GET", "/js/main.js", &[zip], None)
+            .header("etag")
+            .unwrap()
+            .to_owned();
+
+        // 304 pour chaque représentation avec son `ETag`, sans corps, avec la CSP et `Vary`.
+        for (headers, etag) in [
+            (vec![("If-None-Match", plain_etag.as_str())], &plain_etag),
+            (
+                vec![zip, ("If-None-Match", zipped_etag.as_str())],
+                &zipped_etag,
+            ),
+        ] {
+            let reply = service.request("GET", "/js/main.js", &headers, None);
+            assert_eq!(reply.status, 304, "{etag}");
+            assert!(reply.body.is_empty());
+            assert_eq!(reply.header("etag"), Some(etag.as_str()));
+            assert_eq!(reply.header("vary"), Some("Accept-Encoding"));
+            assert_eq!(reply.header("content-encoding"), None);
+            assert_hardened(&reply, "a 304");
+        }
+
+        // Le `ETag` d'une représentation ne valide pas l'autre : le corps est renvoyé.
+        let identity_for_gzip = service.request(
+            "GET",
+            "/js/main.js",
+            &[zip, ("If-None-Match", plain_etag.as_str())],
+            None,
+        );
+        assert_eq!(identity_for_gzip.status, 200);
+        assert_eq!(identity_for_gzip.header("content-encoding"), Some("gzip"));
+        let gzip_for_identity = service.request(
+            "GET",
+            "/js/main.js",
+            &[("If-None-Match", zipped_etag.as_str())],
+            None,
+        );
+        assert_eq!(gzip_for_identity.status, 200);
+        assert_eq!(gzip_for_identity.header("content-encoding"), None);
     }
 
     #[test]
