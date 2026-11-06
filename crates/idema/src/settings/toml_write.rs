@@ -29,7 +29,19 @@ pub enum ConfigEdit {
     CommitEndpoint(Option<String>),
     /// Remplace tout le tableau `[[browser.favorites]]`.
     Favorites(Vec<Favorite>),
+    /// Vrai : crée la table `[companion]` avec le port par défaut si elle manque, garde une table existante. Faux :
+    /// retire toute la table (le compagnon n'existe plus).
+    CompanionEnabled(bool),
+    /// Les trois clés ci-dessous se posent dans la table existante et ne la créent jamais : sans elle, le compagnon est
+    /// éteint, et poser une clé l'allumerait.
+    CompanionNotifyWaiting(bool),
+    CompanionNotifyError(bool),
+    /// `None` retire la clé (le délai par défaut reprend la main).
+    CompanionAwayAfter(Option<u64>),
 }
+
+/// Le port que la table `[companion]` reçoit quand l'interrupteur l'ajoute (celui de la spec, §3.2).
+pub const COMPANION_DEFAULT_PORT: u16 = 3910;
 
 /// Applique `edit` au texte d'une config. Refuse un `text` qui ne passe pas `parse_config`, et rend le nouveau texte
 /// avec sa `Config` validée (une valeur refusée par la validation revient en erreur, rien n'est à défaire).
@@ -130,6 +142,41 @@ fn apply(document: &mut DocumentMut, edit: &ConfigEdit) {
             let tables = favorites.iter().map(favorite_table).collect();
             replace_tables(document, &["browser"], "favorites", tables);
         }
+        ConfigEdit::CompanionEnabled(true) => {
+            if root.get("companion").is_none() {
+                let mut section = Table::new();
+                section.insert(
+                    "port",
+                    Item::Value(Value::from(i64::from(COMPANION_DEFAULT_PORT))),
+                );
+                // Une ligne vide sépare la table de ce qui la précède, sauf sur un fichier vide.
+                if !root.is_empty() {
+                    section.decor_mut().set_prefix("\n");
+                }
+                root.insert("companion", Item::Table(section));
+            }
+        }
+        ConfigEdit::CompanionEnabled(false) => {
+            root.remove("companion");
+        }
+        ConfigEdit::CompanionNotifyWaiting(value) => {
+            set_companion(root, "notify_waiting", Some(Value::from(*value)));
+        }
+        ConfigEdit::CompanionNotifyError(value) => {
+            set_companion(root, "notify_error", Some(Value::from(*value)));
+        }
+        ConfigEdit::CompanionAwayAfter(value) => set_companion(
+            root,
+            "away_after_seconds",
+            value.map(|seconds| Value::from(i64::try_from(seconds).unwrap_or(i64::MAX))),
+        ),
+    }
+}
+
+/// Une clé de `[companion]`, dans la table existante seulement : la créer allumerait le compagnon.
+fn set_companion(root: &mut Table, key: &str, value: Option<Value>) {
+    if let Some(section) = root.get_mut("companion").and_then(Item::as_table_like_mut) {
+        set(section, key, value);
     }
 }
 
@@ -377,6 +424,89 @@ mod tests {
             .collect();
         assert_eq!(names, ["B", "A"]);
         assert!(parse_config(&text).is_ok());
+    }
+
+    #[test]
+    fn enabling_adds_the_section_with_the_default_port() {
+        let (text, config) = apply_edit("", &ConfigEdit::CompanionEnabled(true)).unwrap();
+        assert_eq!(text, "[companion]\nport = 3910\n");
+        assert_eq!(config.companion.unwrap().port, 3910);
+
+        // Sur un fichier qui a déjà du contenu, la table arrive après une ligne vide et le reste ne bouge pas.
+        let (text, config) = apply_edit(
+            "ui_font_size = 14 # taille\n",
+            &ConfigEdit::CompanionEnabled(true),
+        )
+        .unwrap();
+        assert_eq!(
+            text,
+            "ui_font_size = 14 # taille\n\n[companion]\nport = 3910\n"
+        );
+        assert!(config.companion.is_some());
+    }
+
+    #[test]
+    fn enabling_keeps_an_existing_section_untouched() {
+        let base = "[companion]\nport = 4000\nnotify_error = false # sans bruit\n";
+        let (text, config) = apply_edit(base, &ConfigEdit::CompanionEnabled(true)).unwrap();
+        assert_eq!(text, base);
+        assert_eq!(config.companion.unwrap().port, 4000);
+    }
+
+    #[test]
+    fn disabling_removes_the_section_and_keeps_the_rest() {
+        let base = "# en-tête\nui_font_size = 14\n\n# le compagnon\n[companion]\nport = 4000\nnotify_error = false\n\n[commit_message]\nenabled = true # actif\n";
+        let (text, config) = apply_edit(base, &ConfigEdit::CompanionEnabled(false)).unwrap();
+        assert_eq!(config.companion, None);
+        assert!(!text.contains("[companion]") && !text.contains("port = 4000"));
+        assert!(!text.contains("notify_error"));
+        assert!(text.contains("# en-tête\nui_font_size = 14"));
+        assert!(text.contains("[commit_message]\nenabled = true # actif"));
+
+        // Éteindre un compagnon déjà éteint ne change rien.
+        let (again, _) = apply_edit(&text, &ConfigEdit::CompanionEnabled(false)).unwrap();
+        assert_eq!(again, text);
+    }
+
+    #[test]
+    fn notify_toggles_write_their_keys() {
+        let base = "[companion]\nport = 3910\n";
+        let (text, config) = apply_edit(base, &ConfigEdit::CompanionNotifyWaiting(false)).unwrap();
+        assert!(text.contains("notify_waiting = false"));
+        assert!(!config.companion.as_ref().unwrap().notify_waiting);
+        let (text, config) = apply_edit(&text, &ConfigEdit::CompanionNotifyError(false)).unwrap();
+        assert!(text.contains("notify_error = false"));
+        let section = config.companion.unwrap();
+        assert!(!section.notify_waiting && !section.notify_error);
+
+        // Une clé déjà là est remplacée en place, avec le commentaire de sa ligne.
+        let commented = "[companion]\nnotify_waiting = false # calme\n";
+        let (text, _) = apply_edit(commented, &ConfigEdit::CompanionNotifyWaiting(true)).unwrap();
+        assert_eq!(text, "[companion]\nnotify_waiting = true # calme\n");
+    }
+
+    #[test]
+    fn away_after_writes_then_clears_its_key() {
+        let base = "[companion]\nport = 3910\n";
+        let (text, config) = apply_edit(base, &ConfigEdit::CompanionAwayAfter(Some(0))).unwrap();
+        assert!(text.contains("away_after_seconds = 0"));
+        assert_eq!(config.companion.unwrap().away_after_seconds, 0);
+        let (text, config) = apply_edit(&text, &ConfigEdit::CompanionAwayAfter(None)).unwrap();
+        assert!(!text.contains("away_after_seconds"));
+        assert_eq!(config.companion.unwrap().away_after_seconds, 120);
+    }
+
+    #[test]
+    fn the_companion_keys_never_create_the_section() {
+        for edit in [
+            ConfigEdit::CompanionNotifyWaiting(false),
+            ConfigEdit::CompanionNotifyError(false),
+            ConfigEdit::CompanionAwayAfter(Some(30)),
+        ] {
+            let (text, config) = apply_edit("ui_font_size = 14\n", &edit).unwrap();
+            assert_eq!(text, "ui_font_size = 14\n", "{edit:?}");
+            assert_eq!(config.companion, None);
+        }
     }
 
     #[test]

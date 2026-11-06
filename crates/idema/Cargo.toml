@@ -42,3 +42,4 @@ flate2.workspace = true
 p256.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true
+qrcodegen.workspace = true

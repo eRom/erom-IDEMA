@@ -12,6 +12,7 @@ use gpui::{
 };
 use gpui_component::input::{InputEvent, InputState};
 
+use super::companion_section::CompanionState;
 use super::idema_sections::IdemaState;
 use super::mcp_section::McpState;
 use super::nav::{NavGroup, SELECT_PROJECT_HELP, Section, SystemItem, filter_nav, filter_system};
@@ -56,6 +57,7 @@ fn section_icon(section: Section) -> Icon {
         Section::Agents => Icon::SmartToy,
         Section::CommitMessage => Icon::EditNote,
         Section::Browser => Icon::Language,
+        Section::Companion => Icon::Smartphone,
         Section::McpServers => Icon::Mcp,
         Section::Plugins => Icon::Extension,
         Section::Marketplaces => Icon::Storefront,
@@ -88,6 +90,8 @@ pub struct SettingsView {
     counts: HashMap<Section, SharedString>,
     /// L'état des quatre sections IdemA (champs, erreurs, relecture de `config.toml`).
     pub(super) idema: IdemaState,
+    /// L'état de la section « Compagnon » (état du service, QR code, code d'appairage, veille du `watch`).
+    pub(super) companion: CompanionState,
     /// L'état de la section « Serveurs MCP » (liste lue dans `~/.claude.json`, lignes dépliées, appel CLI en cours).
     pub(super) mcp: McpState,
     /// L'état des sections « Plugins » et « Marketplaces » (listes lues dans le CLI, appel en cours, champs d'ajout).
@@ -165,6 +169,7 @@ impl SettingsView {
             query: String::new(),
             counts: HashMap::new(),
             idema,
+            companion: CompanionState::new(),
             mcp: McpState::new(),
             plugins,
             skills: SkillsState::new(),
@@ -195,8 +200,14 @@ impl SettingsView {
             Section::McpServers => self.refresh_mcp(cx),
             Section::Plugins | Section::Marketplaces => self.refresh_plugins(cx),
             Section::Skills => self.refresh_skills(cx),
+            Section::Companion => self.recheck_tailnet(cx),
             _ => {}
         }
+    }
+
+    /// La fenêtre principale, que la section « Compagnon » interroge pour l'état du service.
+    pub(super) fn workspace_handle(&self) -> WindowHandle<Workspace> {
+        self.workspace
     }
 
     /// Affiche `section` (utilisé aussi par le lien « Marketplaces » de la section Plugins).
@@ -529,6 +540,10 @@ impl SettingsView {
         self.render_idema_section(Section::Browser, theme, cx)
     }
 
+    fn render_companion(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        self.render_companion_section(theme, cx)
+    }
+
     fn render_mcp_servers(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         self.render_mcp_section(theme, cx)
     }
@@ -548,6 +563,7 @@ impl SettingsView {
             Section::Agents => self.render_agents(theme, cx),
             Section::CommitMessage => self.render_commit_message(theme, cx),
             Section::Browser => self.render_browser(theme, cx),
+            Section::Companion => self.render_companion(theme, cx),
             Section::McpServers => self.render_mcp_servers(theme, cx),
             Section::Plugins => self.render_plugins(theme, cx),
             Section::Marketplaces => self.render_marketplaces(theme, cx),

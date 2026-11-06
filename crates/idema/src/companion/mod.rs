@@ -86,10 +86,8 @@ pub struct DeviceSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceEvent {
     /// Émettre un code d'appairage (le précédent, s'il y en avait un, cesse de valoir).
-    #[allow(dead_code, reason = "émis par Personnaliser (tâche 11)")]
     StartPairing,
     /// Annuler le code en cours.
-    #[allow(dead_code, reason = "émis par Personnaliser (tâche 11)")]
     CancelPairing,
     /// Oublier un appareil et son abonnement : sa requête suivante prend 401.
     ForgetDevice { id: String },
@@ -112,7 +110,6 @@ pub enum ServiceEvent {
     ConfigChanged(CompanionConfig),
     /// Relancer la détection de l'adresse tailnet (le bouton « Vérifier » de Personnaliser). Plusieurs demandes
     /// rapprochées ne font qu'une détection de plus.
-    #[allow(dead_code, reason = "émis par Personnaliser (tâche 11)")]
     RecheckTailnet,
 }
 

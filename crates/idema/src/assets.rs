@@ -97,10 +97,12 @@ pub enum Icon {
     Warning,
     /// L'icône du pied « Copiées pour » de l'onglet Compétences (graisse 300).
     ContentCopy,
+    /// Ligne « Compagnon » de la barre latérale de « Personnaliser » (graisse 300).
+    Smartphone,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 57] = [
+    pub const ALL: [Icon; 58] = [
         Icon::Add,
         Icon::AddBold,
         Icon::Check,
@@ -158,6 +160,7 @@ impl Icon {
         Icon::Settings,
         Icon::Warning,
         Icon::ContentCopy,
+        Icon::Smartphone,
     ];
 
     /// Chemin à donner à `svg().path(...)`. Les icônes d'IdemA vivent sous `icons/idema/` : les chemins
@@ -221,6 +224,7 @@ impl Icon {
             Self::Settings => "icons/idema/settings.svg",
             Self::Warning => "icons/idema/warning.svg",
             Self::ContentCopy => "icons/idema/content_copy.svg",
+            Self::Smartphone => "icons/idema/smartphone.svg",
         }
     }
 
@@ -283,6 +287,7 @@ impl Icon {
             Self::Settings => include_bytes!("../assets/icons/settings.svg"),
             Self::Warning => include_bytes!("../assets/icons/warning.svg"),
             Self::ContentCopy => include_bytes!("../assets/icons/content_copy.svg"),
+            Self::Smartphone => include_bytes!("../assets/icons/smartphone.svg"),
         }
     }
 }

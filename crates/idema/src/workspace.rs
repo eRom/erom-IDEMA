@@ -51,7 +51,8 @@ use crate::companion::input::{
 };
 use crate::companion::presence;
 use crate::companion::{
-    AckOrigin, CompanionController, InputOutcome, PaneCommand, PaneProbe, ServiceEvent, log_safe,
+    AckOrigin, CompanionController, InputOutcome, PaneCommand, PaneProbe, ServiceEvent,
+    ServiceStatus, log_safe,
 };
 use crate::config::{
     AgentEntry, Config, ConfigError, FileWatch, IdeationConfig, ReloadEffects, SHELL_ENTRY,
@@ -2525,6 +2526,35 @@ impl Workspace {
             self.config_path.clone(),
             cx,
         );
+    }
+
+    /// Ce que « Personnaliser » montre du compagnon : l'état du service (`None` tant qu'aucun ne tourne), et, quand la
+    /// section est dans la config sans que le service tourne, le mot de la raison que l'espace de travail connaît seul
+    /// (le service, qui n'existe pas, ne peut pas la dire). `config.companion` est à jour dès que `sync_companion` a
+    /// tourné : une section présente sans service est un échec, pas une attente.
+    pub(crate) fn companion_feed(
+        &self,
+    ) -> (
+        Option<tokio::sync::watch::Receiver<ServiceStatus>>,
+        Option<&'static str>,
+    ) {
+        let status = self.companion.status();
+        let blocked = if status.is_some() || self.config.companion.is_none() {
+            None
+        } else if self.server.is_some() {
+            Some("thread_spawn_failed")
+        } else if self.startup_error.is_some() {
+            Some("tmux_unavailable")
+        } else {
+            // tmux s'amorce encore : le service démarrera avec lui.
+            None
+        };
+        (status, blocked)
+    }
+
+    /// Un geste de « Personnaliser » pour le service du compagnon (appairer, oublier, revérifier) ; sans effet éteint.
+    pub(crate) fn companion_send(&self, event: ServiceEvent) {
+        self.companion.send(event);
     }
 
     /// Une ligne « Système » de « Personnaliser » : ouvre `path` en onglet permanent dans le volet Fichiers du projet de

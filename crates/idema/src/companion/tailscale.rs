@@ -142,6 +142,30 @@ fn serve_command(port: u16, status: Option<&Value>) -> String {
     format!("tailscale serve --bg --https={https_port} localhost:{port}")
 }
 
+/// La commande par défaut quand le service n'a pas pu en proposer une (CLI introuvable ou muet) : celle de la spec.
+pub fn default_serve_command(port: u16) -> String {
+    serve_command(port, None)
+}
+
+/// `command` (qui commence par `tailscale`) telle qu'elle se tape dans un terminal d'ici : quand `tailscale` n'est pas
+/// dans le `PATH` mais que l'app Tailscale est installée, le chemin du CLI de l'app remplace le nom nu. Un lecteur qui a
+/// collé la commande telle quelle y trouverait « command not found ».
+pub fn typeable_command(command: &str, path_env: Option<&str>) -> String {
+    typeable_command_in(command, path_env, Path::new(BUNDLE_BINARY))
+}
+
+fn typeable_command_in(command: &str, path_env: Option<&str>, bundle: &Path) -> String {
+    let on_path = path_env
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .any(|dir| is_executable(&dir.join("tailscale")));
+    match command.strip_prefix("tailscale ") {
+        Some(rest) if !on_path && is_executable(bundle) => format!("{} {rest}", bundle.display()),
+        _ => command.to_string(),
+    }
+}
+
 /// Ce que le CLI dit de `port`, bloquant et au plus `STATUS_TIMEOUT` : jamais le repli `public_url` (voir
 /// `with_public_url`), pour que l'appelant sache ce que le CLI a vu lui-même.
 pub fn detect(port: u16) -> TailnetState {
@@ -431,6 +455,48 @@ mod tests {
             find_binary_in(None, &dir.0.join("missing")),
             None,
             "neither the PATH nor the bundle has it"
+        );
+    }
+
+    #[test]
+    fn the_offered_command_names_the_bundle_only_when_the_path_lacks_the_cli() {
+        let command = "tailscale serve --bg --https=8455 localhost:3910";
+        let other = TempDir::new("ts-cmd-bundle");
+        let bundle = script(&other, "Tailscale", "exit 0");
+        let bundle_command = format!(
+            "{} serve --bg --https=8455 localhost:3910",
+            bundle.display()
+        );
+        let empty = TempDir::new("ts-cmd-empty");
+        let empty_path = empty.0.to_str().unwrap();
+
+        assert_eq!(
+            typeable_command_in(command, Some(empty_path), &bundle),
+            bundle_command,
+            "not on the PATH, the app is installed"
+        );
+        assert_eq!(typeable_command_in(command, None, &bundle), bundle_command);
+
+        let bin = TempDir::new("ts-cmd-path");
+        script(&bin, "tailscale", "exit 0");
+        let on_path = bin.0.to_str().unwrap();
+        assert_eq!(
+            typeable_command_in(command, Some(on_path), &bundle),
+            command
+        );
+
+        assert_eq!(
+            typeable_command_in(command, Some(empty_path), &other.0.join("missing")),
+            command,
+            "neither: the bare command stays"
+        );
+    }
+
+    #[test]
+    fn the_default_command_is_the_one_of_the_spec() {
+        assert_eq!(
+            default_serve_command(3910),
+            "tailscale serve --bg --https=8455 localhost:3910"
         );
     }
 

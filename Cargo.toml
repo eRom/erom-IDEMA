@@ -74,6 +74,8 @@ p256 = { version = "=0.13.2", default-features = false, features = ["ecdh", "ecd
 aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc"] }
 # Dérivation de la clé et du nonce du message à partir du secret partagé (RFC 8291 §3.3-3.4).
 hkdf = { version = "=0.12.4", default-features = false }
+# QR code de l'adresse tailnet dans Personnaliser : encodeur seul, sans dépendance, qui rend la matrice de modules.
+qrcodegen = { version = "=1.8.0", default-features = false }
 
 # gpui-base 0.7.3 recopié tel que publié, plus un seul patch : en police monospace, le retour à la ligne mesure les
 # lignes simples par sommes de largeurs de caractère (celles qui empruntent une police de secours seulement si leur

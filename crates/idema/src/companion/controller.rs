@@ -246,7 +246,6 @@ impl CompanionController {
     }
 
     /// L'état du service pour Personnaliser ; `None` éteint.
-    #[allow(dead_code, reason = "lu par Personnaliser (tâche 11)")]
     pub fn status(&self) -> Option<watch::Receiver<ServiceStatus>> {
         self.running.as_ref().map(|running| running.status.clone())
     }

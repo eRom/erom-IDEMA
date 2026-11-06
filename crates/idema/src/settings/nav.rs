@@ -9,6 +9,7 @@ pub enum Section {
     Agents,
     CommitMessage,
     Browser,
+    Companion,
     McpServers,
     Plugins,
     Marketplaces,
@@ -73,11 +74,12 @@ impl SystemItem {
 
 impl Section {
     /// Toutes les sections, dans l'ordre de la barre latérale.
-    pub const ALL: [Section; 8] = [
+    pub const ALL: [Section; 9] = [
         Section::General,
         Section::Agents,
         Section::CommitMessage,
         Section::Browser,
+        Section::Companion,
         Section::McpServers,
         Section::Plugins,
         Section::Marketplaces,
@@ -91,6 +93,7 @@ impl Section {
             Self::Agents => "Agents",
             Self::CommitMessage => "Message de commit",
             Self::Browser => "Navigateur",
+            Self::Companion => "Compagnon",
             Self::McpServers => "Serveurs MCP",
             Self::Plugins => "Plugins",
             Self::Marketplaces => "Marketplaces",
@@ -100,7 +103,11 @@ impl Section {
 
     pub fn group(self) -> NavGroup {
         match self {
-            Self::General | Self::Agents | Self::CommitMessage | Self::Browser => NavGroup::IdemA,
+            Self::General
+            | Self::Agents
+            | Self::CommitMessage
+            | Self::Browser
+            | Self::Companion => NavGroup::IdemA,
             Self::McpServers | Self::Plugins | Self::Marketplaces | Self::Skills => {
                 NavGroup::ClaudeCode
             }
@@ -110,7 +117,11 @@ impl Section {
     /// Le sous-titre de l'en-tête : la source de la section.
     pub fn source(self) -> &'static str {
         match self {
-            Self::General | Self::Agents | Self::CommitMessage | Self::Browser => "config.toml",
+            Self::General
+            | Self::Agents
+            | Self::CommitMessage
+            | Self::Browser
+            | Self::Companion => "config.toml",
             Self::McpServers => "~/.claude.json · portée utilisateur",
             Self::Plugins | Self::Marketplaces => "~/.claude/settings.json · portée utilisateur",
             Self::Skills => "~/.claude/skills · skillOverrides de ~/.claude/settings.json",
@@ -139,6 +150,11 @@ pub mod label {
     pub const ENDPOINT: &str = "Point d'accès";
     pub const FAVORITES: &str = "Favoris";
     pub const ADD_FAVORITE: &str = "Ajouter un favori";
+    pub const COMPANION_ENABLED: &str = "Compagnon iPhone";
+    pub const PAIR_DEVICE: &str = "Appairer un appareil";
+    pub const NOTIFY_WAITING: &str = "Notifier quand un agent attend";
+    pub const NOTIFY_ERROR: &str = "Notifier une erreur";
+    pub const AWAY_AFTER: &str = "Absent après (secondes)";
 }
 
 /// Les libellés des contrôles d'une section, ceux que la recherche trouve. Les sections de Claude Code n'ont que leur titre.
@@ -167,6 +183,13 @@ pub fn setting_labels(section: Section) -> &'static [&'static str] {
             label::ENDPOINT,
         ],
         Section::Browser => &[label::FAVORITES, label::ADD_FAVORITE],
+        Section::Companion => &[
+            label::COMPANION_ENABLED,
+            label::PAIR_DEVICE,
+            label::NOTIFY_WAITING,
+            label::NOTIFY_ERROR,
+            label::AWAY_AFTER,
+        ],
         Section::McpServers => &["Serveurs MCP"],
         Section::Plugins => &["Plugins"],
         Section::Marketplaces => &["Marketplaces"],
@@ -230,6 +253,7 @@ mod tests {
                 Section::Agents,
                 Section::CommitMessage,
                 Section::Browser,
+                Section::Companion,
                 Section::McpServers,
                 Section::Plugins,
                 Section::Marketplaces,
@@ -248,6 +272,17 @@ mod tests {
     #[test]
     fn query_matches_a_setting_label() {
         assert_eq!(filter_nav("interligne"), vec![Section::General]);
+    }
+
+    #[test]
+    fn the_companion_section_sits_after_the_browser_in_the_idema_group() {
+        let all = Section::ALL;
+        let browser = all.iter().position(|s| *s == Section::Browser).unwrap();
+        assert_eq!(all[browser + 1], Section::Companion);
+        assert_eq!(Section::Companion.group(), NavGroup::IdemA);
+        assert_eq!(filter_nav("compagnon"), vec![Section::Companion]);
+        assert_eq!(filter_nav("appairer"), vec![Section::Companion]);
+        assert_eq!(filter_nav("absent apres"), vec![Section::Companion]);
     }
 
     #[test]

@@ -33,6 +33,9 @@ const COMMIT_DELAY: Duration = Duration::from_millis(400);
 const POLL: Duration = Duration::from_secs(1);
 
 const NUMBER_EXPECTED: &str = "Un nombre est attendu, par exemple 1.55.";
+const SECONDS_EXPECTED: &str = "Un nombre entier de secondes est attendu, par exemple 120.";
+/// Le délai d'absence quand la clé est retirée (spec du compagnon, §3.2).
+const DEFAULT_AWAY_AFTER: u64 = 120;
 const STALE_LIST: &str = "La liste a changé sur le disque, elle est rechargée.";
 const TMUX_HELP: &str =
     "Vide : détection automatique. Pris en compte au prochain lancement d'IdemA.";
@@ -67,6 +70,10 @@ pub(super) enum Field {
     IncludeRules,
     Instructions,
     Endpoint,
+    CompanionEnabled,
+    CompanionNotifyWaiting,
+    CompanionNotifyError,
+    CompanionAwayAfter,
     Row(ListKind, u64),
     /// Le message qui vaut pour toute une liste (une ligne a changé sur le disque pendant qu'on la modifiait).
     List(ListKind),
@@ -232,6 +239,7 @@ struct Inputs {
     model: Entity<InputState>,
     endpoint: Entity<InputState>,
     instructions: Entity<TextareaState>,
+    away_after: Entity<InputState>,
 }
 
 impl Inputs {
@@ -246,6 +254,7 @@ impl Inputs {
             Field::ApiKey => Some(&self.api_key),
             Field::Model => Some(&self.model),
             Field::Endpoint => Some(&self.endpoint),
+            Field::CompanionAwayAfter => Some(&self.away_after),
             _ => None,
         }
     }
@@ -306,6 +315,7 @@ impl IdemaState {
             model: single(&CommitMessageConfig::default().model, window, cx),
             endpoint: single("Point d'accès par défaut", window, cx),
             instructions: cx.new(|cx| TextareaState::new(window, cx)),
+            away_after: single("120", window, cx),
         };
 
         let mut subscriptions = Vec::new();
@@ -318,6 +328,7 @@ impl IdemaState {
             Field::ApiKey,
             Field::Model,
             Field::Endpoint,
+            Field::CompanionAwayAfter,
         ] {
             if let Some(input) = inputs.input(field) {
                 subscriptions.push(watch_input(field, input, window, cx));
@@ -360,6 +371,11 @@ impl IdemaState {
             _subscriptions: subscriptions,
             _poll: poll,
         }
+    }
+
+    /// La dernière lecture de `config.toml`, que la section « Compagnon » lit aussi.
+    pub(super) fn config(&self) -> &Result<Config, ConfigError> {
+        &self.config
     }
 
     fn rows(&self, kind: ListKind) -> &Vec<EntryRow> {
@@ -417,6 +433,7 @@ impl SettingsView {
         if self.idema.watch.changed() {
             self.idema.config = load_config(&self.config_path);
             self.update_agent_count(cx);
+            self.sync_companion_feed(cx);
             cx.notify();
         }
         self.sync_idema(window, cx);
@@ -425,6 +442,7 @@ impl SettingsView {
     /// La première lecture : compteur de la barre latérale, puis champs et listes.
     pub(super) fn init_idema(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.update_agent_count(cx);
+        self.sync_companion_feed(cx);
         self.sync_idema(window, cx);
     }
 
@@ -466,6 +484,12 @@ impl SettingsView {
             cx,
         );
         changed |= self.sync_input(Field::TmuxPath, &tmux, window, cx);
+        let away = config
+            .companion
+            .as_ref()
+            .map(|section| section.away_after_seconds.to_string())
+            .unwrap_or_default();
+        changed |= self.sync_input(Field::CompanionAwayAfter, &away, window, cx);
         changed |= self.sync_input(
             Field::ApiKey,
             commit.api_key.as_deref().unwrap_or(""),
@@ -953,10 +977,30 @@ impl SettingsView {
                     .map(str::to_string);
                 Ok((wanted != current).then_some(ConfigEdit::CommitInstructions(wanted)))
             }
-            Field::Row(kind, key) => self.build_row_edit(kind, key, cx),
-            Field::SoundOnWait | Field::CommitEnabled | Field::IncludeRules | Field::List(_) => {
-                Ok(None)
+            Field::CompanionAwayAfter => {
+                // Sans section `[companion]`, il n'y a rien à écrire (la clé ne l'allumerait pas : voir `ConfigEdit`).
+                let Some(section) = &config.companion else {
+                    return Ok(None);
+                };
+                let wanted = optional(read(&inputs.away_after))
+                    .map(|text| {
+                        text.parse::<u64>()
+                            .map_err(|_| SECONDS_EXPECTED.to_string())
+                    })
+                    .transpose()?;
+                // Champ vidé : la clé est retirée, le délai par défaut reprend la main.
+                let current = Some(section.away_after_seconds);
+                Ok((wanted.or(Some(DEFAULT_AWAY_AFTER)) != current)
+                    .then_some(ConfigEdit::CompanionAwayAfter(wanted)))
             }
+            Field::Row(kind, key) => self.build_row_edit(kind, key, cx),
+            Field::SoundOnWait
+            | Field::CommitEnabled
+            | Field::IncludeRules
+            | Field::CompanionEnabled
+            | Field::CompanionNotifyWaiting
+            | Field::CompanionNotifyError
+            | Field::List(_) => Ok(None),
         }
     }
 
@@ -1046,12 +1090,25 @@ impl SettingsView {
     }
 
     /// Bascule un interrupteur : la valeur contraire de celle de la config, écrite aussitôt.
-    fn flip(&mut self, field: Field, cx: &mut Context<Self>) {
+    pub(super) fn flip(&mut self, field: Field, cx: &mut Context<Self>) {
         let Ok(config) = &self.idema.config else {
             return;
         };
         let commit = config.commit_message.clone().unwrap_or_default();
         let edit = match field {
+            Field::CompanionEnabled => ConfigEdit::CompanionEnabled(config.companion.is_none()),
+            Field::CompanionNotifyWaiting => {
+                let Some(section) = &config.companion else {
+                    return;
+                };
+                ConfigEdit::CompanionNotifyWaiting(!section.notify_waiting)
+            }
+            Field::CompanionNotifyError => {
+                let Some(section) = &config.companion else {
+                    return;
+                };
+                ConfigEdit::CompanionNotifyError(!section.notify_error)
+            }
             Field::SoundOnWait => ConfigEdit::SoundOnWait(!config.sound_on_wait),
             Field::CommitEnabled => ConfigEdit::CommitEnabled(!commit.enabled),
             Field::IncludeRules => {
@@ -1059,7 +1116,10 @@ impl SettingsView {
             }
             _ => return,
         };
-        self.write_field(field, edit, cx);
+        if self.write_field(field, edit, cx) && field == Field::CompanionEnabled {
+            // Le service démarre ou s'arrête avec la section : la veille de son état suit tout de suite.
+            self.sync_companion_feed(cx);
+        }
     }
 
     /// Montre ou masque la clé d'API.
@@ -1238,7 +1298,7 @@ impl SettingsView {
         )
     }
 
-    fn render_config_error(
+    pub(super) fn render_config_error(
         &self,
         error: &ConfigError,
         theme: &Theme,
@@ -1271,12 +1331,12 @@ impl SettingsView {
             )
     }
 
-    fn error_of(&self, field: Field) -> Option<String> {
+    pub(super) fn error_of(&self, field: Field) -> Option<String> {
         self.idema.errors.get(&field).cloned()
     }
 
     /// Une ligne de réglage dont le contrôle est un champ d'une ligne.
-    fn field_row(
+    pub(super) fn field_row(
         &self,
         text: &str,
         help: Option<&str>,
@@ -1300,7 +1360,7 @@ impl SettingsView {
     }
 
     /// Une ligne de réglage dont le contrôle est un interrupteur.
-    fn toggle_row(
+    pub(super) fn toggle_row(
         &self,
         text: &str,
         field: Field,
