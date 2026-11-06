@@ -4,7 +4,7 @@
 import { el } from './dom.js';
 import { icon } from './icons.js';
 import { ageFr, realTimers } from './time.js';
-import { openHash, triageHash } from './triage.js';
+import { openHash, startTriage, stopTriage, triageHash } from './triage.js';
 
 /** « 2 attendent · 1 erreur · 3 en cours », zéros omis. @param {{sessions: {state: string}[]}} fleet */
 export function summary({ sessions }) {
@@ -56,6 +56,8 @@ function row(s, ages) {
 
 /** @type {import('./router.js').View} */
 export function mountFleet(root, { store, timers = realTimers }) {
+  // Revenir à la flotte met fin au tri ; le résumé le relance.
+  stopTriage();
   /** @type {[HTMLElement, any][]} */
   let ages = [];
   let drawn = /** @type {any} */ (null);
@@ -79,7 +81,7 @@ export function mountFleet(root, { store, timers = realTimers }) {
           el('h1', null, fleet.mac),
           el('span', { class: `dot dot--${LINK_DOT[connection]}`, role: 'img', 'aria-label': connection === 'ok' ? 'Connecté' : 'Connexion perdue' }),
           el('button', { class: 'fleet__gear', type: 'button', 'aria-label': 'Réglages', onclick: () => void (location.hash = '#/settings') }, icon('settings')),
-          el('button', { class: 'fleet__summary', type: 'button', disabled: !next, onclick: () => next && void (location.hash = next) }, summary(fleet)),
+          el('button', { class: 'fleet__summary', type: 'button', disabled: !next, onclick: () => next && (startTriage(), void (location.hash = next)) }, summary(fleet)),
         ),
         groupFleet(fleet).map(({ title, sessions }) =>
           el('section', { class: 'group' }, el('h2', { class: 'group__title' }, title), sessions.length ? sessions.map((s) => row(s, ages)) : el('p', { class: 'group__empty' }, 'Aucune session')),

@@ -8,12 +8,14 @@ import { mountSettings } from './notify.js';
 import { browserEnv, registerWorker } from './push.js';
 import { registerView } from './router.js';
 import { createShell } from './shell.js';
+import { mountSession } from './session.js';
 import { store } from './store.js';
 
 registerView('fleet', mountFleet);
 registerView('absence', mountAbsence);
 registerView('notes', mountNotes);
 registerView('settings', mountSettings);
+registerView('session', mountSession);
 void registerWorker(browserEnv());
 
 void createShell({ root: /** @type {HTMLElement} */ (document.getElementById('app')), store }).boot();

@@ -2,7 +2,7 @@
 // Toutes les requêtes de la page passent ici : préfixe, JSON, délai de 4 s, et un résultat typé au lieu d'exceptions.
 
 /**
- * @typedef {{kind: 'ok', data: any}
+ * @typedef {{kind: 'ok', data: any, etag?: string}
  *   | {kind: 'unpaired'}
  *   | {kind: 'offline'}
  *   | {kind: 'timeout'}
@@ -30,9 +30,10 @@ export function classifyFailure(error, aborted) {
  * @param {unknown} [body] sérialisé en JSON s'il est défini (`null` compris)
  * @param {number} [timeoutMs]
  * @param {boolean} [keepalive] la requête survit à la fermeture de la page (le `null` de présence au masquage)
+ * @param {Record<string, string>} [headers] en-têtes en plus (`If-None-Match` : un 304 rend `{kind: 'http', status: 304}`)
  * @returns {Promise<ApiResult>}
  */
-export async function api(method, path, body, timeoutMs = TIMEOUT_MS, keepalive = false) {
+export async function api(method, path, body, timeoutMs = TIMEOUT_MS, keepalive = false, headers = undefined) {
   const controller = new AbortController();
   let aborted = false;
   const timer = setTimeout(() => {
@@ -42,8 +43,9 @@ export async function api(method, path, body, timeoutMs = TIMEOUT_MS, keepalive 
   /** @type {RequestInit} */
   const init = { method, signal: controller.signal, credentials: 'same-origin', cache: 'no-store' };
   if (keepalive) init.keepalive = true;
+  if (headers) init.headers = headers;
   if (body !== undefined) {
-    init.headers = { 'Content-Type': 'application/json' };
+    init.headers = { ...headers, 'Content-Type': 'application/json' };
     init.body = JSON.stringify(body);
   }
   try {
@@ -53,7 +55,8 @@ export async function api(method, path, body, timeoutMs = TIMEOUT_MS, keepalive 
     if (response.ok) {
       if (text === '') return { kind: 'ok', data: null };
       try {
-        return { kind: 'ok', data: JSON.parse(text) };
+        const etag = response.headers.get('ETag');
+        return etag === null ? { kind: 'ok', data: JSON.parse(text) } : { kind: 'ok', data: JSON.parse(text), etag };
       } catch {
         return { kind: 'http', status: response.status, error: 'bad_response' };
       }

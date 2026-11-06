@@ -18,7 +18,7 @@ export const TEST_TIMEOUT_MS = 15_000;
  */
 
 /**
- * @typedef {(method: string, path: string, body?: unknown, keepalive?: boolean, timeoutMs?: number)
+ * @typedef {(method: string, path: string, body?: unknown, keepalive?: boolean, timeoutMs?: number, headers?: Record<string, string>)
  *   => Promise<import('./api.js').ApiResult>} Request
  */
 

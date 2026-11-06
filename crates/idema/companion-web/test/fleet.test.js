@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { groupFleet, mountFleet, summary } from '../js/fleet.js';
 import { createStore } from '../js/store.js';
+import { isTriage, markHandled } from '../js/triage.js';
 
 const NOW = 1_800_000_000_000;
 const MIN = 60_000;
@@ -104,6 +105,16 @@ describe('mountFleet', () => {
     expect(location.hash).toBe('#/s/idema-dddd4444/0');
     /** @type {HTMLElement} */ (root.querySelector('button[aria-label="Réglages"]')).click();
     expect(location.hash).toBe('#/settings');
+  });
+
+  test('the summary starts a triage with nothing handled; showing the fleet again ends it', () => {
+    mount(fleet([session('idema-dddd4444', 'waiting')]));
+    expect(isTriage()).toBe(false);
+    /** @type {HTMLElement} */ (root.querySelector('.fleet__summary')).click();
+    expect(isTriage()).toBe(true);
+    markHandled('idema-dddd4444');
+    mount(fleet([session('idema-dddd4444', 'waiting')]));
+    expect(isTriage()).toBe(false);
   });
 
   test('the summary does nothing when everything is calm', () => {

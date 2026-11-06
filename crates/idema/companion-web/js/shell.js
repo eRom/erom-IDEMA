@@ -72,10 +72,10 @@ export function createShell({
 
   /**
    * Toute requête de l'app : un 401 ramène à l'appairage, quel que soit l'écran qui l'a lancée.
-   * @param {string} method @param {string} path @param {unknown} [body] @param {boolean} [keepalive] @param {number} [timeoutMs]
+   * @param {string} method @param {string} path @param {unknown} [body] @param {boolean} [keepalive] @param {number} [timeoutMs] @param {Record<string, string>} [headers]
    */
-  async function request(method, path, body, keepalive = false, timeoutMs = undefined) {
-    const result = await api(method, path, body, timeoutMs, keepalive);
+  async function request(method, path, body, keepalive = false, timeoutMs = undefined, headers = undefined) {
+    const result = await api(method, path, body, timeoutMs, keepalive, headers);
     if (result.kind === 'unpaired') showPairing();
     return result;
   }

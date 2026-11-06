@@ -22,3 +22,27 @@ export function triageHash(fleet, handled = []) {
   const next = triageQueue(fleet).find((s) => !handled.includes(s.name));
   return next ? openHash(next) : null;
 }
+
+// Le tri en cours : ouvert par le résumé de la flotte, fermé quand on revient à la flotte. Les sessions déjà vues y
+// restent, pour que « Suivante » ne rouvre pas celle qu'on vient de quitter.
+let running = false;
+/** @type {string[]} */
+let handled = [];
+
+export const isTriage = () => running;
+export const handledSessions = () => handled;
+
+export function startTriage() {
+  running = true;
+  handled = [];
+}
+
+export function stopTriage() {
+  running = false;
+  handled = [];
+}
+
+/** @param {string} name */
+export function markHandled(name) {
+  if (running && !handled.includes(name)) handled.push(name);
+}

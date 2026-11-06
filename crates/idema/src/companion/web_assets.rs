@@ -43,8 +43,18 @@ const FILES: &[(&str, &[u8], &str)] = &[
         JS,
     ),
     (
+        "/js/ansi.js",
+        include_bytes!("../../companion-web/js/ansi.js"),
+        JS,
+    ),
+    (
         "/js/api.js",
         include_bytes!("../../companion-web/js/api.js"),
+        JS,
+    ),
+    (
+        "/js/choices.js",
+        include_bytes!("../../companion-web/js/choices.js"),
         JS,
     ),
     (
@@ -105,6 +115,11 @@ const FILES: &[(&str, &[u8], &str)] = &[
     (
         "/js/router.js",
         include_bytes!("../../companion-web/js/router.js"),
+        JS,
+    ),
+    (
+        "/js/session.js",
+        include_bytes!("../../companion-web/js/session.js"),
         JS,
     ),
     (

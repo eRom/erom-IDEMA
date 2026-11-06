@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { targetPane, triageHash, triageQueue } from '../js/triage.js';
+import { handledSessions, isTriage, markHandled, startTriage, stopTriage, targetPane, triageHash, triageQueue } from '../js/triage.js';
 
 /** @param {string} name @param {string} state @param {{id: number, active: boolean, state: string}[]} [panes] */
 const session = (name, state, panes = [{ id: 0, active: true, state }]) => ({ name, state, panes });
@@ -46,5 +46,30 @@ describe('triageHash', () => {
   test('skips the sessions already handled, and rests when none is left', () => {
     expect(triageHash(fleet, ['idema-a b'])).toBe('#/s/idema-c/0');
     expect(triageHash(fleet, ['idema-a b', 'idema-c'])).toBeNull();
+  });
+});
+
+describe('the triage in progress', () => {
+  test('starts empty, remembers the sessions handled, and forgets them when it stops', () => {
+    stopTriage();
+    expect(isTriage()).toBe(false);
+    startTriage();
+    expect(isTriage()).toBe(true);
+    markHandled('a');
+    markHandled('a');
+    markHandled('b');
+    expect(handledSessions()).toEqual(['a', 'b']);
+    startTriage();
+    expect(handledSessions()).toEqual([]);
+    markHandled('c');
+    stopTriage();
+    expect(isTriage()).toBe(false);
+    expect(handledSessions()).toEqual([]);
+  });
+
+  test('a session is only marked while a triage runs', () => {
+    stopTriage();
+    markHandled('x');
+    expect(handledSessions()).toEqual([]);
   });
 });

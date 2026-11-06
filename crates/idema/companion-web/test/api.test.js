@@ -95,4 +95,22 @@ describe('api', () => {
     expect(await api('GET', '/fleet', undefined, 50)).toEqual({ kind: 'timeout' });
     expect(Date.now() - started).toBeLessThan(2000);
   });
+
+  test('extra headers go out, with or without a body, and the ETag of a reply comes back', async () => {
+    /** @type {RequestInit[]} */
+    const seen = [];
+    stubFetch(async (_url, init) => {
+      seen.push(init);
+      return new Response('{"a":1}', { status: 200, headers: { ETag: '"v1"' } });
+    });
+    expect(await api('GET', '/x', undefined, 4000, false, { 'If-None-Match': '"v0"' })).toEqual({ kind: 'ok', data: { a: 1 }, etag: '"v1"' });
+    expect(seen[0].headers).toEqual({ 'If-None-Match': '"v0"' });
+    await api('POST', '/x', { b: 2 }, 4000, false, { 'X-Extra': '1' });
+    expect(seen[1].headers).toEqual({ 'X-Extra': '1', 'Content-Type': 'application/json' });
+  });
+
+  test('a 304 is an http result the caller can tell apart', async () => {
+    stubFetch(async () => new Response(null, { status: 304 }));
+    expect(await api('GET', '/x', undefined, 4000, false, { 'If-None-Match': '"v1"' })).toEqual({ kind: 'http', status: 304, error: 'unknown' });
+  });
 });
