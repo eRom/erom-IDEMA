@@ -386,24 +386,32 @@ struct ScreenQuery {
 const DEFAULT_HISTORY: u16 = 200;
 const MAX_HISTORY: u16 = 2000;
 
-/// Le client accepte-t-il gzip ? Un jeton `gzip` (ou `*`) dont le poids n'est pas zéro.
+/// Le client accepte-t-il gzip ? Un jeton `gzip` explicite décide seul (donc `gzip;q=0` l'emporte sur `*`, RFC 9110) ;
+/// à défaut, `*` ; dans les deux cas, un poids différent de zéro.
 fn accepts_gzip(headers: &HeaderMap) -> bool {
-    headers
+    let mut explicit: Option<bool> = None;
+    let mut star: Option<bool> = None;
+    for token in headers
         .get_all(header::ACCEPT_ENCODING)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|line| line.split(','))
-        .any(|token| {
-            let mut parts = token.split(';');
-            let coding = parts.next().unwrap_or("").trim();
-            let weight_zero = parts.any(|param| {
-                param
-                    .trim()
-                    .strip_prefix("q=")
-                    .is_some_and(|q| q.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
-            });
-            (coding.eq_ignore_ascii_case("gzip") || coding == "*") && !weight_zero
-        })
+    {
+        let mut parts = token.split(';');
+        let coding = parts.next().unwrap_or("").trim();
+        let weight_zero = parts.any(|param| {
+            param
+                .trim()
+                .strip_prefix("q=")
+                .is_some_and(|q| q.trim().parse::<f32>().is_ok_and(|q| q <= 0.0))
+        });
+        if coding.eq_ignore_ascii_case("gzip") {
+            explicit = Some(explicit.unwrap_or(false) || !weight_zero);
+        } else if coding == "*" {
+            star = Some(star.unwrap_or(false) || !weight_zero);
+        }
+    }
+    explicit.or(star).unwrap_or(false)
 }
 
 /// L'écran capturé, prêt à servir : 304 ou un corps JSON (compressé ou non).
@@ -1591,6 +1599,27 @@ mod tests {
         }
         let any = service.request("GET", "/app.css", &[("Accept-Encoding", "*")], None);
         assert_eq!(any.header("content-encoding"), Some("gzip"));
+        // Un `gzip;q=0` explicite l'emporte sur `*` (RFC 9110), dans les deux ordres.
+        for vetoed in ["gzip;q=0, *", "*, gzip;q=0"] {
+            let reply = service.request("GET", "/app.css", &[("Accept-Encoding", vetoed)], None);
+            assert_eq!(reply.header("content-encoding"), None, "{vetoed}");
+        }
+        // `gzip` explicite accepté malgré `*;q=0`.
+        let only_gzip = service.request(
+            "GET",
+            "/app.css",
+            &[("Accept-Encoding", "gzip, *;q=0")],
+            None,
+        );
+        assert_eq!(only_gzip.header("content-encoding"), Some("gzip"));
+
+        // HEAD avec gzip : mêmes en-têtes que GET, corps vide.
+        let head = service.request("HEAD", "/app.css", &zip, None);
+        assert_eq!(head.status, 200);
+        assert_eq!(head.header("content-encoding"), Some("gzip"));
+        assert_eq!(head.header("vary"), Some("Accept-Encoding"));
+        assert!(head.header("etag").is_some());
+        assert!(head.body.is_empty());
 
         // Les images ne sont jamais recompressées, même demandées.
         for png in ["/icons/icon-180.png", "/logos/claude.png"] {

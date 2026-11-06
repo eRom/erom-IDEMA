@@ -1,6 +1,5 @@
 # Build
 /target
-/probe/web-push/target/
 
 # Machine locale
 .DS_Store

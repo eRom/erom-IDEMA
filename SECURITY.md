@@ -23,6 +23,7 @@ Tout le reste part d'un geste :
 | Chercher ou ajouter une compétence (volet Projet) | la recherche, le paquet `skills` | skills.sh et le registre npm, via `bunx skills` |
 | Ouvrir la galerie Artifacts | une requête avec votre session claude.ai | claude.ai |
 | Naviguer dans le volet Browser, onglets rouverts compris | ce qu'envoie n'importe quel navigateur | les sites visités |
+| Notification du compagnon (éteint par défaut) | le nom de la session et ses dernières lignes, chiffrés pour l'appareil appairé | le service push de l'appareil, `web.push.apple.com` pour un iPhone |
 
 ### Secrets
 
@@ -30,6 +31,10 @@ Tout le reste part d'un geste :
 - Les cookies du navigateur intégré restent dans le magasin WebKit d'IdemA. IdemA n'en lit jamais la valeur.
 - Le journal `~/.config/idema/logs/idema.log` ne contient ni clé, ni texte recherché, ni variables d'environnement des commandes Git.
 - Les terminaux démarrent dans un environnement nettoyé : les variables de session d'un agent qui aurait lancé IdemA n'y passent pas.
+- Compagnon iPhone (éteint par défaut) : le jeton d'un appareil appairé n'est gardé que sous forme d'empreinte, et son cookie est borné au chemin `/idema-api`. Le jeton d'un appareil vaut un accès en écriture aux panes : qui le détient peut taper dans vos sessions. Oubliez l'appareil dans Personnaliser › Compagnon pour le révoquer.
+- La clé VAPID du compagnon est écrite en mode 0600 dans le dossier de configuration d'IdemA. Le service n'écoute que sur `127.0.0.1` ; l'exposer sur votre tailnet (`tailscale serve`) est votre choix, et Funnel (exposition sur Internet) est déconseillé.
+- Défense contre les requêtes intersites : aucune route d'écriture du compagnon n'accepte autre chose que du JSON, et le service n'envoie jamais d'en-tête CORS. Ces deux règles ne se relâchent pas.
+- Le compagnon n'envoie aucune télémétrie : les mesures de la page ne sont écrites que dans le journal local.
 
 ### Git
 
