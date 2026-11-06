@@ -19,7 +19,9 @@
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 [hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font: 400 17px/1.35 var(--font); -webkit-text-size-adjust: 100%; overscroll-behavior: none; }
-#app { display: flex; flex-direction: column; height: 100dvh; height: 100lvh; padding-top: var(--safe-top); }
+/* Boîte fixe et opaque qui couvre la vue : elle prend exactement la hauteur visible, barre d'état comprise ou non, et
+   WebKit ne pose pas son flou de bord d'iOS 26 sur le haut d'une telle boîte (WebKit PR #43516, bug 290963). */
+#app { position: fixed; inset: 0; display: flex; flex-direction: column; padding-top: var(--safe-top); background: var(--bg); }
 h1 { margin: 0 0 var(--u); font-size: 22px; font-weight: 700; line-height: 1.2; }
 p { margin: 0; }
 .muted { color: var(--text-2); font-size: 15px; }
