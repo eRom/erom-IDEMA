@@ -32,7 +32,7 @@ p { margin: 0; }
 .view { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
 /* La marge du bas rend 5 px à l'indicateur d'accueil : jugé sur l'iPhone 15 Pro Max le 06/11, la barre entière à 34 pt
    flottait trop haut. */
-.tabs { display: flex; flex: none; background: var(--bar); border-top: 1px solid var(--separator); padding-bottom: max(0px, calc(var(--safe-bottom) - 5px)); }
+.tabs { display: flex; flex: none; background: var(--bar); border-top: 1px solid var(--separator); padding-top: 5px; padding-bottom: max(0px, calc(var(--safe-bottom) - 10px)); }
 .tab { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-height: var(--tab-height); padding: 4px 0; border: 0; background: none; color: var(--text-3); font: 600 11px/1.2 var(--font); transition: color var(--move); }
 .tab[aria-selected='true'] { color: var(--accent-text); }
 .tab:active { background: var(--press); }
