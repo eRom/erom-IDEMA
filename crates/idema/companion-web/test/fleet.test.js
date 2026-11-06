@@ -122,6 +122,26 @@ describe('mountFleet', () => {
     expect(root.querySelector('.fleet__summary')?.textContent).toBe('2 en cours');
   });
 
+  test('an identical notification keeps the buttons, and the tick rewrites the durations in place', () => {
+    /** @type {(() => void)[]} */
+    const ticks = [];
+    const clock = { ...timers, setInterval: (/** @type {() => void} */ fn) => ticks.push(fn) };
+    const store = createStore(localStorage);
+    const data = fleet([session('a', 'waiting', { state_since: Date.now() - 3 * MIN })]);
+    store.setFleet(data, NOW);
+    mountFleet(root, /** @type {any} */ ({ store, timers: clock }));
+    const button = root.querySelector('.row');
+    const state = /** @type {HTMLElement} */ (root.querySelector('.row__state'));
+    expect(state.textContent).toBe('attend · 3 min');
+    store.setFleet(data, NOW);
+    store.setConnection('ok');
+    expect(root.querySelector('.row')).toBe(button);
+    data.sessions[0].state_since = Date.now() - 10 * MIN;
+    ticks[0]();
+    expect(root.querySelector('.row')).toBe(button);
+    expect(state.textContent).toBe('attend · 10 min');
+  });
+
   test('without any fleet yet it says it is reading, and a text from the Mac stays text', () => {
     const { store, unmount } = mount(null);
     expect(root.textContent).toContain('Lecture de la flotte');

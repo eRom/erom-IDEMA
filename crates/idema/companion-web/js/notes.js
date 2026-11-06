@@ -30,14 +30,15 @@ export function mountNotes(root, { store, request }) {
   // Pas d'ajout tant que le Mac ne répond pas : la ligne resterait dans le champ.
   const syncButton = () => void (add.disabled = store.state.connection !== 'ok');
 
-  async function load() {
+  /** @param {boolean} [scroll] vers le bas : au premier affichage et après un ajout, jamais à la reprise */
+  async function load(scroll = false) {
     const reply = await request('GET', '/scratchpad');
     if (!alive) return;
     if (reply.kind !== 'ok') return void (meta.textContent = 'Le Mac ne répond pas : la note affichée peut être ancienne.');
     const { text: note = '', modified_at: at } = reply.data;
     meta.textContent = note === '' ? 'La note est vide.' : at ? `Modifiée il y a ${ageFr(at, Date.now())}` : '';
     text.replaceChildren(...linkify(note));
-    text.scrollTop = text.scrollHeight;
+    if (scroll) text.scrollTop = text.scrollHeight;
   }
 
   async function send() {
@@ -49,14 +50,20 @@ export function mountNotes(root, { store, request }) {
     const reply = await request('POST', '/scratchpad/append', { line: checked.line });
     if (!alive) return;
     syncButton();
+    if (reply.kind === 'timeout') {
+      // Le Mac a peut-être écrit la ligne : on la garde dans le champ et on relit la note pour qu'on puisse voir.
+      status.textContent = 'Le Mac ne répond pas : vérifiez la note avant de réessayer.';
+      return void load();
+    }
     if (reply.kind !== 'ok') return void (status.textContent = `${reply.kind === 'http' ? 'Le Mac a refusé la ligne' : 'Mac injoignable'} : elle n'a pas été ajoutée.`);
     input.value = '';
-    await load();
+    await load(true);
   }
 
   syncButton();
   const unsubscribe = store.subscribe(syncButton);
-  void load();
-  addEventListener('idema:resume', load);
-  return () => ((alive = false), unsubscribe(), removeEventListener('idema:resume', load));
+  const resume = () => void load();
+  void load(true);
+  addEventListener('idema:resume', resume);
+  return () => ((alive = false), unsubscribe(), removeEventListener('idema:resume', resume));
 }

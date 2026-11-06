@@ -67,6 +67,33 @@ describe('mountNotes', () => {
     expect(root.querySelector('.notes__meta')?.textContent).toBe('Modifiée il y a 5 min');
   });
 
+  test('a timeout keeps the line, tells to check the note, and reads it again', async () => {
+    const { calls } = mount((method) => (method === 'POST' ? { kind: 'timeout' } : { kind: 'ok', data: { text: 'x', modified_at: 1 } }));
+    await flush();
+    input().value = 'ma ligne';
+    addButton().click();
+    await flush();
+    expect(root.querySelector('.status')?.textContent).toBe('Le Mac ne répond pas : vérifiez la note avant de réessayer.');
+    expect(input().value).toBe('ma ligne');
+    expect(calls.filter((c) => c.method === 'GET').length).toBe(2);
+  });
+
+  test('scrolls to the bottom on the first load and after an append, never on a resume', async () => {
+    const { calls: _calls } = mount(() => ({ kind: 'ok', data: { text: 'a\nb', modified_at: 1 } }));
+    const box = /** @type {HTMLElement} */ (root.querySelector('.notes__text'));
+    Object.defineProperty(box, 'scrollHeight', { value: 500 });
+    await flush();
+    expect(box.scrollTop).toBe(500);
+    box.scrollTop = 40;
+    dispatchEvent(new Event('idema:resume'));
+    await flush();
+    expect(box.scrollTop).toBe(40);
+    input().value = 'c';
+    addButton().click();
+    await flush();
+    expect(box.scrollTop).toBe(500);
+  });
+
   test('adds a line, then reads the note again', async () => {
     let note = 'une';
     const { calls } = mount((method, _path, body) => {

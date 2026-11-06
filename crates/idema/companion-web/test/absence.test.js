@@ -87,7 +87,7 @@ describe('mountAbsence', () => {
     const paths = [];
     const request = async (/** @type {string} */ _method, /** @type {string} */ path) => (paths.push(path), reply);
     const unmount = mountAbsence(root, /** @type {any} */ ({ store, request }));
-    return { paths, unmount };
+    return { store, paths, unmount };
   }
 
   test('asks the timeline since the last visit and tells it in phrases; a row opens its session', async () => {
@@ -114,6 +114,35 @@ describe('mountAbsence', () => {
     mount({ kind: 'ok', data: { started_at: at(15, 30), events: [] } });
     await flush();
     expect(root.textContent).toContain("Depuis le démarrage d'IdemA à 15:30");
+  });
+
+  test('says it is reading until the first reply', async () => {
+    mount(new Promise(() => {}));
+    expect(root.textContent).toContain('Lecture…');
+  });
+
+  test('a fleet that arrives after the mount names the sessions and makes the rows open', async () => {
+    localStorage.clear();
+    const store = createStore(localStorage);
+    const request = async () => ({ kind: 'ok', data: { started_at: at(8, 0), events: [event(at(16, 20), 'idema-aaaa1111', 'running', 'error')] } });
+    mountAbsence(root, /** @type {any} */ ({ store, request }));
+    await flush();
+    expect(root.querySelector('.row')?.textContent).toContain('Session fermée');
+    expect(root.querySelector('.row')?.textContent).toContain("L'agent est passé en erreur");
+    store.setFleet({ mac: 'Mac', generated_at: 1, badge: 0, projects: [], sessions: [{ name: 'idema-aaaa1111', display_name: 'refonte', state: 'idle', agents: [{ label: 'Codex', logo: null }], panes: [{ id: 3, active: true, state: 'idle' }] }] });
+    const row = /** @type {HTMLElement} */ (root.querySelector('.row'));
+    expect(row.textContent).toContain('refonte');
+    expect(row.textContent).toContain('Codex est passé en erreur');
+    row.click();
+    expect(location.hash).toBe('#/s/idema-aaaa1111/3');
+  });
+
+  test('a notification that does not bring a new fleet leaves the rows alone', async () => {
+    const { store } = mount({ kind: 'ok', data: { started_at: at(8, 0), events: [event(at(16, 20), 'idema-aaaa1111', 'running', 'error')] } });
+    await flush();
+    const row = root.querySelector('.row');
+    store.setConnection('offline');
+    expect(root.querySelector('.row')).toBe(row);
   });
 
   test('a session closed since is shown but does not open', async () => {

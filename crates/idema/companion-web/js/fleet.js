@@ -34,28 +34,41 @@ const STATE_TEXT = /** @type {Record<string, string>} */ ({ idle: 'au repos', ru
 const LINK_DOT = /** @type {const} */ ({ ok: 'running', timeout: 'waiting', offline: 'error' });
 
 /** @param {any} s @param {number} now */
-function row(s, now) {
+const stateText = (s, now) => `${STATE_TEXT[s.state] ?? s.state} · ${ageFr(s.state_since, now)}`;
+
+/** @param {any} s @param {[HTMLElement, any][]} ages les durées, remises à jour sur place par la minuterie */
+function row(s, ages) {
   const agents = s.agents.map((/** @type {{label: string, logo: string | null}} */ a) =>
     a.logo ? el('img', { class: 'row__logo', src: `/logos/${encodeURIComponent(a.logo)}.png`, alt: a.label }) : el('span', { class: 'row__agent' }, a.label),
   );
   const hot = s.state === 'waiting' || s.state === 'error';
+  const state = el('span', { class: 'row__state' }, stateText(s, Date.now()));
+  ages.push([state, s]);
   return el(
     'button',
     { class: hot ? 'row row--hot' : 'row', type: 'button', onclick: () => void (location.hash = openHash(s)) },
     el('span', { class: `dot dot--${s.state}` }),
     el('span', { class: 'row__name' }, s.display_name),
     el('span', { class: 'row__agents' }, agents),
-    el('span', { class: 'row__state' }, `${STATE_TEXT[s.state] ?? s.state} · ${ageFr(s.state_since, now)}`),
+    state,
   );
 }
 
 /** @type {import('./router.js').View} */
 export function mountFleet(root, { store, timers = realTimers }) {
+  /** @type {[HTMLElement, any][]} */
+  let ages = [];
+  let drawn = /** @type {any} */ (null);
+  let drawnLink = '';
   function render() {
     const { fleet, connection } = store.state;
+    // Une notification qui ne change rien ne refait pas l'écran : un bouton touché ne doit pas être détaché.
+    if (drawn !== null && fleet === drawn && connection === drawnLink) return;
+    drawn = fleet;
+    drawnLink = connection;
+    ages = [];
     if (!fleet) return root.replaceChildren(el('p', { class: 'muted fleet__empty' }, 'Lecture de la flotte…'));
     const next = triageHash(fleet);
-    const now = Date.now();
     root.replaceChildren(
       el(
         'div',
@@ -69,13 +82,14 @@ export function mountFleet(root, { store, timers = realTimers }) {
           el('button', { class: 'fleet__summary', type: 'button', disabled: !next, onclick: () => next && void (location.hash = next) }, summary(fleet)),
         ),
         groupFleet(fleet).map(({ title, sessions }) =>
-          el('section', { class: 'group' }, el('h2', { class: 'group__title' }, title), sessions.length ? sessions.map((s) => row(s, now)) : el('p', { class: 'group__empty' }, 'Aucune session')),
+          el('section', { class: 'group' }, el('h2', { class: 'group__title' }, title), sessions.length ? sessions.map((s) => row(s, ages)) : el('p', { class: 'group__empty' }, 'Aucune session')),
         ),
       ),
     );
   }
   render();
   const unsubscribe = store.subscribe(render);
-  const tick = timers.setInterval(render, 30_000); // les durées avancent sans que la flotte change
+  // Les durées avancent sans que la flotte change : on réécrit leur texte, sans toucher aux boutons.
+  const tick = timers.setInterval(() => ages.forEach(([span, s]) => void (span.textContent = stateText(s, Date.now()))), 30_000);
   return () => (unsubscribe(), timers.clearInterval(tick));
 }

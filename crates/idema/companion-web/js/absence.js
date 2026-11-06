@@ -44,15 +44,16 @@ export function phrases(events, startedAt, lastVisit, labelOf = () => "L'agent")
 /** @type {import('./router.js').View} */
 export function mountAbsence(root, { store, request }) {
   let alive = true;
+  /** La dernière réponse de la chronologie : l'écran se redessine d'elle quand la flotte change (noms, liens). @type {{data: any, lastVisit: number | null} | 'failed' | null} */
+  let last = null;
   /** @param {...import('./dom.js').Child} body */
   const page = (...body) => root.replaceChildren(el('div', { class: 'page' }, el('h1', null, 'Absence'), ...body));
-  async function load() {
-    const { lastVisit, fleet } = store.state;
-    const reply = await request('GET', `/timeline?since=${lastVisit ?? 0}`);
-    if (!alive) return;
-    if (reply.kind !== 'ok') return page(el('p', { class: 'muted' }, "Le Mac ne répond pas : impossible de lire l'absence."));
-    const find = (/** @type {string} */ name) => fleet?.sessions.find((s) => s.name === name);
-    const { head, items } = phrases(reply.data.events, reply.data.started_at, lastVisit, (n) => find(n)?.agents[0]?.label ?? find(n)?.display_name ?? "L'agent");
+  function render() {
+    if (last === null) return page(el('p', { class: 'muted' }, 'Lecture…'));
+    if (last === 'failed') return page(el('p', { class: 'muted' }, "Le Mac ne répond pas : impossible de lire l'absence."));
+    const { data, lastVisit } = last;
+    const find = (/** @type {string} */ name) => store.state.fleet?.sessions.find((s) => s.name === name);
+    const { head, items } = phrases(data.events, data.started_at, lastVisit, (n) => find(n)?.agents[0]?.label ?? find(n)?.display_name ?? "L'agent");
     page(
       head && el('p', { class: 'muted' }, head),
       items.length
@@ -63,7 +64,22 @@ export function mountAbsence(root, { store, request }) {
         : el('p', { class: 'muted' }, 'Rien à signaler depuis votre dernière visite.'),
     );
   }
+  async function load() {
+    const { lastVisit } = store.state;
+    const reply = await request('GET', `/timeline?since=${lastVisit ?? 0}`);
+    if (!alive) return;
+    // Un échec à la reprise ne chasse pas ce qui est déjà affiché.
+    if (reply.kind === 'ok') last = { data: reply.data, lastVisit };
+    else last ??= 'failed';
+    render();
+  }
+  render();
+  let seen = store.state.fleet;
+  const unsubscribe = store.subscribe(() => {
+    // Seule une nouvelle flotte change l'écran : le reste ne doit pas détacher une ligne touchée.
+    if (store.state.fleet !== seen) (seen = store.state.fleet), render();
+  });
   void load();
   addEventListener('idema:resume', load);
-  return () => ((alive = false), removeEventListener('idema:resume', load));
+  return () => ((alive = false), unsubscribe(), removeEventListener('idema:resume', load));
 }
