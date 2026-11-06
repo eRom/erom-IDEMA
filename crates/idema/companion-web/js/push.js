@@ -2,6 +2,8 @@
 // Les notifications côté page : abonnement (le geste exigé par iOS), clé du Mac, test, pastille de l'icône.
 // Le service worker (sw.js) affiche les push ; ici on s'abonne et on garde l'abonnement d'aplomb.
 
+import { safeLocalStorage } from './store.js';
+
 /** Attente du service worker prêt : passé ce délai, il n'est pas enregistré et rien ne viendra. */
 export const READY_TIMEOUT_MS = 8000;
 /** Le test attend l'envoi réel vers le service push (10 s de curl côté Mac), donc plus que les 4 s ordinaires. */
@@ -279,15 +281,39 @@ export function testMessage(outcome) {
  * @typedef {object} PushState
  * @property {boolean} supported le navigateur sait faire du push (app installée, iOS 16.4 et plus)
  * @property {NotificationPermission} permission
- * @property {boolean} subscribed cet appareil est abonné chez le Mac
+ * @property {boolean | null} subscribed cet appareil est abonné chez le Mac ; `null` tant qu'on ne le sait pas (ni lu, ni gardé d'un lancement précédent)
  * @property {boolean} busy un geste est en cours
  * @property {{text: string, ok: boolean} | null} message le dernier résultat, dit en français
  */
 
-/** @param {{request: Request, env?: PushEnv}} deps */
-export function createPushController({ request, env = browserEnv() }) {
+/** Où le dernier état connu est gardé : un lancement hors ligne montre ce qu'on savait. */
+export const SUBSCRIBED_KEY = 'idema.push.subscribed';
+
+/** @param {Storage} storage @returns {boolean | null} */
+function readSubscribed(storage) {
+  try {
+    const saved = storage.getItem(SUBSCRIBED_KEY);
+    return saved === 'true' ? true : saved === 'false' ? false : null;
+  } catch {
+    return null;
+  }
+}
+
+/** @param {{request: Request, env?: PushEnv, storage?: Storage}} deps */
+export function createPushController({ request, env = browserEnv(), storage = safeLocalStorage() }) {
   /** @type {PushState} */
-  const state = { supported: isSupported(env), permission: env.Notification?.permission ?? 'default', subscribed: false, busy: false, message: null };
+  const state = { supported: isSupported(env), permission: env.Notification?.permission ?? 'default', subscribed: readSubscribed(storage), busy: false, message: null };
+
+  /** @param {boolean} value */
+  function setSubscribed(value) {
+    state.subscribed = value;
+    try {
+      storage.setItem(SUBSCRIBED_KEY, String(value));
+    } catch {
+      // Stockage refusé : l'état reste en mémoire pour cette page.
+    }
+  }
+
   /** @type {Set<(state: PushState) => void>} */
   const subscribers = new Set();
   /** @type {Promise<void> | null} */
@@ -327,7 +353,7 @@ export function createPushController({ request, env = browserEnv() }) {
         if (me.kind !== 'ok') return;
         const serverSubscribed = me.data?.subscribed === true;
         const outcome = await ensureSubscriptionMatchesKey({ request, env, serverSubscribed });
-        state.subscribed = outcome === 'unchanged' || outcome === 'restored' || outcome === 'resubscribed' || (outcome === 'failed' && serverSubscribed);
+        setSubscribed(outcome === 'unchanged' || outcome === 'restored' || outcome === 'resubscribed' || (outcome === 'failed' && serverSubscribed));
         notify();
       }
       // Les appels qui se chevauchent (démarrage, reprise, ouverture des réglages) partagent la même lecture.
@@ -339,14 +365,14 @@ export function createPushController({ request, env = browserEnv() }) {
     /** Le geste « Activer les notifications » : à appeler directement depuis le toucher. */
     async enable() {
       const outcome = await gesture(() => enableNotifications({ request, env }), enableMessage);
-      if (outcome === 'enabled') state.subscribed = true;
+      if (outcome === 'enabled') setSubscribed(true);
       notify();
     },
     async test() {
       const outcome = await gesture(() => sendTestNotification({ request }), testMessage);
       // Abonnement mort : le Mac l'a retiré ; le garder dans le navigateur le ferait redonner à chaque ouverture.
       if (outcome === 'gone') await dropLocalSubscription(env);
-      if (outcome === 'gone' || outcome === 'not_subscribed') state.subscribed = false;
+      if (outcome === 'gone' || outcome === 'not_subscribed') setSubscribed(false);
       notify();
     },
   };

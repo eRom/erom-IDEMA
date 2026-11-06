@@ -33,9 +33,9 @@ const APP_FILES = [
   '/js/time.js',
 ];
 
-/** Le nom du cache d'une version d'IdemA. @param {string} version */
-function cacheName(version) {
-  return CACHE_PREFIX + version;
+/** Le nom du cache d'une construction d'IdemA : sa version et l'empreinte de ses fichiers (`health`). @param {string} version @param {string} assets */
+function cacheName(version, assets) {
+  return `${CACHE_PREFIX}${version}-${assets}`;
 }
 
 /** Une adresse de l'app (chemin de l'origine, fragment compris), sinon `/`. @param {unknown} value */
@@ -89,14 +89,14 @@ async function showPush(payload) {
   }
 }
 
-/** La version d'IdemA que le Mac annonce, ou `null` s'il ne répond pas. */
-async function currentVersion() {
+/** La construction d'IdemA que le Mac annonce, ou `null` s'il ne répond pas. */
+async function currentBuild() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
   try {
     const response = await worker.fetch(HEALTH_URL, { cache: 'no-store', signal: controller.signal });
-    const { version } = await response.json();
-    return typeof version === 'string' && version !== '' ? version : null;
+    const { version, assets } = await response.json();
+    return typeof version === 'string' && version !== '' && typeof assets === 'string' && assets !== '' ? { version, assets } : null;
   } catch {
     return null;
   } finally {
@@ -104,39 +104,69 @@ async function currentVersion() {
   }
 }
 
+/** Un cache est complet quand la page d'accueil y est : `addAll` les pose toutes ou aucune. @param {string} name */
+async function isComplete(name) {
+  return (await (await worker.caches.open(name)).match('/')) !== undefined;
+}
+
 /**
- * Met en cache les fichiers de la version courante, puis retire les caches des autres. Un échec en cours de route
- * efface le cache entamé : il n'en reste que de complets. `force` reprend les fichiers même si le cache existe (un
- * `sw.js` nouveau vient d'une version nouvelle de l'app).
- * @param {boolean} [force]
+ * Télécharge les fichiers de la construction courante dans leur cache, s'il n'y est pas déjà complet. Un échec
+ * n'efface que ce que cet appel a créé, et ne fait jamais échouer l'installation. Les caches plus anciens restent
+ * jusqu'au lancement suivant (`activeCache`).
  */
-async function refreshAppCache(force = false) {
-  const version = await currentVersion();
-  if (version === null) return;
-  const name = cacheName(version);
-  if (!force && (await worker.caches.has(name))) return;
+async function refreshAppCache() {
   try {
-    const cache = await worker.caches.open(name);
-    await cache.addAll(APP_FILES);
+    const build = await currentBuild();
+    if (build === null) return;
+    const name = cacheName(build.version, build.assets);
+    if (await worker.caches.has(name)) {
+      if (await isComplete(name)) return;
+      // Reste d'un téléchargement interrompu : on le reprend à zéro.
+      await worker.caches.delete(name);
+    }
+    try {
+      await (await worker.caches.open(name)).addAll(APP_FILES);
+    } catch {
+      await worker.caches.delete(name);
+    }
   } catch {
-    await worker.caches.delete(name);
-    return;
+    // Stockage ou réseau en défaut : l'app garde son cache précédent, le lancement suivant réessaie.
   }
-  for (const key of await worker.caches.keys()) {
-    if (key.startsWith(CACHE_PREFIX) && key !== name) await worker.caches.delete(key);
+}
+
+/** Le nom du cache que ce worker sert, une fois choisi (le choix se refait à chaque lancement). @type {string | null} */
+let activeName = null;
+
+/**
+ * Le plus récent des caches complets ; avec `prune`, les plus anciens sont retirés : c'est ici, au début d'un lancement
+ * et avant toute lecture, que la version téléchargée au lancement précédent prend la place de l'ancienne.
+ * @param {boolean} prune
+ */
+async function activeCache(prune) {
+  if (activeName !== null && !prune) return activeName;
+  const names = (await worker.caches.keys()).filter((name) => name.startsWith(CACHE_PREFIX));
+  activeName = null;
+  for (let index = names.length - 1; index >= 0 && activeName === null; index--) {
+    if (await isComplete(names[index])) {
+      activeName = names[index];
+      if (prune) await Promise.all(names.slice(0, index).map((older) => worker.caches.delete(older)));
+    }
   }
+  return activeName;
 }
 
 /** @param {FetchEvent} event */
 async function serveApp(event) {
   const { request } = event;
   const page = request.mode === 'navigate';
+  // `waitUntil` se pose tout de suite, pendant la distribution de l'événement ; le téléchargement attend la fin du
+  // choix du cache (la version nouvelle sert au lancement suivant).
+  const chosen = activeCache(page).catch(() => null);
+  if (page) event.waitUntil(chosen.then(refreshAppCache));
+  const name = await chosen;
   // Une page s'ouvre sur `/` quel que soit le fragment ou les paramètres.
-  const lookup = worker.caches.match(page ? '/' : request, { ignoreSearch: true });
-  // La version nouvelle est reprise pour le lancement suivant, pas pour celui-ci. `waitUntil` se pose tout de suite,
-  // pendant la distribution de l'événement.
-  if (page) event.waitUntil(refreshAppCache());
-  return (await lookup) ?? worker.fetch(request);
+  const cached = name === null ? undefined : await (await worker.caches.open(name)).match(page ? '/' : request, { ignoreSearch: true });
+  return cached ?? worker.fetch(request);
 }
 
 /** @param {string} url */
@@ -158,7 +188,7 @@ async function openApp(url) {
 
 worker.addEventListener('install', (event) => {
   void worker.skipWaiting();
-  event.waitUntil(refreshAppCache(true));
+  event.waitUntil(refreshAppCache());
 });
 
 worker.addEventListener('activate', (event) => {

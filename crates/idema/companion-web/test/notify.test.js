@@ -1,6 +1,9 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mountActivationCard, mountSettings } from '../js/notify.js';
 import { createPushController, enableMessage, testMessage } from '../js/push.js';
+
+// Le dernier état connu vit dans `localStorage` : chaque test repart d'un stockage vide.
+beforeEach(() => localStorage.clear());
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -10,19 +13,18 @@ const failure = (/** @type {number} */ status, /** @type {string} */ error) => (
 
 /** Le navigateur et le Mac en faux, et le vrai contrôleur entre les deux : on touche, on lit ce que l'écran dit. */
 function setup({ supported = true, permission = 'default', answer = 'granted', subscribed = false, routes = /** @type {Record<string, any>} */ ({}) } = {}) {
+  const makeSubscription = () => ({
+    options: { applicationServerKey: new Uint8Array(Buffer.from(KEY, 'base64url')).buffer },
+    toJSON: () => ({ endpoint: 'https://web.push.apple.com/x', keys: { p256dh: 'p', auth: 'a' } }),
+    unsubscribe: async () => void (registration.current = null),
+  });
   /** @type {any} */
   const registration = {
-    current: null,
+    // Un appareil abonné chez le Mac l'est aussi dans le navigateur.
+    current: subscribed ? makeSubscription() : null,
     pushManager: {
       getSubscription: async () => registration.current,
-      subscribe: async () => {
-        registration.current = {
-          options: { applicationServerKey: new Uint8Array(Buffer.from(KEY, 'base64url')).buffer },
-          toJSON: () => ({ endpoint: 'https://web.push.apple.com/x', keys: { p256dh: 'p', auth: 'a' } }),
-          unsubscribe: async () => void (registration.current = null),
-        };
-        return registration.current;
-      },
+      subscribe: async () => (registration.current = makeSubscription()),
     },
   };
   const env = /** @type {any} */ (
@@ -90,8 +92,44 @@ describe('the activation card', () => {
     expect(unsupported.host.hidden).toBe(true);
   });
 
+  test('it stays hidden until the Mac has answered, so a subscribed user never sees it flash', async () => {
+    const app = setup({ permission: 'granted', subscribed: true });
+    /** @type {boolean[]} */
+    const seen = [];
+    mountCard(app);
+    app.push.subscribe(() => void seen.push(Boolean(app.host.hidden)));
+    expect(app.host.hidden).toBe(true); // avant toute réponse
+    await app.push.refresh();
+    expect(app.host.hidden).toBe(true);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every(Boolean)).toBe(true); // jamais visible, pas même une image
+  });
+
+  test('offline at launch, it shows what was last known: hidden if subscribed, shown if not', async () => {
+    const offline = { 'GET /me': { kind: 'offline' } };
+    const known = setup({ permission: 'granted', subscribed: true });
+    await known.push.refresh(); // dernier lancement en ligne : abonné
+    const relaunched = setup({ permission: 'granted', routes: offline });
+    mountCard(relaunched);
+    await relaunched.push.refresh();
+    expect(relaunched.host.hidden).toBe(true);
+    localStorage.setItem('idema.push.subscribed', 'false');
+    const notSubscribed = setup({ routes: offline });
+    mountCard(notSubscribed);
+    await notSubscribed.push.refresh();
+    expect(notSubscribed.host.hidden).toBe(false);
+  });
+
+  test('offline at the very first launch, nothing is known and the card stays hidden', async () => {
+    const app = setup({ routes: { 'GET /me': { kind: 'offline' } } });
+    mountCard(app);
+    await app.push.refresh();
+    expect(app.host.hidden).toBe(true);
+  });
+
   test('touching the button asks for the permission and the card goes away on success', async () => {
     const app = setup();
+    await app.push.refresh();
     mountCard(app);
     button(app.host, 'Activer les notifications')?.click();
     await flush();
@@ -102,6 +140,7 @@ describe('the activation card', () => {
 
   test('a refusal stays on the card, in words, with no button left to press', async () => {
     const app = setup({ answer: 'denied' });
+    await app.push.refresh();
     mountCard(app);
     button(app.host, 'Activer les notifications')?.click();
     await flush();
@@ -113,6 +152,7 @@ describe('the activation card', () => {
 
   test('a Mac that does not answer is told with the same sentence as the offline banner', async () => {
     const app = setup({ routes: { 'GET /push/key': { kind: 'offline' } } });
+    await app.push.refresh();
     mountCard(app);
     button(app.host, 'Activer les notifications')?.click();
     await flush();
@@ -122,6 +162,7 @@ describe('the activation card', () => {
 
   test('the button is disabled while the activation runs', async () => {
     const app = setup();
+    await app.push.refresh();
     mountCard(app);
     button(app.host, 'Activer les notifications')?.click();
     expect(button(app.host, 'Activer les notifications')?.disabled).toBe(true);

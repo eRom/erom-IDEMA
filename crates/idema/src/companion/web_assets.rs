@@ -150,15 +150,39 @@ fn etag_of(path: &str, bytes: &[u8]) -> &'static str {
     if let Some(etag) = cache.get(path) {
         return etag;
     }
-    let digest = Sha256::digest(bytes);
-    let short: String = digest
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let short = hex_prefix(&Sha256::digest(bytes), 8);
     let etag: &'static str = Box::leak(format!("\"{short}\"").into_boxed_str());
     cache.insert(path.to_owned(), etag);
     etag
+}
+
+/// Les `count` premiers octets d'une empreinte, en hexadécimal.
+fn hex_prefix(digest: &[u8], count: usize) -> String {
+    digest
+        .iter()
+        .take(count)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// L'empreinte d'un lot de fichiers : chemin et octets de chacun (longueurs en tête, pour qu'aucun découpage
+/// différent ne donne la même suite). 8 chiffres hexadécimaux.
+fn bundle_digest<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
+    let mut hasher = Sha256::new();
+    for (path, bytes) in files {
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    hex_prefix(&hasher.finalize(), 4)
+}
+
+/// L'identifiant du contenu de l'app (tous les fichiers embarqués, `sw.js` compris) : il change dès qu'un octet change,
+/// là où la version d'IdemA ne bouge pas entre deux constructions. Le service worker y nomme son cache.
+pub fn bundle_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| bundle_digest(FILES.iter().map(|(path, bytes, _)| (*path, *bytes))))
 }
 
 #[cfg(test)]
@@ -260,6 +284,32 @@ mod tests {
         ] {
             assert!(asset(hostile).is_none(), "{hostile}");
         }
+    }
+
+    #[test]
+    fn the_bundle_id_is_stable_and_follows_every_file() {
+        let id = bundle_id();
+        assert_eq!(id, bundle_id());
+        assert_eq!(id.len(), 8);
+        assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        // Le même lot donne la même empreinte ; un octet, un chemin ou un découpage différent la change.
+        let files: Vec<(&str, &[u8])> = vec![("/a.js", b"one"), ("/b.js", b"two")];
+        let base = bundle_digest(files.iter().copied());
+        assert_eq!(base, bundle_digest(files.iter().copied()));
+        let edited: Vec<(&str, &[u8])> = vec![("/a.js", b"one"), ("/b.js", b"twp")];
+        assert_ne!(base, bundle_digest(edited));
+        let renamed: Vec<(&str, &[u8])> = vec![("/a.js", b"one"), ("/c.js", b"two")];
+        assert_ne!(base, bundle_digest(renamed));
+        let shifted: Vec<(&str, &[u8])> = vec![("/a.js", b"onet"), ("/b.js", b"wo")];
+        assert_ne!(base, bundle_digest(shifted));
+        // Le vrai lot compte chaque fichier : sans `sw.js`, l'identifiant change.
+        let without_worker = bundle_digest(
+            FILES
+                .iter()
+                .filter(|(path, ..)| *path != "/sw.js")
+                .map(|(path, bytes, _)| (*path, *bytes)),
+        );
+        assert_ne!(id, without_worker);
     }
 
     #[test]

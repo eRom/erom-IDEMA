@@ -623,7 +623,9 @@ mod tests {
         let mut body = vec![0u8; length];
         health.read_exact(&mut body).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body, serde_json::json!({ "ok": true, "version": "test" }));
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["version"], "test");
+        assert_eq!(body["assets"], crate::companion::web_assets::bundle_id());
 
         let (mut stream, head) = get(port, "/idema-api/events", &cookie);
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");

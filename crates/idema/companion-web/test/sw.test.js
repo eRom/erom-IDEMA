@@ -16,13 +16,17 @@ function fakeCaches() {
     addAllCalls: 0,
     /** Chemins dont le téléchargement échoue (un 404 fait échouer `addAll` en entier). */
     failOn: /** @type {Set<string>} */ (new Set()),
+    /** Le stockage entier est en défaut. */
+    broken: false,
     has: async (/** @type {string} */ name) => stores.has(name),
     keys: async () => [...stores.keys()],
     delete: async (/** @type {string} */ name) => stores.delete(name),
     open: async (/** @type {string} */ name) => {
+      if (api.broken) throw new DOMException('quota', 'QuotaExceededError');
       const entries = stores.get(name) ?? new Map();
       stores.set(name, entries);
       return {
+        match: async (/** @type {any} */ request) => entries.get(pathOf(request))?.clone(),
         addAll: async (/** @type {string[]} */ urls) => {
           api.addAllCalls++;
           for (const url of urls) {
@@ -31,13 +35,6 @@ function fakeCaches() {
           }
         },
       };
-    },
-    match: async (/** @type {any} */ request) => {
-      for (const entries of stores.values()) {
-        const hit = entries.get(pathOf(request));
-        if (hit) return hit.clone();
-      }
-      return undefined;
     },
   };
   return api;
@@ -48,9 +45,9 @@ let counter = 0;
 /**
  * Charge `sw.js` dans un faux `ServiceWorkerGlobalScope` : le script s'exécute comme dans le navigateur, ses
  * écouteurs sont ceux qu'on déclenche ensuite.
- * @param {{version?: string | null, caches?: ReturnType<typeof fakeCaches>, windows?: any[], navigateFails?: boolean}} [options]
+ * @param {{version?: string | null, assets?: string, caches?: ReturnType<typeof fakeCaches>, windows?: any[], navigateFails?: boolean}} [options]
  */
-async function loadWorker({ version = '1.0.0', caches = fakeCaches(), windows = [], navigateFails = false } = {}) {
+async function loadWorker({ version = '1.0.0', assets = 'a1', caches = fakeCaches(), windows = [], navigateFails = false } = {}) {
   /** @type {Record<string, ((event: any) => void)[]>} */
   const listeners = {};
   const log = {
@@ -94,7 +91,7 @@ async function loadWorker({ version = '1.0.0', caches = fakeCaches(), windows = 
       log.networkPaths.push(path);
       if (path === '/idema-api/health') {
         if (version === null) throw new TypeError('network');
-        return Response.json({ ok: true, version });
+        return Response.json({ ok: true, version, assets });
       }
       return new Response(`network:${path}`);
     },
@@ -148,12 +145,13 @@ afterEach(() => {
 });
 
 describe('install and the app cache', () => {
-  test('the cache is named after the version and holds every file of the app folder', async () => {
-    const worker = await loadWorker({ version: '2.4.1' });
+  test('the cache is named after the version and the assets hash, and holds every file of the app folder', async () => {
+    const worker = await loadWorker({ version: '2.4.1', assets: 'f00dbeef' });
     await worker.dispatch('install');
     const names = await worker.caches.keys();
     expect(names.length).toBe(1);
     expect(names[0]).toContain('2.4.1');
+    expect(names[0]).toContain('f00dbeef');
     // Un fichier oublié dans la liste du worker laisserait l'app blanche hors ligne.
     expect(cached(worker.caches, names[0])).toEqual(appFilesOnDisk());
     expect(worker.log.skipped).toBe(1);
@@ -167,12 +165,41 @@ describe('install and the app cache', () => {
 
   test('a download that fails midway leaves no half cache, and the older complete one stays', async () => {
     const caches = fakeCaches();
-    await (await caches.open('idema-1.0.0')).addAll(['/']);
-    caches.addAllCalls = 0;
+    await (await caches.open('idema-1.0.0-a1')).addAll(['/']);
     caches.failOn.add('/js/shell.js');
     const worker = await loadWorker({ version: '1.1.0', caches });
     await worker.dispatch('install');
-    expect(await caches.keys()).toEqual(['idema-1.0.0']);
+    expect(await caches.keys()).toEqual(['idema-1.0.0-a1']);
+  });
+
+  test('a download that fails never deletes a complete cache of the same name', async () => {
+    const caches = fakeCaches();
+    await (await caches.open('idema-1.0.0-a1')).addAll(['/', '/js/api.js']);
+    caches.failOn.add('/js/shell.js');
+    const worker = await loadWorker({ caches }); // même construction : déjà complète, rien à télécharger
+    await worker.dispatch('install');
+    expect(cached(caches, 'idema-1.0.0-a1')).toEqual(['/', '/js/api.js']);
+    expect(caches.addAllCalls).toBe(1); // celui de la mise en place ci-dessus
+  });
+
+  test('a half cache of the same name is started over, and removed if it fails again', async () => {
+    const caches = fakeCaches();
+    await caches.open('idema-1.0.0-a1'); // créé vide : un reste interrompu
+    caches.failOn.add('/js/shell.js');
+    const worker = await loadWorker({ caches });
+    await worker.dispatch('install');
+    expect(await caches.keys()).toEqual([]);
+    caches.failOn.clear();
+    await worker.dispatch('install');
+    expect(cached(caches, 'idema-1.0.0-a1')).toEqual(appFilesOnDisk());
+  });
+
+  test('a storage that fails never fails the install', async () => {
+    const caches = fakeCaches();
+    caches.broken = true;
+    const worker = await loadWorker({ caches });
+    await worker.dispatch('install'); // rien ne doit lever
+    expect(worker.log.skipped).toBe(1);
   });
 
   test('activation takes over the open pages', async () => {
@@ -188,9 +215,9 @@ describe('serving the app', () => {
     await loadWorker({ caches }).then((worker) => worker.dispatch('install'));
     const offline = await loadWorker({ caches, version: null });
     const outcome = await offline.dispatch('fetch', offline.fetchEvent('/?from=notification', { mode: 'navigate' }));
-    expect(await (await outcome.responded)?.text()).toBe('idema-1.0.0:/');
+    expect(await (await outcome.responded)?.text()).toBe('idema-1.0.0-a1:/');
     const asset = await offline.dispatch('fetch', offline.fetchEvent('/js/api.js'));
-    expect(await (await asset.responded)?.text()).toBe('idema-1.0.0:/js/api.js');
+    expect(await (await asset.responded)?.text()).toBe('idema-1.0.0-a1:/js/api.js');
     expect(offline.log.networkPaths.filter((path) => path.startsWith('/js'))).toEqual([]);
   });
 
@@ -213,15 +240,39 @@ describe('serving the app', () => {
     }
   });
 
-  test('a new version is downloaded at the launch, used by the next one, and the old cache goes', async () => {
+  test('a new version is downloaded at one launch, and replaces the old cache at the start of the next', async () => {
     const caches = fakeCaches();
     await loadWorker({ caches, version: '1.0.0' }).then((worker) => worker.dispatch('install'));
     const upgraded = await loadWorker({ caches, version: '1.1.0' });
     const launch = await upgraded.dispatch('fetch', upgraded.fetchEvent('/', { mode: 'navigate' }));
-    expect(await (await launch.responded)?.text()).toBe('idema-1.0.0:/'); // ce lancement reste sur l'ancienne
-    expect(await caches.keys()).toEqual(['idema-1.1.0']);
+    expect(await (await launch.responded)?.text()).toBe('idema-1.0.0-a1:/'); // ce lancement reste sur l'ancienne
+    expect(await caches.keys()).toEqual(['idema-1.0.0-a1', 'idema-1.1.0-a1']); // rien n'est retiré en cours de lancement
     const next = await upgraded.dispatch('fetch', upgraded.fetchEvent('/', { mode: 'navigate' }));
-    expect(await (await next.responded)?.text()).toBe('idema-1.1.0:/');
+    expect(await (await next.responded)?.text()).toBe('idema-1.1.0-a1:/');
+    expect(await caches.keys()).toEqual(['idema-1.1.0-a1']);
+  });
+
+  test('a build where only the assets hash differs replaces the cache too', async () => {
+    const caches = fakeCaches();
+    await loadWorker({ caches, assets: 'aaaaaaaa' }).then((worker) => worker.dispatch('install'));
+    const rebuilt = await loadWorker({ caches, assets: 'bbbbbbbb' }); // même version d'IdemA, un fichier de l'app a changé
+    const launch = await rebuilt.dispatch('fetch', rebuilt.fetchEvent('/', { mode: 'navigate' }));
+    expect(await (await launch.responded)?.text()).toBe('idema-1.0.0-aaaaaaaa:/');
+    const next = await rebuilt.dispatch('fetch', rebuilt.fetchEvent('/js/shell.js'));
+    const nextPage = await rebuilt.dispatch('fetch', rebuilt.fetchEvent('/', { mode: 'navigate' }));
+    expect(await (await nextPage.responded)?.text()).toBe('idema-1.0.0-bbbbbbbb:/');
+    expect(await (await next.responded)?.text()).toBe('idema-1.0.0-aaaaaaaa:/js/shell.js'); // celui du lancement déjà ouvert
+    expect(await caches.keys()).toEqual(['idema-1.0.0-bbbbbbbb']);
+  });
+
+  test('a half cache left by an interrupted download never shadows the complete one', async () => {
+    const caches = fakeCaches();
+    await (await caches.open('idema-0.9.0-zz')).addAll(['/js/api.js']); // sans la page d'accueil : incomplet, et plus ancien
+    await (await caches.open('idema-1.0.0-a1')).addAll(['/', '/js/api.js']);
+    const worker = await loadWorker({ caches, version: null });
+    const outcome = await worker.dispatch('fetch', worker.fetchEvent('/', { mode: 'navigate' }));
+    expect(await (await outcome.responded)?.text()).toBe('idema-1.0.0-a1:/');
+    expect(await caches.keys()).toEqual(['idema-1.0.0-a1']);
   });
 
   test('the same version is not downloaded again at each launch', async () => {

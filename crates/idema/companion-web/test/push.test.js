@@ -1,6 +1,7 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
 import {
   createPushController,
+  SUBSCRIBED_KEY,
   enableMessage,
   enableNotifications,
   ensureSubscriptionMatchesKey,
@@ -11,6 +12,9 @@ import {
   syncBadge,
   testMessage,
 } from '../js/push.js';
+
+// Le dernier état connu vit dans `localStorage` : chaque test repart d'un stockage vide.
+beforeEach(() => localStorage.clear());
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -380,6 +384,7 @@ describe('createPushController', () => {
   test('a refusal leaves the device unsubscribed and says where to change it', async () => {
     const browser = fakeBrowser({ answer: 'denied' });
     const push = createPushController({ request: fakeRequest(withKey).request, env: browser.env });
+    await push.refresh();
     await push.enable();
     expect(push.state).toMatchObject({ subscribed: false, permission: 'denied' });
     expect(push.state.message).toEqual({ text: enableMessage('denied'), ok: false });
@@ -407,6 +412,49 @@ describe('createPushController', () => {
     expect(push.state.message?.text).toBe(testMessage('gone'));
     await push.refresh();
     expect(mac.called('/push/subscription')).toEqual([]);
+  });
+
+  test('nothing is known before the first answer, then the answer is kept for the next launch', async () => {
+    const browser = fakeBrowser({ permission: 'granted', existing: keyOf(7) });
+    const mac = fakeRequest({ ...withKey, 'GET /me': ok({ subscribed: true }) });
+    const push = createPushController({ request: mac.request, env: browser.env });
+    expect(push.state.subscribed).toBeNull();
+    await push.refresh();
+    expect(push.state.subscribed).toBe(true);
+    expect(localStorage.getItem(SUBSCRIBED_KEY)).toBe('true');
+    const next = createPushController({ request: fakeRequest({ 'GET /me': { kind: 'offline' } }).request, env: browser.env });
+    expect(next.state.subscribed).toBe(true); // lu avant toute requête
+    await next.refresh();
+    expect(next.state.subscribed).toBe(true); // et gardé quand le Mac ne répond pas
+  });
+
+  test('each change of the state is kept: activation, then a dead subscription', async () => {
+    const browser = fakeBrowser();
+    const mac = fakeRequest({ ...withKey, 'POST /push/test': failure(502, 'push_gone') });
+    const push = createPushController({ request: mac.request, env: browser.env });
+    await push.enable();
+    expect(localStorage.getItem(SUBSCRIBED_KEY)).toBe('true');
+    await push.test();
+    expect(localStorage.getItem(SUBSCRIBED_KEY)).toBe('false');
+  });
+
+  test('an unreadable or refused storage leaves the state unknown, and does not break the controller', async () => {
+    localStorage.setItem(SUBSCRIBED_KEY, 'maybe');
+    const browser = fakeBrowser();
+    const push = createPushController({ request: fakeRequest(withKey).request, env: browser.env });
+    expect(push.state.subscribed).toBeNull();
+    const refused = /** @type {Storage} */ (/** @type {unknown} */ ({
+      getItem: () => {
+        throw new DOMException('blocked', 'SecurityError');
+      },
+      setItem: () => {
+        throw new DOMException('blocked', 'SecurityError');
+      },
+    }));
+    const guarded = createPushController({ request: fakeRequest(withKey).request, env: browser.env, storage: refused });
+    expect(guarded.state.subscribed).toBeNull();
+    await guarded.enable();
+    expect(guarded.state.subscribed).toBe(true); // en mémoire pour cette page
   });
 
   test('subscribers hear every change and can leave', async () => {

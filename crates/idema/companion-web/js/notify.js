@@ -28,7 +28,8 @@ function activateButton(push, label) {
 export function mountActivationCard(container, push) {
   function render() {
     const { state } = push;
-    container.hidden = !state.supported || state.subscribed;
+    // Tant qu'on ne sait pas (`null`), la carte reste cachée : un abonné ne la voit pas clignoter au lancement.
+    container.hidden = !state.supported || state.subscribed !== false;
     if (container.hidden) return;
     container.replaceChildren(
       el(
@@ -54,6 +55,7 @@ export function mountActivationCard(container, push) {
 function stateText({ supported, permission, subscribed }) {
   if (!supported) return "Indisponibles ici : ouvrez IdemA depuis l'écran d'accueil (iOS 16.4 ou plus).";
   if (permission === 'denied') return "Refusées dans les réglages de l'iPhone.";
+  if (subscribed === null) return "Lecture de l'état en cours.";
   return subscribed ? 'Activées sur cet appareil.' : 'Désactivées sur cet appareil.';
 }
 
@@ -61,7 +63,7 @@ function stateText({ supported, permission, subscribed }) {
 export function mountSettings(root, { push }) {
   function render() {
     const { state } = push;
-    const canActivate = state.supported && !state.subscribed && state.permission !== 'denied';
+    const canActivate = state.supported && state.subscribed === false && state.permission !== 'denied';
     root.replaceChildren(
       el(
         'section',

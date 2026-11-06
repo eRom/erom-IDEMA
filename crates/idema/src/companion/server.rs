@@ -229,7 +229,8 @@ fn is_json(headers: &HeaderMap) -> bool {
 async fn health(State(state): State<AppState>) -> Response {
     json_reply(
         StatusCode::OK,
-        serde_json::json!({ "ok": true, "version": state.version }).to_string(),
+        serde_json::json!({ "ok": true, "version": state.version, "assets": web_assets::bundle_id() })
+            .to_string(),
     )
 }
 
