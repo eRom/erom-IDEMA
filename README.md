@@ -158,9 +158,9 @@ La version vit à un seul endroit, `version` de `[workspace.package]` dans `Carg
 IdemA peut vous prévenir sur l'iPhone quand un agent attend, et vous laisser lui répondre. C'est éteint par défaut, sans compte Apple ni application à installer : une page web installée sur l'écran d'accueil.
 
 1. Dans **Personnaliser › Compagnon**, activez le compagnon.
-2. Exposez-le sur votre tailnet Tailscale : `tailscale serve --bg --https=<port> localhost:3910` (la section affiche la commande exacte).
+2. Exposez-le sur votre tailnet Tailscale avec `tailscale serve --bg --https=<port> localhost:<port du compagnon>` : la section affiche la commande exacte, avec votre port.
 3. Sur l'iPhone, ouvrez l'adresse affichée dans Safari, puis **Partager › Sur l'écran d'accueil**.
-4. Ouvrez la page installée et saisissez le code à 6 chiffres affiché dans Personnaliser.
+4. Ouvrez la page installée et saisissez le code à 6 chiffres affiché dans Personnaliser (il vaut 10 minutes).
 5. Activez les notifications.
 
 Un Mac en veille, ou IdemA fermé, n'envoie aucune notification.

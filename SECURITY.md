@@ -33,6 +33,7 @@ Tout le reste part d'un geste :
 - Les terminaux démarrent dans un environnement nettoyé : les variables de session d'un agent qui aurait lancé IdemA n'y passent pas.
 - Compagnon iPhone (éteint par défaut) : le jeton d'un appareil appairé n'est gardé que sous forme d'empreinte, et son cookie est borné au chemin `/idema-api`. Le jeton d'un appareil vaut un accès en écriture aux panes : qui le détient peut taper dans vos sessions. Oubliez l'appareil dans Personnaliser › Compagnon pour le révoquer.
 - La clé VAPID du compagnon est écrite en mode 0600 dans le dossier de configuration d'IdemA. Le service n'écoute que sur `127.0.0.1` ; l'exposer sur votre tailnet (`tailscale serve`) est votre choix, et Funnel (exposition sur Internet) est déconseillé.
+- Un autre service sur le même nom d'hôte, mais sur un autre port, reçoit le cookie du compagnon s'il fait demander `/idema-api/*` au navigateur sur son propre port : un cookie ne distingue pas les ports, et aucun attribut ne l'empêche. N'exposez sur le nom d'hôte du compagnon que des services que vous maîtrisez.
 - Défense contre les requêtes intersites : aucune route d'écriture du compagnon n'accepte autre chose que du JSON, et le service n'envoie jamais d'en-tête CORS. Ces deux règles ne se relâchent pas.
 - Le compagnon n'envoie aucune télémétrie : les mesures de la page ne sont écrites que dans le journal local.
 
