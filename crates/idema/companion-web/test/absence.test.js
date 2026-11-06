@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mountAbsence, phrases } from '../js/absence.js';
+import { EARLIER_MAX, earlierPhrases, mountAbsence, phrases } from '../js/absence.js';
 import { createStore } from '../js/store.js';
 
 const MIN = 60_000;
@@ -66,6 +66,18 @@ describe('phrases', () => {
   });
 });
 
+describe('earlierPhrases', () => {
+  test('tells what is before the last visit, with the waits paired over the whole buffer', () => {
+    const events = [event(at(14, 0), 'a', 'running', 'waiting'), event(at(14, 30), 'a', 'waiting', 'running'), event(at(14, 40), 'b', 'running', 'waiting'), event(at(14, 50), 'c', 'running', 'waiting'), event(at(16, 0), 'b', 'waiting', 'running')];
+    // L'attente de b se clôt après la visite : elle n'est plus ouverte, sa fin est du neuf. Celle de c dure encore.
+    expect(text({ items: earlierPhrases(events, at(15, 0)) })).toEqual(["L'agent attend depuis 14:50", "L'agent a attendu 30 min, puis a repris (14:30)"]);
+  });
+
+  test('a first visit has nothing older: everything is new', () => {
+    expect(earlierPhrases([event(at(14, 0), 'a', 'running', 'error')], null)).toEqual([]);
+  });
+});
+
 describe('mountAbsence', () => {
   /** @type {HTMLElement} */
   let root;
@@ -93,7 +105,8 @@ describe('mountAbsence', () => {
   test('asks the timeline since the last visit and tells it in phrases; a row opens its session', async () => {
     const { paths } = mount({ kind: 'ok', data: { started_at: at(8, 0), events: [event(at(16, 20), 'idema-aaaa1111', 'running', 'error')] } });
     await flush();
-    expect(paths).toEqual([`/timeline?since=${at(15, 0)}`]);
+    // Tout le tampon est demandé : la page range elle-même le neuf et l'ancien autour de la dernière visite.
+    expect(paths).toEqual(['/timeline']);
     const row = /** @type {HTMLElement} */ (root.querySelector('.row'));
     expect(row.textContent).toContain('Codex est passé en erreur (16:20)');
     expect(row.textContent).toContain('refonte');
@@ -109,6 +122,50 @@ describe('mountAbsence', () => {
     await flush();
     expect(root.textContent).toContain('Le Mac ne répond pas');
   });
+
+
+  test('news first, then the older events under "Plus tôt", dimmed and most recent first', async () => {
+    mount({ kind: 'ok', data: { started_at: at(8, 0), events: [event(at(13, 0), 'idema-aaaa1111', 'running', 'error'), event(at(14, 0), 'idema-aaaa1111', 'running', 'error'), event(at(16, 20), 'idema-aaaa1111', 'running', 'error')] } });
+    await flush();
+    const rows = [...root.querySelectorAll('.row')].map((row) => row.textContent);
+    expect(rows[0]).toContain('(16:20)');
+    expect(rows.slice(1).map((row) => row?.match(/\(\d\d:\d\d\)/)?.[0])).toEqual(['(14:00)', '(13:00)']);
+    const kids = [...(root.querySelector('.page')?.children ?? [])];
+    const title = kids.findIndex((node) => node.textContent === 'Plus tôt');
+    expect(title).toBeGreaterThan(0);
+    expect(kids.slice(title + 1).every((node) => node.classList.contains('row--earlier'))).toBe(true);
+    expect(kids.slice(0, title).some((node) => node.classList.contains('row--earlier'))).toBe(false);
+    expect(root.textContent).not.toContain('Rien à signaler');
+  });
+
+  test('nothing new but older events: the sentence stays first and "Plus tôt" follows', async () => {
+    mount({ kind: 'ok', data: { started_at: at(8, 0), events: [event(at(14, 0), 'idema-aaaa1111', 'running', 'error')] } });
+    await flush();
+    const kids = [...(root.querySelector('.page')?.children ?? [])].map((node) => node.textContent ?? '');
+    const sentence = kids.findIndex((text) => text.includes('Rien à signaler depuis votre dernière visite.'));
+    const title = kids.findIndex((text) => text === 'Plus tôt');
+    expect(sentence).toBeGreaterThan(-1);
+    expect(title).toBeGreaterThan(sentence);
+    expect(kids[title + 1]).toContain('Codex est passé en erreur (14:00)');
+  });
+
+  test('an empty buffer keeps the sentence alone', async () => {
+    mount({ kind: 'ok', data: { started_at: at(8, 0), events: [] } });
+    await flush();
+    expect(root.textContent).toContain('Rien à signaler depuis votre dernière visite.');
+    expect(root.textContent).not.toContain('Plus tôt');
+    expect(root.querySelector('.row')).toBeNull();
+  });
+
+  test('"Plus tôt" shows 30 lines at most', async () => {
+    const events = Array.from({ length: 45 }, (_, n) => event(at(10, 0) + n * MIN, 'idema-aaaa1111', 'running', 'error'));
+    mount({ kind: 'ok', data: { started_at: at(8, 0), events } });
+    await flush();
+    const rows = root.querySelectorAll('.row--earlier');
+    expect(rows.length).toBe(EARLIER_MAX);
+    expect(rows[0]?.textContent).toContain('(10:44)');
+  });
+
 
   test('the restart head shows above the phrases', async () => {
     mount({ kind: 'ok', data: { started_at: at(15, 30), events: [] } });
