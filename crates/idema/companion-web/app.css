@@ -1,0 +1,62 @@
+/* IdemA, compagnon iPhone : jetons du design system d'IdemA (maquette/design_handoff_ide_terminal), sombre seulement. */
+:root {
+  color-scheme: dark;
+  --bg: #151516; --card: #1c1c1e; --bar: #1a1a1c; --well: rgba(0, 0, 0, 0.22);
+  --separator: rgba(255, 255, 255, 0.07); --press: rgba(255, 255, 255, 0.07);
+  --text: rgba(255, 255, 255, 0.88); --text-2: rgba(255, 255, 255, 0.6); --text-3: rgba(255, 255, 255, 0.42); --text-4: rgba(255, 255, 255, 0.25);
+  --accent: #0a84ff; --accent-text: #409cff; --running: #30d158; --running-halo: rgba(48, 209, 88, 0.16);
+  --error: #ff453a; --modified: #ff9f0a; --waiting: #ffd60a; --agent: #bf5af2;
+  /* ANSI : normal (0 à 7), puis vif (8 à 15) */
+  --ansi-0: #1e1e20; --ansi-1: #ff6961; --ansi-2: #a8d672; --ansi-3: #ffd60a; --ansi-4: #3aa0ff; --ansi-5: #c58af9; --ansi-6: #64c3f5; --ansi-7: #d4d4d6;
+  --ansi-8: #5a5a5e; --ansi-9: #ff8a80; --ansi-10: #c2e89a; --ansi-11: #ffe566; --ansi-12: #7dbbff; --ansi-13: #ddb3ff; --ansi-14: #9adcf9; --ansi-15: #fff;
+  --font: -apple-system, 'SF Pro Text', system-ui, sans-serif;
+  --mono: ui-monospace, 'SF Mono', Menlo, monospace;
+  /* Grille de 4 px, rayons 8 (contrôles) et 12 (cartes), cibles de 44 px */
+  --u: 4px; --radius-control: 8px; --radius-card: 12px; --target: 44px; --tab-height: 49px; --move: 150ms;
+  --safe-top: env(safe-area-inset-top, 0px); --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font: 400 17px/1.35 var(--font); -webkit-text-size-adjust: 100%; overscroll-behavior: none; }
+#app { display: flex; flex-direction: column; height: 100dvh; padding-top: var(--safe-top); }
+h1 { margin: 0 0 var(--u); font-size: 22px; font-weight: 700; line-height: 1.2; }
+p { margin: 0; }
+.muted { color: var(--text-2); font-size: 15px; }
+.icon { width: 24px; height: 24px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Cadre : bandeau hors ligne, écran, barre d'onglets */
+.banner { padding: 12px 16px; background: var(--bar); border-bottom: 1px solid var(--separator); color: var(--modified); font-size: 15px; }
+.view { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+.tabs { display: flex; flex: none; background: var(--bar); border-top: 1px solid var(--separator); padding-bottom: var(--safe-bottom); }
+.tab { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-height: var(--tab-height); padding: 4px 0; border: 0; background: none; color: var(--text-3); font: 600 11px/1.2 var(--font); transition: color var(--move); }
+.tab[aria-selected='true'] { color: var(--accent-text); }
+.tab:active { background: var(--press); }
+
+/* Installation et appairage */
+.screen { display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 420px; margin: 0 auto; padding: 40px 24px calc(24px + var(--safe-bottom)); }
+.screen__logo { width: 72px; height: 72px; border-radius: 16px; }
+.card { background: var(--card); border-radius: var(--radius-card); }
+.steps { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }
+.step { display: flex; align-items: center; gap: 16px; min-height: 64px; padding: 8px 16px; }
+.step + .step { border-top: 1px solid var(--separator); }
+.step__icon { color: var(--accent-text); }
+.btn { min-height: var(--target); padding: 0 16px; border: 0; border-radius: var(--radius-control); background: var(--press); color: var(--text); font: 600 17px/1 var(--font); transition: opacity var(--move); }
+.btn--primary { background: var(--accent); color: #fff; }
+.btn:disabled { opacity: 0.4; }
+.btn:active:not(:disabled) { opacity: 0.8; }
+.error { min-height: 1.35em; color: var(--error); font-size: 15px; }
+
+/* Les six cases du code ; le vrai champ, transparent, les recouvre et reçoit le clavier numérique */
+.code { position: relative; display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
+.code__cell { display: flex; align-items: center; justify-content: center; height: 56px; background: var(--well); border: 1.5px solid var(--separator); border-radius: var(--radius-control); font: 600 28px/1 var(--mono); transition: border-color var(--move); }
+.code:focus-within .code__cell.is-current { border-color: var(--accent); }
+.code__input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; border: 0; background: none; color: transparent; font-size: 16px; }
+
+/* Pastilles d'état de 9 px comme la barre d'IdemA ; leurs noms sont ceux de `state` dans la flotte */
+.dot { width: 9px; height: 9px; flex: none; border-radius: 50%; }
+.dot--idle { border: 1.5px solid rgba(255, 255, 255, 0.32); }
+.dot--running { background: var(--running); box-shadow: 0 0 0 3px var(--running-halo); }
+.dot--waiting { background: var(--waiting); }
+.dot--error { background: var(--error); }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }

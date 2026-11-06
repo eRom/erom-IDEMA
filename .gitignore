@@ -16,3 +16,6 @@
 /maquette/
 /tests/
 /scripts/probe-gemini.sh
+
+# PWA du compagnon : dépendances de développement
+node_modules/

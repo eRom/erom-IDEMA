@@ -1,10 +1,13 @@
+// @ts-check
 // Service worker d'IdemA, à ce chemin pour remplacer celui de la sonde déjà installé sur l'iPhone.
-// Coque minimale : il prend la main tout de suite ; le cache et les notifications arrivent avec la PWA complète.
+// Coque minimale : il prend la main tout de suite ; le cache et les notifications arrivent avec la tâche suivante.
 
-self.addEventListener('install', () => {
-  self.skipWaiting();
+const worker = /** @type {ServiceWorkerGlobalScope} */ (/** @type {unknown} */ (self));
+
+worker.addEventListener('install', () => {
+  void worker.skipWaiting();
 });
 
-self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
+worker.addEventListener('activate', (event) => {
+  event.waitUntil(worker.clients.claim());
 });
