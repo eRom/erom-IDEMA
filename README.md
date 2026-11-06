@@ -167,9 +167,9 @@ IdemA peut vous prévenir sur l'iPhone quand un agent attend, et vous laisser lu
 
 Un Mac en veille, ou IdemA fermé, n'envoie aucune notification.
 
-| Liste des compagnons | Panneau du compagnon |
-| :---: | :---: |
-| ![Liste des compagnons](assets/screenshots/compagnon-list.png) | ![Panneau du compagnon](assets/screenshots/compagnon-pane.png) |
+| Liste des compagnons | Panneau du compagnon | Notifications |
+| :---: | :---: | :---: |
+| ![Liste des compagnons](assets/screenshots/compagnon-list.png) | ![Panneau du compagnon](assets/screenshots/compagnon-pane.png) | ![Notifications](assets/screenshots/compagnon-notif.png) |
 
 ## Statut
 
