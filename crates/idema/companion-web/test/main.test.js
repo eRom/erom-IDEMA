@@ -341,18 +341,36 @@ describe('pairing lost', () => {
     expect(localStorage.getItem('idema.fleet')).toBeNull();
     expect(FakeEventSource.open().length).toBe(0);
   });
+
+  test('a 401 forgets the persisted subscription state too, which becomes unknown', async () => {
+    const { createPushController, SUBSCRIBED_KEY } = await import('../js/push.js');
+    const env = /** @type {any} */ ({ serviceWorker: { ready: new Promise(() => {}) }, PushManager: {}, Notification: { permission: 'granted' } });
+    localStorage.setItem(SUBSCRIBED_KEY, 'true');
+    const push = createPushController({ request: async () => ({ kind: 'offline' }), env });
+    expect(push.state.subscribed).toBe(true);
+    const app = await boot({ push });
+    localStorage.setItem(SUBSCRIBED_KEY, 'true');
+    app.fleetScript.push({ kind: 'unpaired' });
+    await app.start();
+    expect(app.root.querySelector('.code')).not.toBeNull();
+    expect(push.state.subscribed).toBeNull();
+    expect(localStorage.getItem(SUBSCRIBED_KEY)).toBeNull();
+  });
 });
 
 /** Des notifications à la main : l'état qu'on veut, et le compte des lectures demandées. */
 function fakePush(state = {}) {
   const push = {
-    state: { supported: true, permission: 'default', subscribed: false, busy: false, message: null, ...state },
+    state: { supported: true, permission: 'default', subscribed: /** @type {boolean | null} */ (false), busy: false, message: null, ...state },
     refreshes: 0,
     refresh() {
       this.refreshes++;
       return Promise.resolve();
     },
     subscribe: () => () => {},
+    reset() {
+      this.state.subscribed = null;
+    },
     enable: async () => {},
     test: async () => {},
   };
@@ -398,38 +416,36 @@ describe('notifications in the frame', () => {
     expect(push.refreshes).toBe(2);
   });
 
-  test('the settings button opens the settings screen, which gets the notifications', async () => {
+  test('the settings screen gets the notifications and the timers of the frame', async () => {
     const { registerView } = await import('../js/router.js');
     /** @type {any} */
     let received = null;
     registerView('settings', (root, context) => {
-      received = context.push;
+      received = context;
       root.textContent = 'settings screen';
     });
     const push = fakePush();
     const app = await boot({ push });
     await app.start();
-    /** @type {HTMLButtonElement} */ (app.root.querySelector('button[aria-label="Réglages"]')).click();
+    expect(app.root.querySelector('.topbar')).toBeNull(); // la roue est dans l'en-tête de la flotte
+    location.hash = '#/settings';
     await flush();
-    expect(location.hash).toBe('#/settings');
     expect(app.root.querySelector('.view')?.textContent).toBe('settings screen');
-    expect(received).toBe(push);
+    expect(received.push).toBe(push);
+    expect(received.timers).toBe(app.timers);
     expect(app.presenceCalls().filter((call) => call.body !== null)).toEqual([]);
   });
 
-  test('the top bar and the activation card give way to a session, and come back', async () => {
+  test('the activation card gives way to a session, and come back', async () => {
     const app = await boot({ push: fakePush() });
     await app.start();
-    const topBar = /** @type {HTMLElement} */ (app.root.querySelector('.topbar'));
     const notice = /** @type {HTMLElement} */ (app.root.querySelector('.notice'));
-    expect(topBar.hidden || notice.hidden).toBe(false);
+    expect(notice.hidden).toBe(false);
     location.hash = '#/s/idema-1a2b3c4d/0';
     await flush();
-    expect(topBar.hidden).toBe(true);
     expect(notice.hidden).toBe(true);
     location.hash = '#/';
     await flush();
-    expect(topBar.hidden).toBe(false);
     expect(notice.hidden).toBe(false);
   });
 

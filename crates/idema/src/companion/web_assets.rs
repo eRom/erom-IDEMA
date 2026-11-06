@@ -38,6 +38,11 @@ const FILES: &[(&str, &[u8], &str)] = &[
     ),
     ("/sw.js", include_bytes!("../../companion-web/sw.js"), JS),
     (
+        "/js/absence.js",
+        include_bytes!("../../companion-web/js/absence.js"),
+        JS,
+    ),
+    (
         "/js/api.js",
         include_bytes!("../../companion-web/js/api.js"),
         JS,
@@ -45,6 +50,11 @@ const FILES: &[(&str, &[u8], &str)] = &[
     (
         "/js/dom.js",
         include_bytes!("../../companion-web/js/dom.js"),
+        JS,
+    ),
+    (
+        "/js/fleet.js",
+        include_bytes!("../../companion-web/js/fleet.js"),
         JS,
     ),
     (
@@ -60,6 +70,11 @@ const FILES: &[(&str, &[u8], &str)] = &[
     (
         "/js/main.js",
         include_bytes!("../../companion-web/js/main.js"),
+        JS,
+    ),
+    (
+        "/js/notes.js",
+        include_bytes!("../../companion-web/js/notes.js"),
         JS,
     ),
     (
@@ -105,6 +120,11 @@ const FILES: &[(&str, &[u8], &str)] = &[
     (
         "/js/time.js",
         include_bytes!("../../companion-web/js/time.js"),
+        JS,
+    ),
+    (
+        "/js/triage.js",
+        include_bytes!("../../companion-web/js/triage.js"),
         JS,
     ),
     (

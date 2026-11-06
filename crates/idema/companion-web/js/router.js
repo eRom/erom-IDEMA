@@ -12,6 +12,7 @@
  * @property {typeof import('./store.js').store} store
  * @property {import('./push.js').Request} request
  * @property {ReturnType<typeof import('./push.js').createPushController>} push les notifications de l'appareil
+ * @property {import('./time.js').Timers} [timers] les minuteries de la coque (des faux dans les tests)
  */
 
 /** @typedef {(root: HTMLElement, context: ViewContext) => (void | (() => void))} View */

@@ -50,8 +50,6 @@ export function createShell({
   /** @type {HTMLElement | null} */
   let tabBar = null;
   /** @type {HTMLElement | null} */
-  let topBar = null;
-  /** @type {HTMLElement | null} */
   let notice = null;
   /** @type {(() => void) | null} */
   let unmountCard = null;
@@ -161,17 +159,17 @@ export function createShell({
 
   /** @param {import('./router.js').Route} route */
   function renderRoute(route) {
-    if (!view || !tabBar || !topBar || !notice) return;
+    if (!view || !tabBar || !notice) return;
     unmountView?.();
     unmountView = undefined;
     view.replaceChildren();
     // La session s'empile au-dessus de la flotte : plein écran, sans barre d'onglets.
-    tabBar.hidden = topBar.hidden = notice.hidden = route.name === 'session';
+    tabBar.hidden = notice.hidden = route.name === 'session';
     for (const tab of tabBar.querySelectorAll('button')) {
       tab.setAttribute('aria-selected', String(tab.dataset.route === route.name));
     }
     const mount = viewFor(route.name);
-    if (mount) unmountView = mount(view, { route, store, request, push });
+    if (mount) unmountView = mount(view, { route, store, request, push, timers });
     presence.setTarget(route.name === 'session' ? { session: route.session, pane: route.pane } : null);
   }
 
@@ -187,7 +185,7 @@ export function createShell({
     presence.setTarget(null);
     unmountCard?.();
     unmountCard = null;
-    banner = view = tabBar = topBar = notice = null;
+    banner = view = tabBar = notice = null;
   }
 
   function startApp() {
@@ -216,26 +214,10 @@ export function createShell({
         ),
       ),
     );
-    topBar = el(
-      'header',
-      { class: 'topbar' },
-      el(
-        'button',
-        {
-          class: 'topbar__button',
-          type: 'button',
-          'aria-label': 'Réglages',
-          onclick: () => {
-            location.hash = '#/settings';
-          },
-        },
-        icon('settings'),
-      ),
-    );
     const card = el('div');
     notice = el('div', { class: 'notice' }, card);
     unmountCard = mountActivationCard(card, push);
-    root.replaceChildren(banner, topBar, notice, view, tabBar);
+    root.replaceChildren(banner, notice, view, tabBar);
     renderBanner();
     stopRouter = startRouter(renderRoute);
     if (coldStart) sendMetric('shell_ready', performance.now());
@@ -253,6 +235,7 @@ export function createShell({
     coldStart = false;
     // Plus appairé : la flotte en cache n'est plus à lui.
     store.clearFleet();
+    push.reset();
     renderPairing(root, {
       onPaired: () => {
         location.hash = '#/';

@@ -438,6 +438,18 @@ describe('createPushController', () => {
     expect(localStorage.getItem(SUBSCRIBED_KEY)).toBe('false');
   });
 
+  test('reset forgets the kept state and tells the subscribers', async () => {
+    localStorage.setItem(SUBSCRIBED_KEY, 'true');
+    const push = createPushController({ request: fakeRequest(withKey).request, env: fakeBrowser().env });
+    let told = 0;
+    push.subscribe(() => told++);
+    expect(push.state.subscribed).toBe(true);
+    push.reset();
+    expect(push.state.subscribed).toBeNull();
+    expect(localStorage.getItem(SUBSCRIBED_KEY)).toBeNull();
+    expect(told).toBe(1);
+  });
+
   test('an unreadable or refused storage leaves the state unknown, and does not break the controller', async () => {
     localStorage.setItem(SUBSCRIBED_KEY, 'maybe');
     const browser = fakeBrowser();

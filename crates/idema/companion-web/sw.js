@@ -17,11 +17,14 @@ const APP_FILES = [
   '/manifest.webmanifest',
   '/icons/icon-180.png',
   '/icons/icon-512.png',
+  '/js/absence.js',
   '/js/api.js',
   '/js/dom.js',
+  '/js/fleet.js',
   '/js/icons.js',
   '/js/install.js',
   '/js/main.js',
+  '/js/notes.js',
   '/js/notify.js',
   '/js/offline.js',
   '/js/pairing.js',
@@ -31,6 +34,7 @@ const APP_FILES = [
   '/js/shell.js',
   '/js/store.js',
   '/js/time.js',
+  '/js/triage.js',
 ];
 
 /** Le nom du cache d'une construction d'IdemA : sa version et l'empreinte de ses fichiers (`health`). @param {string} version @param {string} assets */

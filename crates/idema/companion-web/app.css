@@ -32,16 +32,49 @@ p { margin: 0; }
 .tab[aria-selected='true'] { color: var(--accent-text); }
 .tab:active { background: var(--press); }
 
-/* Barre du haut (Réglages), carte d'activation, résultats */
-.topbar { display: flex; flex: none; justify-content: flex-end; padding: 0 8px; }
-.topbar__button { display: flex; align-items: center; justify-content: center; width: var(--target); height: var(--target); border: 0; border-radius: var(--radius-control); background: none; color: var(--text-3); }
-.topbar__button:active { background: var(--press); }
+/* Carte d'activation, résultats */
 .notice .panel { margin: 0 16px 8px; }
 .panel { display: flex; flex-direction: column; align-items: stretch; gap: 12px; padding: 16px; }
 .panel h2 { margin: 0; font-size: 17px; font-weight: 700; }
 .status { color: var(--error); font-size: 15px; }
 .status:empty { display: none; }
 .status--ok { color: var(--running); }
+
+/* Flotte, Absence, Notes */
+.fleet__head { display: grid; grid-template-columns: auto auto 1fr; align-items: center; gap: 4px 8px; padding: 4px 8px 12px 16px; }
+.fleet__head h1 { margin: 0; }
+.fleet__gear { grid-column: 3; justify-self: end; display: flex; align-items: center; justify-content: center; width: var(--target); height: var(--target); border: 0; border-radius: var(--radius-control); background: none; color: var(--text-3); }
+.fleet__gear:active { background: var(--press); }
+.fleet__summary { grid-column: 1 / -1; justify-self: start; min-height: 36px; padding: 0 12px; border: 0; border-radius: var(--radius-control); background: var(--press); color: var(--accent-text); font: 600 15px/1 var(--font); }
+.fleet__summary:disabled { color: var(--text-3); }
+.fleet__empty { padding: 16px; }
+.page > .muted { margin-bottom: 12px; }
+.page { padding: 4px 16px 16px; }
+.page h1 { margin-bottom: 8px; }
+.group { margin: 0 16px 20px; }
+.group__title { margin: 0; padding: 0 4px 6px; color: var(--text-3); font-size: 13px; font-weight: 600; }
+.group__empty { margin: 0; padding: 12px 16px; border-radius: var(--radius-card); background: var(--card); color: var(--text-3); font-size: 15px; }
+.row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: var(--target); padding: 10px 16px; border: 0; background: var(--card); color: var(--text); font: 400 17px/1.25 var(--font); text-align: left; }
+.row + .row { border-top: 1px solid var(--separator); }
+.row:first-of-type { border-radius: var(--radius-card) var(--radius-card) 0 0; }
+.row:last-of-type { border-radius: 0 0 var(--radius-card) var(--radius-card); }
+.row:only-of-type { border-radius: var(--radius-card); }
+.row:active { background: #232325; }
+.row__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row--hot .row__name { font-weight: 600; }
+.row__agents { display: flex; gap: 4px; }
+.row__logo { width: 16px; height: 16px; border-radius: 4px; }
+.row__agent { padding: 2px 6px; border-radius: 4px; background: var(--press); color: var(--text-2); font-size: 11px; font-weight: 600; }
+.row__state { flex: none; color: var(--text-2); font-size: 15px; }
+.row--phrase { flex-direction: column; align-items: flex-start; gap: 2px; }
+.row__caption { color: var(--text-3); font-size: 13px; font-weight: 600; }
+.notes { display: flex; flex-direction: column; height: 100%; padding: 4px 16px 12px; }
+.notes__meta { margin: 0 0 8px; font-size: 13px; }
+.notes__text { flex: 1; min-height: 0; padding: 12px 16px; overflow-y: auto; border-radius: var(--radius-card); background: var(--card); white-space: pre-wrap; overflow-wrap: anywhere; }
+.notes__text a { color: var(--accent-text); }
+.notes__form { display: flex; gap: 8px; padding-top: 8px; }
+.notes__input { flex: 1; min-width: 0; height: var(--target); padding: 0 12px; border: 1.5px solid var(--separator); border-radius: var(--radius-control); background: var(--well); color: var(--text); font: 400 16px/1 var(--font); }
+.notes__input:focus { outline: none; border-color: var(--accent); }
 
 /* Installation et appairage */
 .screen { display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 420px; margin: 0 auto; padding: 40px 24px calc(24px + var(--safe-bottom)); }

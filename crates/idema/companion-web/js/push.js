@@ -344,6 +344,17 @@ export function createPushController({ request, env = browserEnv(), storage = sa
       subscribers.add(fn);
       return () => subscribers.delete(fn);
     },
+    /** L'appareil n'est plus appairé : l'état gardé n'est plus le sien, on ne le sait plus. */
+    reset() {
+      state.subscribed = null;
+      state.message = null;
+      try {
+        storage.removeItem(SUBSCRIBED_KEY);
+      } catch {
+        // Stockage refusé : rien à effacer.
+      }
+      notify();
+    },
     /** À chaque ouverture : qui est abonné, et la clé est-elle la bonne ? Hors ligne, l'état connu reste. */
     refresh() {
       async function run() {
