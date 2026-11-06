@@ -32,6 +32,17 @@ p { margin: 0; }
 .tab[aria-selected='true'] { color: var(--accent-text); }
 .tab:active { background: var(--press); }
 
+/* Barre du haut (Réglages), carte d'activation, résultats */
+.topbar { display: flex; flex: none; justify-content: flex-end; padding: 0 8px; }
+.topbar__button { display: flex; align-items: center; justify-content: center; width: var(--target); height: var(--target); border: 0; border-radius: var(--radius-control); background: none; color: var(--text-3); }
+.topbar__button:active { background: var(--press); }
+.notice .panel { margin: 0 16px 8px; }
+.panel { display: flex; flex-direction: column; align-items: stretch; gap: 12px; padding: 16px; }
+.panel h2 { margin: 0; font-size: 17px; font-weight: 700; }
+.status { color: var(--error); font-size: 15px; }
+.status:empty { display: none; }
+.status--ok { color: var(--running); }
+
 /* Installation et appairage */
 .screen { display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 420px; margin: 0 auto; padding: 40px 24px calc(24px + var(--safe-bottom)); }
 .screen__logo { width: 72px; height: 72px; border-radius: 16px; }

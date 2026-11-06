@@ -121,7 +121,7 @@ function setVisibility(next) {
 let shells = [];
 
 /** Une coque avec un téléphone déjà appairé et une flotte en cache : elle démarre sans demander `me`. */
-async function boot() {
+async function boot(extra = {}) {
   localStorage.clear();
   createStore(localStorage).setFleet(FLEET, Date.now());
   const store = createStore(localStorage);
@@ -135,6 +135,7 @@ async function boot() {
     api: fake.api,
     EventSource: /** @type {any} */ (FakeEventSource),
     timers,
+    ...extra,
   });
   shells.push(shell);
   return { shell, root, store, timers, ...fake, start: async () => (await shell.boot(), await flush()) };
@@ -339,5 +340,104 @@ describe('pairing lost', () => {
     expect(app.store.state.fleet).toBeNull();
     expect(localStorage.getItem('idema.fleet')).toBeNull();
     expect(FakeEventSource.open().length).toBe(0);
+  });
+});
+
+/** Des notifications à la main : l'état qu'on veut, et le compte des lectures demandées. */
+function fakePush(state = {}) {
+  const push = {
+    state: { supported: true, permission: 'default', subscribed: false, busy: false, message: null, ...state },
+    refreshes: 0,
+    refresh() {
+      this.refreshes++;
+      return Promise.resolve();
+    },
+    subscribe: () => () => {},
+    enable: async () => {},
+    test: async () => {},
+  };
+  return /** @type {typeof push & ReturnType<typeof import('../js/push.js').createPushController>} */ (/** @type {unknown} */ (push));
+}
+
+describe('notifications in the frame', () => {
+  test('the badge follows each fleet received, never the stale one from the cache', async () => {
+    /** @type {number[]} */
+    const badges = [];
+    const syncBadge = async (/** @type {number} */ count) => {
+      badges.push(count);
+      return true;
+    };
+    const app = await boot({ syncBadge: /** @type {any} */ (syncBadge), push: fakePush() });
+    app.fleetScript.push({ kind: 'ok', data: { ...FLEET, badge: 2 } });
+    await app.start();
+    expect(badges).toEqual([2]); // la flotte en cache (badge 0) n'a rien posé
+    FakeEventSource.open()[0].emitFleet({ ...FLEET, badge: 5 });
+    FakeEventSource.open()[0].emitFleet({ ...FLEET, badge: 0 });
+    expect(badges).toEqual([2, 5, 0]);
+  });
+
+  test('a connection change alone does not set the badge again', async () => {
+    /** @type {number[]} */
+    const badges = [];
+    const app = await boot({ syncBadge: async (/** @type {number} */ count) => (badges.push(count), true), push: fakePush() });
+    await app.start();
+    const before = badges.length;
+    app.store.setConnection('offline');
+    app.store.setConnection('ok');
+    expect(badges.length).toBe(before);
+  });
+
+  test('the subscription is checked when the app opens and at each resume', async () => {
+    const push = fakePush();
+    const app = await boot({ push });
+    await app.start();
+    expect(push.refreshes).toBe(1);
+    setVisibility('hidden');
+    setVisibility('visible');
+    await flush();
+    expect(push.refreshes).toBe(2);
+  });
+
+  test('the settings button opens the settings screen, which gets the notifications', async () => {
+    const { registerView } = await import('../js/router.js');
+    /** @type {any} */
+    let received = null;
+    registerView('settings', (root, context) => {
+      received = context.push;
+      root.textContent = 'settings screen';
+    });
+    const push = fakePush();
+    const app = await boot({ push });
+    await app.start();
+    /** @type {HTMLButtonElement} */ (app.root.querySelector('button[aria-label="Réglages"]')).click();
+    await flush();
+    expect(location.hash).toBe('#/settings');
+    expect(app.root.querySelector('.view')?.textContent).toBe('settings screen');
+    expect(received).toBe(push);
+    expect(app.presenceCalls().filter((call) => call.body !== null)).toEqual([]);
+  });
+
+  test('the top bar and the activation card give way to a session, and come back', async () => {
+    const app = await boot({ push: fakePush() });
+    await app.start();
+    const topBar = /** @type {HTMLElement} */ (app.root.querySelector('.topbar'));
+    const notice = /** @type {HTMLElement} */ (app.root.querySelector('.notice'));
+    expect(topBar.hidden || notice.hidden).toBe(false);
+    location.hash = '#/s/idema-1a2b3c4d/0';
+    await flush();
+    expect(topBar.hidden).toBe(true);
+    expect(notice.hidden).toBe(true);
+    location.hash = '#/';
+    await flush();
+    expect(topBar.hidden).toBe(false);
+    expect(notice.hidden).toBe(false);
+  });
+
+  test('a device that is not subscribed sees the activation card above the fleet', async () => {
+    const { createPushController } = await import('../js/push.js');
+    const env = /** @type {any} */ ({ serviceWorker: { ready: new Promise(() => {}) }, PushManager: {}, Notification: { permission: 'default' } });
+    const app = await boot({ push: createPushController({ request: async () => ({ kind: 'ok', data: { subscribed: false } }), env }) });
+    await app.start();
+    expect(app.root.querySelector('.notice')?.textContent).toContain('Activer les notifications');
   });
 });

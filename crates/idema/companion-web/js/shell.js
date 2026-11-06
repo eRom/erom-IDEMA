@@ -7,8 +7,10 @@ import { el } from './dom.js';
 import { icon } from './icons.js';
 import { isStandalone, renderInstall } from './install.js';
 import { bannerText, createRetry } from './offline.js';
+import { mountActivationCard } from './notify.js';
 import { renderPairing } from './pairing.js';
 import { createPresence } from './presence.js';
+import { createPushController, syncBadge as realSyncBadge } from './push.js';
 import { startRouter, viewFor } from './router.js';
 import { realTimers } from './time.js';
 
@@ -29,14 +31,30 @@ const TABS = /** @type {const} */ ([
  * @param {typeof realApi} [deps.api]
  * @param {typeof EventSource} [deps.EventSource]
  * @param {import('./time.js').Timers} [deps.timers]
+ * @param {ReturnType<typeof createPushController>} [deps.push] les notifications (par défaut, celles du navigateur)
+ * @param {typeof realSyncBadge} [deps.syncBadge]
  */
-export function createShell({ root, store, api = realApi, EventSource: Source = globalThis.EventSource, timers = realTimers }) {
+export function createShell({
+  root,
+  store,
+  api = realApi,
+  EventSource: Source = globalThis.EventSource,
+  timers = realTimers,
+  push: injectedPush,
+  syncBadge = realSyncBadge,
+}) {
   /** @type {HTMLElement | null} */
   let banner = null;
   /** @type {HTMLElement | null} */
   let view = null;
   /** @type {HTMLElement | null} */
   let tabBar = null;
+  /** @type {HTMLElement | null} */
+  let topBar = null;
+  /** @type {HTMLElement | null} */
+  let notice = null;
+  /** @type {(() => void) | null} */
+  let unmountCard = null;
   /** @type {(() => void) | void} */
   let unmountView;
   /** @type {(() => void) | null} */
@@ -56,10 +74,10 @@ export function createShell({ root, store, api = realApi, EventSource: Source = 
 
   /**
    * Toute requête de l'app : un 401 ramène à l'appairage, quel que soit l'écran qui l'a lancée.
-   * @param {string} method @param {string} path @param {unknown} [body] @param {boolean} [keepalive]
+   * @param {string} method @param {string} path @param {unknown} [body] @param {boolean} [keepalive] @param {number} [timeoutMs]
    */
-  async function request(method, path, body, keepalive = false) {
-    const result = await api(method, path, body, undefined, keepalive);
+  async function request(method, path, body, keepalive = false, timeoutMs = undefined) {
+    const result = await api(method, path, body, timeoutMs, keepalive);
     if (result.kind === 'unpaired') showPairing();
     return result;
   }
@@ -70,6 +88,9 @@ export function createShell({ root, store, api = realApi, EventSource: Source = 
     void request('POST', '/client-metrics', { name, ms: clamped });
   }
 
+  const push = injectedPush ?? createPushController({ request });
+  // La pastille suit la flotte reçue (pas celle du cache au lancement, qui peut être ancienne).
+  let badgedFleet = store.state.fleet;
   const presence = createPresence((body, keepalive) => void request('PUT', '/presence', body, keepalive), undefined, timers);
   const retry = createRetry(() => void refreshFleet(), undefined, timers);
 
@@ -140,17 +161,17 @@ export function createShell({ root, store, api = realApi, EventSource: Source = 
 
   /** @param {import('./router.js').Route} route */
   function renderRoute(route) {
-    if (!view || !tabBar) return;
+    if (!view || !tabBar || !topBar || !notice) return;
     unmountView?.();
     unmountView = undefined;
     view.replaceChildren();
     // La session s'empile au-dessus de la flotte : plein écran, sans barre d'onglets.
-    tabBar.hidden = route.name === 'session';
+    tabBar.hidden = topBar.hidden = notice.hidden = route.name === 'session';
     for (const tab of tabBar.querySelectorAll('button')) {
       tab.setAttribute('aria-selected', String(tab.dataset.route === route.name));
     }
     const mount = viewFor(route.name);
-    if (mount) unmountView = mount(view, { route, store, request });
+    if (mount) unmountView = mount(view, { route, store, request, push });
     presence.setTarget(route.name === 'session' ? { session: route.session, pane: route.pane } : null);
   }
 
@@ -164,7 +185,9 @@ export function createShell({ root, store, api = realApi, EventSource: Source = 
     closeStream();
     generation++;
     presence.setTarget(null);
-    banner = view = tabBar = null;
+    unmountCard?.();
+    unmountCard = null;
+    banner = view = tabBar = topBar = notice = null;
   }
 
   function startApp() {
@@ -193,10 +216,30 @@ export function createShell({ root, store, api = realApi, EventSource: Source = 
         ),
       ),
     );
-    root.replaceChildren(banner, view, tabBar);
+    topBar = el(
+      'header',
+      { class: 'topbar' },
+      el(
+        'button',
+        {
+          class: 'topbar__button',
+          type: 'button',
+          'aria-label': 'Réglages',
+          onclick: () => {
+            location.hash = '#/settings';
+          },
+        },
+        icon('settings'),
+      ),
+    );
+    const card = el('div');
+    notice = el('div', { class: 'notice' }, card);
+    unmountCard = mountActivationCard(card, push);
+    root.replaceChildren(banner, topBar, notice, view, tabBar);
     renderBanner();
     stopRouter = startRouter(renderRoute);
     if (coldStart) sendMetric('shell_ready', performance.now());
+    void push.refresh();
     void refreshFleet().then((arrived) => {
       if (arrived && coldStart) sendMetric('fleet_ready', performance.now());
       coldStart = false;
@@ -225,6 +268,7 @@ export function createShell({ root, store, api = realApi, EventSource: Source = 
     closeStream();
     stopStreamRetry();
     dispatchEvent(new Event('idema:resume'));
+    void push.refresh();
     if (await refreshFleet()) sendMetric('resume_ready', performance.now() - started);
   }
 
@@ -244,7 +288,13 @@ export function createShell({ root, store, api = realApi, EventSource: Source = 
   }
 
   document.addEventListener('visibilitychange', onVisibility);
-  const unsubscribe = store.subscribe(renderBanner);
+  const unsubscribe = store.subscribe((state) => {
+    renderBanner();
+    if (state.fleet && state.fleet !== badgedFleet) {
+      badgedFleet = state.fleet;
+      void syncBadge(state.fleet.badge);
+    }
+  });
 
   return {
     async boot() {

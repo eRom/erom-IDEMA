@@ -2,7 +2,7 @@
 // Le routeur par fragment (`#/`), et le registre des écrans que les autres tâches viennent remplir.
 
 /**
- * @typedef {{name: 'fleet'} | {name: 'absence'} | {name: 'notes'} | {name: 'session', session: string, pane: number}} Route
+ * @typedef {{name: 'fleet'} | {name: 'absence'} | {name: 'notes'} | {name: 'settings'} | {name: 'session', session: string, pane: number}} Route
  */
 
 /**
@@ -10,7 +10,8 @@
  * @typedef {object} ViewContext
  * @property {Route} route
  * @property {typeof import('./store.js').store} store
- * @property {(method: string, path: string, body?: unknown) => Promise<import('./api.js').ApiResult>} request
+ * @property {import('./push.js').Request} request
+ * @property {ReturnType<typeof import('./push.js').createPushController>} push les notifications de l'appareil
  */
 
 /** @typedef {(root: HTMLElement, context: ViewContext) => (void | (() => void))} View */
@@ -19,7 +20,7 @@
 const views = new Map();
 
 /**
- * Un écran se déclare ici (`fleet`, `absence`, `notes`, `session`) ; il rend sa fonction de démontage au besoin.
+ * Un écran se déclare ici (`fleet`, `absence`, `notes`, `settings`, `session`) ; il rend sa fonction de démontage au besoin.
  * @param {Route['name']} name
  * @param {View} view
  */
@@ -50,6 +51,7 @@ export function parseRoute(hash) {
   const parts = hash.replace(/^#\/?/, '').split('/');
   if (parts.length === 1 && parts[0] === 'absence') return { name: 'absence' };
   if (parts.length === 1 && parts[0] === 'notes') return { name: 'notes' };
+  if (parts.length === 1 && parts[0] === 'settings') return { name: 'settings' };
   if (parts.length === 3 && parts[0] === 's' && parts[1] !== '' && /^\d+$/.test(parts[2])) {
     try {
       return { name: 'session', session: decodeURIComponent(parts[1]), pane: Number(parts[2]) };
