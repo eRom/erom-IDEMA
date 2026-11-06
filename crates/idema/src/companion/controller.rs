@@ -161,21 +161,40 @@ impl CompanionController {
         self.running.is_some()
     }
 
-    /// Romain est-il présent ? Vrai compagnon éteint : le « vu » d'IdemA ne dépend alors de rien d'autre que de la
-    /// fenêtre.
-    pub fn present(&self) -> bool {
-        // `away` peut survivre à un démarrage raté (port pris) : sans service, l'absence ne veut plus rien dire.
-        self.running.is_none() || !self.away
+    /// Le service tourne-t-il, ou démarre-t-il ? Faux éteint, et faux quand sa prise n'a pas pu être liée (port pris) :
+    /// il ne répond alors à personne, donc la présence de Romain n'a plus de sens (R15, amendée le 06/11).
+    fn serving(&self) -> bool {
+        self.running.as_ref().is_some_and(|running| {
+            !matches!(running.status.borrow().listen, ListenState::Failed { .. })
+        })
     }
 
-    /// Enregistre l'absence mesurée ; vrai quand l'état a changé. Sans effet éteint (aucune minuterie n'existe alors,
-    /// et `present()` reste vrai).
+    /// Romain est-il présent ? Vrai compagnon éteint, ou service sans prise : le « vu » d'IdemA ne dépend alors de rien
+    /// d'autre que de la fenêtre.
+    pub fn present(&self) -> bool {
+        // `away` peut survivre à un démarrage raté ou à une prise non liée : sans service qui écoute, l'absence ne veut
+        // plus rien dire.
+        !self.serving() || !self.away
+    }
+
+    /// Enregistre l'absence mesurée ; vrai quand l'état a changé. Sans effet éteint ou prise non liée (aucune minuterie
+    /// ne tourne alors, et `present()` reste vrai).
     pub fn set_away(&mut self, away: bool) -> bool {
-        if self.running.is_none() || self.away == away {
+        if !self.serving() || self.away == away {
             return false;
         }
         self.away = away;
         true
+    }
+
+    /// La prise du service n'a-t-elle pas pu être liée ? Si oui, Romain redevient présent (`away` retombe) : la minuterie
+    /// de présence s'arrête et le « vu » est celui de la fenêtre. Un nouveau service (config changée) repart de zéro.
+    pub fn listen_failed(&mut self) -> bool {
+        let failed = self.running.is_some() && !self.serving();
+        if failed {
+            self.away = false;
+        }
+        failed
     }
 
     /// Publie l'instantané de la flotte ; sans effet éteint, et sans effet quand il ne dit rien de plus que le
@@ -501,6 +520,53 @@ mod tests {
         assert!(!controller.is_on());
         assert!(controller.away, "the failed start did not reset it");
         assert!(controller.present(), "no service, so Romain is present");
+    }
+
+    /// Une prise qui n'a pas pu être liée compte pour éteinte : Romain est présent, l'absence n'est pas enregistrée, et
+    /// la minuterie de présence peut s'arrêter (`listen_failed`).
+    #[test]
+    fn a_service_without_a_socket_counts_as_off_for_presence() {
+        let home = super::super::test_support::TempDir::new("controller-failed-presence");
+        let scratchpad = home.0.join("scratchpad.md");
+        let port = super::super::test_support::free_port();
+        let taken = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let mut controller = CompanionController::new();
+        controller.sync(Some(&config(port)), Some(tmux()), &home.0, &scratchpad);
+        // Romain est mesuré absent pendant que le service démarre encore.
+        assert!(controller.set_away(true));
+        let mut status = controller.status().unwrap();
+        super::super::test_support::wait_for(&mut status, |state| {
+            matches!(state, ListenState::Failed { .. })
+        });
+
+        assert!(controller.is_on(), "the section is still there");
+        assert!(controller.present(), "no socket: Romain is present");
+        assert!(
+            !controller.set_away(true),
+            "no absence is recorded without a socket"
+        );
+        assert!(controller.listen_failed());
+        assert!(!controller.away, "the stale absence is dropped");
+
+        // Le port se libère, un réglage change : le service repart et la présence se mesure de nouveau.
+        drop(taken);
+        let changed: CompanionConfig =
+            toml::from_str(&format!("port = {port}\nnotify_waiting = false")).unwrap();
+        assert!(
+            controller
+                .sync(Some(&changed), Some(tmux()), &home.0, &scratchpad)
+                .is_some()
+        );
+        let mut status = controller.status().unwrap();
+        super::super::test_support::wait_for(&mut status, |state| {
+            *state == ListenState::Listening { port }
+        });
+        assert!(!controller.listen_failed());
+        assert!(controller.set_away(true));
+        assert!(!controller.present());
+
+        controller.sync(None, Some(tmux()), &home.0, &scratchpad);
+        controller.stopping.take().unwrap().join().unwrap();
     }
 
     /// Retirer la section garde le fil de l'ancien service ; la réactiver le lui fait joindre avant de lier le port.

@@ -1341,6 +1341,14 @@ impl PaneView {
         self.publish_state(Instant::now(), cx);
     }
 
+    /// Romain s'éloigne alors que ce pane est vu : la question posée sous ses yeux, restée sans réponse, repasse en
+    /// « attend ». Ne publie rien : `set_seen(false)` suit et publie le pane devenu non vu (AC-25).
+    pub fn rearm_unanswered(&mut self) {
+        if self.seen {
+            self.activity.rearm_unanswered();
+        }
+    }
+
     /// Compare l'état du pane au dernier publié ; émet `StateChanged` à un changement seulement.
     fn publish_state(&mut self, now: Instant, cx: &mut Context<Self>) {
         let current = self.activity.state(now);

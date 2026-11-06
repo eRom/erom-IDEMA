@@ -2190,10 +2190,10 @@ impl Workspace {
                 self._presence_task = Some(cx.spawn_in(window, async move |this, cx| {
                     loop {
                         cx.background_executor().timer(PRESENCE_POLL).await;
-                        if this
+                        let keep = this
                             .update_in(cx, |this, window, cx| this.evaluate_presence(window, cx))
-                            .is_err()
-                        {
+                            .unwrap_or(false);
+                        if !keep {
                             break;
                         }
                     }
@@ -2212,17 +2212,24 @@ impl Workspace {
 
     /// Un tour de la présence de Romain : absent après `away_after_seconds` sans entrée, ou écran verrouillé. À un
     /// changement, le service est prévenu et « vu » est recalculé (absent, aucune session n'est vue).
-    fn evaluate_presence(&mut self, window: &Window, cx: &mut Context<Self>) {
+    ///
+    /// Rend faux quand la minuterie doit s'arrêter : plus de section, ou prise non liée (port pris). Dans ce cas
+    /// Romain redevient présent et le « vu » est recalculé une dernière fois ; un service relancé a sa propre minuterie.
+    fn evaluate_presence(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
         let Some(section) = &self.config.companion else {
-            return;
+            return false;
         };
+        if self.companion.listen_failed() {
+            self.update_seen(window, cx);
+            return false;
+        }
         let away = presence::is_away(
             presence::hid_idle_seconds(),
             presence::screen_locked(),
             section.away_after_seconds,
         );
         if !self.companion.set_away(away) {
-            return;
+            return true;
         }
         hud::log_event(if away {
             "companion presence away"
@@ -2230,7 +2237,20 @@ impl Workspace {
             "companion presence present"
         });
         self.companion.send(ServiceEvent::Presence { away });
+        if away {
+            // Une question posée sous les yeux de Romain n'a jamais fait « attend » : elle se réarme avant que
+            // `update_seen` retire le « vu » et publie les états (AC-25).
+            let views: Vec<Entity<SessionView>> = self
+                .entries
+                .iter()
+                .filter_map(|entry| entry.view.clone())
+                .collect();
+            for view in views {
+                view.update(cx, |view, cx| view.rearm_unanswered(cx));
+            }
+        }
         self.update_seen(window, cx);
+        true
     }
 
     /// Une commande du service du compagnon, traitée sur le fil d'interface.

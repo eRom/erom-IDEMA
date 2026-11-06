@@ -73,6 +73,10 @@ pub struct PaneActivity {
     turn_active: bool,
     waiting: bool,
     error: bool,
+    /// Le tour de l'agent s'est fini, ou il a sonné, pendant que le pane était vu, et rien n'a été saisi dans ce pane
+    /// depuis : la question attend une réponse que personne n'a donnée. `rearm_unanswered` la fait passer en « attend »
+    /// quand le pane cesse d'être vu parce que Romain s'éloigne (AC-25).
+    unanswered_while_seen: bool,
 }
 
 impl PaneActivity {
@@ -145,12 +149,17 @@ impl PaneActivity {
     pub fn on_input(&mut self) {
         self.burst_bytes = 0;
         self.turn_active = false;
+        // La saisie répond à la question : rien à réarmer au départ de Romain.
+        self.unanswered_while_seen = false;
     }
 
     /// Un signal du détecteur. Tant que la session est vue, aucun drapeau ne se pose.
     pub fn on_signal(&mut self, signal: Signal, seen: bool) {
         match signal {
-            Signal::Notify => self.waiting |= !seen,
+            Signal::Notify => {
+                self.waiting |= !seen;
+                self.unanswered_while_seen |= seen;
+            }
             Signal::Progress(active) => {
                 self.progress = active;
                 self.turn_active |= active;
@@ -168,6 +177,8 @@ impl PaneActivity {
                 self.command_running = true;
                 // Une rafale d'avant la commande ne doit pas armer le tour de la commande qui démarre.
                 self.turn_active = false;
+                // Une commande qui démarre n'est pas une question en suspens.
+                self.unanswered_while_seen = false;
             }
             Signal::CommandEnd(code) => {
                 self.marks_seen = true;
@@ -195,6 +206,7 @@ impl PaneActivity {
         {
             self.turn_active = false;
             self.waiting |= !seen;
+            self.unanswered_while_seen |= seen;
         }
     }
 
@@ -214,6 +226,17 @@ impl PaneActivity {
     pub fn mark_seen(&mut self) {
         self.waiting = false;
         self.error = false;
+    }
+
+    /// Romain s'éloigne (le compagnon passe en absent) et le pane cesse d'être vu : si l'agent a fini son tour ou sonné
+    /// pendant qu'il était vu, sans saisie depuis, la question se réarme en « attend » pour qu'elle parte en
+    /// notification. Rend vrai si l'état « attend » vient d'être posé. À appeler avant de publier l'état du pane devenu
+    /// non vu : ce n'est pas elle qui publie.
+    pub fn rearm_unanswered(&mut self) -> bool {
+        let rearm = std::mem::take(&mut self.unanswered_while_seen);
+        let changed = rearm && !self.waiting;
+        self.waiting |= rearm;
+        changed
     }
 
     /// Dernier marqueur reçu : 133;A ou 133;B. Sans marqueur depuis l'attache, le shell au premier plan.
@@ -438,6 +461,84 @@ mod tests {
         activity.on_signal(Signal::Notify, false);
         assert_eq!(activity.state(t0), ActivityState::Waiting);
         activity.mark_seen();
+        assert_eq!(activity.state(t0), ActivityState::Idle);
+    }
+
+    #[test]
+    fn a_bell_while_seen_is_rearmed_when_the_user_leaves() {
+        let t0 = Instant::now();
+        let mut activity = PaneActivity::new();
+        activity.on_signal(Signal::Notify, true);
+        assert_eq!(activity.state(t0), ActivityState::Idle);
+        assert!(activity.rearm_unanswered());
+        assert_eq!(activity.state(t0), ActivityState::Waiting);
+        // Une seule fois : la mémoire est consommée, et revoir le pane fait retomber l'attente comme d'habitude.
+        activity.mark_seen();
+        assert!(!activity.rearm_unanswered());
+        assert_eq!(activity.state(t0), ActivityState::Idle);
+    }
+
+    #[test]
+    fn a_turn_that_ended_while_seen_is_rearmed_when_the_user_leaves() {
+        let t0 = Instant::now();
+        let mut activity = PaneActivity::new();
+        activity.on_signal(Signal::CommandStart, true);
+        let end = burst(&mut activity, t0, ms(2000));
+        activity.tick(end + ms(3100), true, true);
+        assert_eq!(activity.state(end + ms(3100)), ActivityState::Idle);
+        assert!(activity.rearm_unanswered());
+        assert_eq!(activity.state(end + ms(3100)), ActivityState::Waiting);
+    }
+
+    #[test]
+    fn an_input_since_the_question_cancels_the_rearming() {
+        let t0 = Instant::now();
+        let mut bell = PaneActivity::new();
+        bell.on_signal(Signal::Notify, true);
+        bell.on_input();
+        assert!(!bell.rearm_unanswered());
+        assert_eq!(bell.state(t0), ActivityState::Idle);
+
+        let mut turn = PaneActivity::new();
+        turn.on_signal(Signal::CommandStart, true);
+        let end = burst(&mut turn, t0, ms(2000));
+        turn.tick(end + ms(3100), true, true);
+        turn.on_input();
+        assert!(!turn.rearm_unanswered());
+        assert_eq!(turn.state(end + ms(3100)), ActivityState::Idle);
+    }
+
+    #[test]
+    fn a_question_asked_after_the_last_input_is_still_rearmed() {
+        let t0 = Instant::now();
+        let mut activity = PaneActivity::new();
+        activity.on_input();
+        activity.on_signal(Signal::Notify, true);
+        assert!(activity.rearm_unanswered());
+        assert_eq!(activity.state(t0), ActivityState::Waiting);
+    }
+
+    #[test]
+    fn nothing_to_rearm_without_a_question_or_when_already_waiting() {
+        let t0 = Instant::now();
+        let mut idle = PaneActivity::new();
+        assert!(!idle.rearm_unanswered());
+        assert_eq!(idle.state(t0), ActivityState::Idle);
+        // Sonné hors vue : déjà « attend », rien ne change et rien n'est mémorisé.
+        let mut waiting = PaneActivity::new();
+        waiting.on_signal(Signal::Notify, false);
+        assert!(!waiting.rearm_unanswered());
+        waiting.mark_seen();
+        assert_eq!(waiting.state(t0), ActivityState::Idle);
+    }
+
+    #[test]
+    fn a_new_command_forgets_the_question_of_the_previous_one() {
+        let t0 = Instant::now();
+        let mut activity = PaneActivity::new();
+        activity.on_signal(Signal::Notify, true);
+        activity.on_signal(Signal::CommandStart, true);
+        assert!(!activity.rearm_unanswered());
         assert_eq!(activity.state(t0), ActivityState::Idle);
     }
 
