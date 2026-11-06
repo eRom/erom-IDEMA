@@ -110,10 +110,12 @@ p { margin: 0; }
 .choice.is-selected { border-color: var(--accent); text-decoration: underline; text-underline-offset: 4px; }
 .choice:active, .key:active { opacity: 0.7; }
 .keys { display: flex; flex-direction: column; gap: 6px; }
-.keys__row { display: flex; gap: 6px; }
-.keys__row--digits { gap: 2px; }
+.keys__row { display: flex; flex-wrap: wrap; gap: 6px; }
+.keys__row--digits { display: grid; grid-template-columns: repeat(9, 1fr); gap: 2px; }
 .key { flex: 1 1 auto; min-width: var(--target); min-height: var(--target); padding: 0 4px; border: 0; border-radius: var(--radius-control); background: var(--press); color: var(--text-2); font: 600 15px/1 var(--font); white-space: nowrap; }
-.keys__row--digits .key { flex: 1 1 0; min-width: 0; padding: 0; }
+.keys__row--digits .key { min-width: 0; padding: 0; }
+/* Neuf colonnes de 44 px demandent 430 px : en dessous, deux rangées de cinq au plus. */
+@media (max-width: 429.98px) { .keys__row--digits { grid-template-columns: repeat(5, 1fr); gap: 6px; } }
 .key--armed { background: var(--error); color: #fff; }
 .reply { display: flex; gap: 8px; }
 
