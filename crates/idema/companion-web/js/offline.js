@@ -25,7 +25,7 @@ export function bannerText(cause, fleetAt, nowMs) {
  * Une reprise périodique, démarrable et arrêtable sans effet de bord en double.
  * @param {() => void} run
  * @param {number} [intervalMs]
- * @param {import('./time.js').Timers} [timers]
+ * @param {import('./time.js').IntervalTimers} [timers]
  */
 export function createRetry(run, intervalMs = RETRY_MS, timers = realTimers) {
   /** @type {any} */

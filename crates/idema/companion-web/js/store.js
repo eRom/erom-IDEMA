@@ -78,6 +78,17 @@ export function createStore(storage) {
       write(storage, FLEET_KEY, JSON.stringify({ fleet, at: nowMs }));
       notify();
     },
+    /** L'appareil n'est plus appairé : la flotte en cache n'est plus à lui. */
+    clearFleet() {
+      state.fleet = null;
+      state.fleetAt = null;
+      try {
+        storage.removeItem(FLEET_KEY);
+      } catch {
+        // Stockage refusé : rien à effacer.
+      }
+      notify();
+    },
     /** @param {State['connection']} connection */
     setConnection(connection) {
       if (state.connection === connection) return;
@@ -105,5 +116,18 @@ export function createStore(storage) {
   };
 }
 
+/** `localStorage`, ou un stockage vide si le navigateur le refuse (l'accès lève, la page resterait blanche). @returns {Storage} */
+export function safeLocalStorage() {
+  try {
+    return globalThis.localStorage;
+  } catch {
+    return /** @type {Storage} */ (/** @type {unknown} */ ({
+      getItem: () => null,
+      setItem() {},
+      removeItem() {},
+    }));
+  }
+}
+
 /** La page n'a qu'un état. */
-export const store = createStore(globalThis.localStorage);
+export const store = createStore(safeLocalStorage());

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { createStore } from '../js/store.js';
+import { createStore, safeLocalStorage } from '../js/store.js';
 
 const FLEET = { mac: 'Mac', generated_at: 1, badge: 0, projects: [], sessions: [] };
 
@@ -59,5 +59,39 @@ describe('createStore', () => {
     const store = createStore(broken);
     store.setFleet(FLEET, 1);
     expect(store.state.fleet).toEqual(FLEET);
+  });
+
+  test('clearing the fleet empties the state and the cache', () => {
+    const store = createStore(localStorage);
+    store.setFleet(FLEET, 1000);
+    let wakes = 0;
+    store.subscribe(() => wakes++);
+    store.clearFleet();
+    expect(store.state.fleet).toBeNull();
+    expect(store.state.fleetAt).toBeNull();
+    expect(wakes).toBe(1);
+    expect(createStore(localStorage).state.fleet).toBeNull();
+  });
+});
+
+describe('safeLocalStorage', () => {
+  test('a browser that refuses localStorage still gives a working, empty store', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      get() {
+        throw new DOMException('denied', 'SecurityError');
+      },
+    });
+    try {
+      const store = createStore(safeLocalStorage());
+      store.setFleet(FLEET, 5);
+      store.setPref('a', 1);
+      store.clearFleet();
+      expect(store.state.fleet).toBeNull();
+      expect(store.getPref('a', 'fallback')).toBe('fallback');
+    } finally {
+      if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor);
+    }
   });
 });

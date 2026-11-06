@@ -8,9 +8,9 @@ export const HEARTBEAT_MS = 15_000;
 /** @typedef {{session: string, pane: number} | null} PresenceBody */
 
 /**
- * @param {(body: PresenceBody) => void} send
+ * @param {(body: PresenceBody, keepalive: boolean) => void} send `keepalive` : le `null` du masquage doit partir même si la page gèle
  * @param {number} [intervalMs]
- * @param {import('./time.js').Timers} [timers]
+ * @param {import('./time.js').IntervalTimers} [timers]
  */
 export function createPresence(send, intervalMs = HEARTBEAT_MS, timers = realTimers) {
   /** @type {{session: string, pane: number} | null} */
@@ -25,7 +25,7 @@ export function createPresence(send, intervalMs = HEARTBEAT_MS, timers = realTim
     const body = visible && target ? { session: target.session, pane: target.pane } : null;
     if (body === null && lastWasNull) return;
     lastWasNull = body === null;
-    send(body);
+    send(body, !visible);
   }
 
   function sync() {

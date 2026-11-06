@@ -37,14 +37,19 @@ export function ageFr(fromMs, nowMs) {
  * @typedef {object} Timers
  * @property {(fn: () => void, ms: number) => any} setInterval
  * @property {(id: any) => void} clearInterval
+ * @property {(fn: () => void, ms: number) => any} setTimeout
+ * @property {(id: any) => void} clearTimeout
  */
 
+/** @typedef {Pick<Timers, 'setInterval' | 'clearInterval'>} IntervalTimers */
+
 /**
- * Les vraies minuteries, enveloppées : `{ setInterval }` appelé comme méthode d'un objet perd son `this` et Safari
- * refuse (« Can only call Window.setInterval on instances of Window »). Les tests en injectent de fausses.
+ * Les vraies minuteries, enveloppées : appelées comme méthodes d'un objet, elles perdent leur `this` et Safari refuse.
  * @type {Timers}
  */
 export const realTimers = {
   setInterval: (fn, ms) => setInterval(fn, ms),
   clearInterval: (id) => clearInterval(id),
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (id) => clearTimeout(id),
 };

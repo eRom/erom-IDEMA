@@ -27,6 +27,13 @@ describe('pairingMessage', () => {
     expect(pairingMessage({ kind: 'timeout' })).toContain('ne répond pas');
   });
 
+  test('an error code that is an Object.prototype member is not a refusal', () => {
+    const generic = pairingMessage({ kind: 'http', status: 500, error: 'internal' });
+    for (const error of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      expect(pairingMessage({ kind: 'http', status: 403, error })).toBe(generic);
+    }
+  });
+
   test('any other failure is a generic sentence', () => {
     expect(pairingMessage({ kind: 'http', status: 500, error: 'internal' })).toContain('erreur');
   });

@@ -5,15 +5,17 @@ import { createPresence } from '../js/presence.js';
 function harness() {
   /** @type {any[]} */
   const sent = [];
+  /** @type {boolean[]} */
+  const keepalives = [];
   /** @type {(() => void) | null} */
   let tick = null;
-  const presence = createPresence((body) => sent.push(body), 15000, {
+  const presence = createPresence((body, keepalive) => (sent.push(body), keepalives.push(keepalive)), 15000, {
     setInterval: (fn) => ((tick = fn), 1),
     clearInterval: () => {
       tick = null;
     },
   });
-  return { presence, sent, tick: () => tick?.(), hasTimer: () => tick !== null };
+  return { presence, sent, keepalives, tick: () => tick?.(), hasTimer: () => tick !== null };
 }
 
 describe('createPresence', () => {
@@ -47,6 +49,14 @@ describe('createPresence', () => {
     presence.setVisible(true);
     expect(sent.at(-1)).toEqual({ session: 'a', pane: 1 });
     expect(hasTimer()).toBe(true);
+  });
+
+  test('only the null sent on hide asks to survive the page being frozen', () => {
+    const { presence, sent, keepalives } = harness();
+    presence.setTarget({ session: 'a', pane: 1 });
+    presence.setVisible(false);
+    expect(sent).toEqual([{ session: 'a', pane: 1 }, null]);
+    expect(keepalives).toEqual([false, true]);
   });
 
   test('nothing to declare and nothing sent while the page is on another screen', () => {

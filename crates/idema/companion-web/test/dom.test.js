@@ -29,6 +29,18 @@ describe('el', () => {
     expect(el('a', { href: 'http://example.com' }).getAttribute('href')).toBe('http://example.com');
   });
 
+  test('the guards hold whatever the case of the attribute key', () => {
+    expect(el('a', { Href: 'javascript:x' }).hasAttribute('href')).toBe(false);
+    expect(el('a', { HREF: 'javascript:x' }).hasAttribute('href')).toBe(false);
+    expect(el('div', { Style: 'color: red' }).hasAttribute('style')).toBe(false);
+    expect(el('div', { STYLE: 'color: red' }).hasAttribute('style')).toBe(false);
+    expect(el('button', { ONCLICK: 'alert(1)' }).hasAttribute('onclick')).toBe(false);
+    expect(el('button', { OnMouseOver: 'alert(1)' }).hasAttribute('onmouseover')).toBe(false);
+    expect(el('iframe', { SrcDoc: '<script>1</script>' }).hasAttribute('srcdoc')).toBe(false);
+    expect(el('img', { SRC: '//evil.example/x.png' }).hasAttribute('src')).toBe(false);
+    expect(el('a', { Href: 'https://ok.example/' }).getAttribute('href')).toBe('https://ok.example/');
+  });
+
   test('the style attribute is refused', () => {
     const node = el('div', { style: 'color: red' });
     expect(node.hasAttribute('style')).toBe(false);
@@ -55,6 +67,13 @@ describe('el', () => {
     expect(el('img', { src: '/logos/claude.png' }).getAttribute('src')).toBe('/logos/claude.png');
     expect(el('img', { src: '//evil.example/x.png' }).hasAttribute('src')).toBe(false);
     expect(el('img', { src: 'javascript:x' }).hasAttribute('src')).toBe(false);
+  });
+
+  test('an image source that resolves to another origin is refused, a backslash included', () => {
+    for (const src of ['/\\evil.example/x.png', '\\\\evil.example/x.png', 'https://evil.example/x.png', 'data:image/png;base64,AAAA']) {
+      expect(el('img', { src }).hasAttribute('src')).toBe(false);
+    }
+    expect(el('img', { src: `${location.origin}/logos/a.png` }).hasAttribute('src')).toBe(true);
   });
 });
 
@@ -97,6 +116,26 @@ describe('linkify', () => {
     const holder = el('div', null, nodes);
     expect(holder.querySelector('img')).toBeNull();
     expect(holder.textContent).toContain(HOSTILE);
+  });
+
+  test('a closing parenthesis stays when the address has its opening one', () => {
+    expect(describeNodes(linkify('https://a.example/Foo_(bar)'))).toEqual(['a:https://a.example/Foo_(bar)']);
+    expect(describeNodes(linkify('(https://a.example/Foo_(bar)).'))).toEqual([
+      't:(',
+      'a:https://a.example/Foo_(bar)',
+      't:).',
+    ]);
+  });
+
+  test('a very long run of punctuation is trimmed in linear time', () => {
+    const started = performance.now();
+    for (const tail of ['.', ')', '!?']) {
+      const nodes = linkify(`https://a.example/x${tail.repeat(100_000)} fin`);
+      expect(describeNodes(nodes)[0]).toBe('a:https://a.example/x');
+    }
+    // La série de points au milieu de l'adresse : c'est là que l'ancienne expression régulière était quadratique.
+    expect(describeNodes(linkify(`https://a.example/${'.'.repeat(100_000)}a`))[0]).toContain('a.example');
+    expect(performance.now() - started).toBeLessThan(1000);
   });
 
   test('empty text gives no node', () => {

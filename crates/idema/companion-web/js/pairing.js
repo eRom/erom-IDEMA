@@ -22,7 +22,7 @@ const REFUSALS = {
  */
 export function pairingMessage(result, nowMs = Date.now()) {
   if (result.kind === 'offline' || result.kind === 'timeout') return bannerText(result.kind, null, nowMs);
-  if (result.kind === 'http' && result.error in REFUSALS) {
+  if (result.kind === 'http' && Object.hasOwn(REFUSALS, result.error)) {
     return REFUSALS[/** @type {keyof typeof REFUSALS} */ (result.error)];
   }
   return 'IdemA a répondu par une erreur. Réessayez dans un instant.';

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { parseRoute, sessionHash } from '../js/router.js';
+import { parseRoute, sessionHash, startRouter } from '../js/router.js';
 
 describe('parseRoute', () => {
   test('the fleet is the home route', () => {
@@ -34,5 +34,22 @@ describe('parseRoute', () => {
     for (const hash of ['#/s/x', '#/s/x/notanumber', '#/s//1', '#/s/%E0%A4%A/1', '#/nope', '#/s/x/1/extra']) {
       expect(parseRoute(hash)).toEqual({ name: 'fleet' });
     }
+  });
+});
+
+describe('startRouter', () => {
+  test('a hash change that leaves the route unchanged does not render again', () => {
+    location.hash = '';
+    /** @type {string[]} */
+    const seen = [];
+    const stop = startRouter((route) => seen.push(route.name));
+    location.hash = '#/';
+    window.dispatchEvent(new Event('hashchange'));
+    location.hash = '#/notes';
+    window.dispatchEvent(new Event('hashchange'));
+    window.dispatchEvent(new Event('hashchange'));
+    stop();
+    window.dispatchEvent(new Event('hashchange'));
+    expect(seen).toEqual(['fleet', 'notes']);
   });
 });

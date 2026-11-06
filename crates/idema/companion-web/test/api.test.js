@@ -41,6 +41,18 @@ describe('api', () => {
     expect(new Headers(seen[0].init.headers).get('content-type')).toBe('application/json');
   });
 
+  test('keepalive is asked for only when wanted', async () => {
+    /** @type {RequestInit[]} */
+    const inits = [];
+    stubFetch(async (_url, init) => {
+      inits.push(init);
+      return new Response('{}', { status: 200 });
+    });
+    await api('PUT', '/presence', null, undefined, true);
+    await api('PUT', '/presence', null);
+    expect(inits.map((init) => init.keepalive ?? false)).toEqual([true, false]);
+  });
+
   test('a 204 is a success without data', async () => {
     stubFetch(async () => new Response(null, { status: 204 }));
     expect(await api('POST', '/client-metrics', { name: 'shell_ready', ms: 1 })).toEqual({

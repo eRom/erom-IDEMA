@@ -61,11 +61,19 @@ export function parseRoute(hash) {
 }
 
 /**
- * Appelle `onRoute` pour la route d'aujourd'hui puis à chaque changement de fragment. Rend l'arrêt.
+ * Appelle `onRoute` pour la route d'aujourd'hui puis à chaque changement de fragment qui change de route (`#` et
+ * `#/` sont la même : pas de second rendu). Rend l'arrêt.
  * @param {(route: Route) => void} onRoute
  */
 export function startRouter(onRoute) {
-  const run = () => onRoute(parseRoute(location.hash));
+  let last = '';
+  const run = () => {
+    const route = parseRoute(location.hash);
+    const key = JSON.stringify(route);
+    if (key === last) return;
+    last = key;
+    onRoute(route);
+  };
   addEventListener('hashchange', run);
   run();
   return () => removeEventListener('hashchange', run);

@@ -29,9 +29,10 @@ export function classifyFailure(error, aborted) {
  * @param {string} path chemin sous `/idema-api`, avec son `/` initial
  * @param {unknown} [body] sérialisé en JSON s'il est défini (`null` compris)
  * @param {number} [timeoutMs]
+ * @param {boolean} [keepalive] la requête survit à la fermeture de la page (le `null` de présence au masquage)
  * @returns {Promise<ApiResult>}
  */
-export async function api(method, path, body, timeoutMs = TIMEOUT_MS) {
+export async function api(method, path, body, timeoutMs = TIMEOUT_MS, keepalive = false) {
   const controller = new AbortController();
   let aborted = false;
   const timer = setTimeout(() => {
@@ -40,6 +41,7 @@ export async function api(method, path, body, timeoutMs = TIMEOUT_MS) {
   }, timeoutMs);
   /** @type {RequestInit} */
   const init = { method, signal: controller.signal, credentials: 'same-origin', cache: 'no-store' };
+  if (keepalive) init.keepalive = true;
   if (body !== undefined) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(body);
