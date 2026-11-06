@@ -185,14 +185,214 @@ fn body_end(lines: &[&str]) -> usize {
     end
 }
 
-/// Les `count` dernières lignes utiles de l'écran, dans leur ordre : séquences ANSI retirées, blancs retirés aux deux
-/// bouts (et le trait vertical d'un cadre de TUI avec eux), lignes vides et lignes sans lettre ni chiffre (cadres, traits,
-/// invites seules) écartées, chacune coupée à 110 caractères suivis de « … ». Le pied de page de l'agent (sous le dernier
-/// trait horizontal de l'écran, avec sa boîte de saisie vide) n'est pas lu tant que l'écran a du texte au-dessus : c'est
-/// la question de l'agent qu'on veut, pas sa ligne de statut. Sans texte au-dessus, la règle s'applique à tout l'écran.
+/// Marqueurs d'invite de saisie des agents (`❯` Claude Code, `›` Codex, `>` Antigravity).
+const PROMPT_MARKERS: [char; 3] = ['❯', '›', '>'];
+/// Marqueurs du curseur d'un menu : les marqueurs d'invite, plus les flèches de certains menus.
+const CURSOR_MARKERS: [char; 5] = ['❯', '›', '>', '▸', '▶'];
+/// Au-delà de ce nombre de blancs de tête, une ligne est alignée à droite (message d'état, pas du texte de l'agent).
+const RIGHT_ALIGNED_BLANKS: usize = 40;
+/// Une jauge est une suite d'au moins ce nombre de blocs identiques.
+const GAUGE_MIN_RUN: usize = 5;
+
+/// La ligne sans ses blancs ni les traits verticaux d'un cadre, aux deux bouts.
+fn bare(line: &str) -> &str {
+    line.trim_matches(|c: char| c.is_whitespace() || FRAME_VERTICALS.contains(&c))
+}
+
+/// Le marqueur de curseur ou d'invite qui ouvre le texte (suivi d'un blanc ou de la fin de ligne), et le reste.
+/// `>_ Codex` n'a pas de marqueur : le caractère qui suit n'est pas un blanc.
+fn split_marker<'a>(text: &'a str, markers: &[char]) -> Option<&'a str> {
+    let rest = text.strip_prefix(markers)?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim_start())
+}
+
+/// Le numéro d'une option de menu (`1. Café`, `❯ 2) Thé`), curseur compris.
+fn option_number(line: &str) -> Option<u32> {
+    let text = bare(line);
+    let text = split_marker(text, &CURSOR_MARKERS).unwrap_or(text);
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || digits > 3 {
+        return None;
+    }
+    let rest = text[digits..].strip_prefix(['.', ')'])?;
+    if !rest.starts_with(char::is_whitespace) || rest.trim().is_empty() {
+        return None;
+    }
+    text[..digits].parse().ok()
+}
+
+/// Le rappel de touches d'un menu (`Enter to select · ↑/↓ to navigate · Esc to cancel`, `Press enter to confirm or esc
+/// to cancel`). « esc to interrupt » est celui d'un agent au travail, pas d'un menu.
+fn is_key_hint(line: &str) -> bool {
+    let text = bare(line).to_lowercase();
+    !text.contains("interrupt")
+        && [
+            "enter to ",
+            "esc to ",
+            "press enter",
+            "press esc",
+            "tab to ",
+            "↑/↓",
+            "↑↓",
+        ]
+        .iter()
+        .any(|start| text.starts_with(start))
+}
+
+/// Les lignes du menu à choix de l'écran, le plus bas : la question (la ligne utile la plus proche au-dessus de la
+/// première option), puis les premières options, `count` lignes au plus. Les lignes de description et le rappel de
+/// touches n'y entrent pas. Un menu est de deux sortes : des options numérotées (`1.` ou `1)`, avec un curseur sur l'une
+/// d'elles ou un rappel de touches dessous, ce qui le distingue d'une liste numérotée dans un message), ou une ligne à
+/// curseur suivie d'options sœurs et d'un rappel de touches.
+fn menu_body(lines: &[&str], count: usize) -> Option<Vec<String>> {
+    let (first, options) = numbered_menu(lines).or_else(|| cursor_menu(lines))?;
+    let question = lines[..first]
+        .iter()
+        .rev()
+        .find_map(|line| clean_line(line));
+    let shown: Vec<String> = question
+        .into_iter()
+        .chain(options.iter().filter_map(|&at| clean_line(lines[at])))
+        .take(count)
+        .collect();
+    Some(shown)
+}
+
+/// Les options numérotées consécutives (`N`, `N+1`, …) de la dernière suite d'au moins deux options, si elle a un
+/// curseur ou un rappel de touches dessous : l'index de la première option et ceux de toutes.
+fn numbered_menu(lines: &[&str]) -> Option<(usize, Vec<usize>)> {
+    let mut groups: Vec<Vec<(usize, u32)>> = Vec::new();
+    for (at, number) in lines
+        .iter()
+        .enumerate()
+        .filter_map(|(at, line)| option_number(line).map(|number| (at, number)))
+    {
+        match groups.last_mut() {
+            Some(group) if group.last().is_some_and(|&(_, last)| last + 1 == number) => {
+                group.push((at, number));
+            }
+            _ => groups.push(vec![(at, number)]),
+        }
+    }
+    let group = groups.into_iter().rfind(|group| group.len() >= 2)?;
+    let last = group.last()?.0;
+    let has_cursor = group
+        .iter()
+        .any(|&(at, _)| split_marker(bare(lines[at]), &CURSOR_MARKERS).is_some());
+    let hint_below = lines[last + 1..].iter().any(|line| is_key_hint(line));
+    (has_cursor || hint_below).then(|| (group[0].0, group.iter().map(|&(at, _)| at).collect()))
+}
+
+/// Un menu sans numéros : la dernière ligne à curseur avant le dernier rappel de touches, avec au moins une option sœur
+/// entre les deux. Rend l'index de la ligne à curseur et ceux de ses options (elle comprise).
+fn cursor_menu(lines: &[&str]) -> Option<(usize, Vec<usize>)> {
+    let hint = lines.iter().rposition(|line| is_key_hint(line))?;
+    let cursor = lines[..hint].iter().rposition(|line| {
+        split_marker(bare(line), &CURSOR_MARKERS)
+            .is_some_and(|rest| rest.chars().any(char::is_alphanumeric))
+    })?;
+    let options: Vec<usize> = (cursor..hint)
+        .filter(|&at| clean_line(lines[at]).is_some())
+        .collect();
+    (options.len() >= 2).then_some((cursor, options))
+}
+
+/// La ligne de saisie : la ligne dont le texte commence par un marqueur d'invite, vide ou non (texte d'exemple compris).
+/// Une option de menu à curseur (`❯ 1. Oui`) n'en est pas une.
+fn is_input_line(line: &str) -> bool {
+    split_marker(bare(line), &PROMPT_MARKERS).is_some_and(|rest| option_number(rest).is_none())
+}
+
+/// Une ligne de durée de tour : un mot puis `for <n>s|m|h` (`✻ Cooked for 1s · done 7:33`, `Worked for 1s • 07:28`).
+fn is_turn_duration(line: &str) -> bool {
+    let text = line.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let mut words = text.split_whitespace();
+    let (Some(verb), Some("for"), Some(duration)) = (words.next(), words.next(), words.next())
+    else {
+        return false;
+    };
+    let digits = duration.trim_end_matches(['s', 'm', 'h']);
+    verb.chars().all(char::is_alphabetic)
+        && duration.len() > digits.len()
+        && !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Une ligne à jauge : au moins cinq caractères identiques de suite parmi les blocs (U+2580 à U+259F) et les formes
+/// géométriques (U+25A0 à U+25FF), `▪▪▪▪▪▪▪▪ 99% hit`.
+fn is_gauge(line: &str) -> bool {
+    let is_block = |c: char| ('\u{2580}'..='\u{25ff}').contains(&c);
+    let mut run = 0;
+    let mut previous = None;
+    for c in line.chars() {
+        run = if previous == Some(c) { run + 1 } else { 1 };
+        previous = Some(c);
+        if is_block(c) && run >= GAUGE_MIN_RUN {
+            return true;
+        }
+    }
+    false
+}
+
+/// Un trait qui porte une étiquette (`──── opus-ceres-0piq ─`) : au moins 80 % de caractères de dessin de boîte.
+fn is_labelled_frame(line: &str) -> bool {
+    let text = line.trim();
+    let total = text.chars().count();
+    let boxed = text
+        .chars()
+        .filter(|c| ('\u{2500}'..='\u{257f}').contains(c))
+        .count();
+    boxed > 0 && boxed * 5 >= total * 4
+}
+
+/// Le dernier message de l'agent : les `count` dernières lignes utiles entre l'invite précédente (le dernier message de
+/// Romain) et la ligne de saisie, la plus basse de l'écran. Écartées : durées de tour, jauges, lignes alignées à droite et
+/// traits étiquetés. Vide sans ligne de saisie, ou quand rien ne reste.
+fn last_message(lines: &[&str], count: usize) -> Vec<String> {
+    let Some(input) = lines.iter().rposition(|line| is_input_line(line)) else {
+        return Vec::new();
+    };
+    let start = lines[..input]
+        .iter()
+        .rposition(|line| is_input_line(line))
+        .map_or(0, |previous| previous + 1);
+    let mut found: Vec<String> = lines[start..input]
+        .iter()
+        .filter(|line| {
+            let blanks = line.chars().take_while(|c| c.is_whitespace()).count();
+            blanks < RIGHT_ALIGNED_BLANKS
+                && !is_turn_duration(line)
+                && !is_gauge(line)
+                && !is_labelled_frame(line)
+        })
+        .filter_map(|line| clean_line(line))
+        .rev()
+        .take(count)
+        .collect();
+    found.reverse();
+    found
+}
+
+/// Les `count` lignes utiles de l'écran à montrer dans la notification, dans leur ordre : séquences ANSI retirées, blancs
+/// retirés aux deux bouts (et le trait vertical d'un cadre de TUI avec eux), lignes sans lettre ni chiffre écartées,
+/// chacune coupée à 110 caractères suivis de « … ». La règle, dans l'ordre :
+/// 1. un menu à choix (`menu_body`) : sa question puis ses premières options ;
+/// 2. sinon le dernier message de l'agent (`last_message`), au-dessus de la ligne de saisie ;
+/// 3. à défaut, les dernières lignes au-dessus du dernier trait horizontal (`body_end`) : le pied de page de l'agent
+///    n'est pas lu tant que l'écran a du texte au-dessus ;
+/// 4. à défaut, les dernières lignes de l'écran entier.
 pub fn useful_lines(screen: &str, count: usize) -> Vec<String> {
     let clean = strip_ansi(screen);
     let lines: Vec<&str> = clean.lines().collect();
+    if let Some(menu) = menu_body(&lines, count)
+        && !menu.is_empty()
+    {
+        return menu;
+    }
+    let message = last_message(&lines, count);
+    if !message.is_empty() {
+        return message;
+    }
     let last = |range: &[&str]| -> Vec<String> {
         let mut found: Vec<String> = range
             .iter()
@@ -424,31 +624,28 @@ mod tests {
         assert_eq!(
             useful_lines(CLAUDE_MENU, 3),
             [
+                "Do you want to proceed?",
                 "❯ 1. Yes",
                 "2. Yes, and don't ask again for cargo test",
-                "3. No, and tell Claude what to do differently",
             ]
         );
         // Menu à la forme de Codex (couleurs 24 bits, aide grisée, `›` du choix courant, aucun cadre) : sa question et
-        // ses choix, jusqu'à la ligne d'aide.
+        // ses premiers choix, jamais la ligne d'aide.
         assert_eq!(
             useful_lines(CODEX_MENU, 3),
             [
+                "$ cargo test --workspace",
+                "› 1. Yes, proceed (y)",
                 "2. Yes, and don't ask again for this command (p)",
-                "3. No, and tell Codex what to do differently (esc)",
-                "Press enter to confirm or esc to cancel",
             ]
         );
         assert_eq!(
             useful_lines(CODEX_MENU, 7),
             [
-                ">_ Codex (v9.9.9)",
-                "Would you like to run the following command?",
                 "$ cargo test --workspace",
                 "› 1. Yes, proceed (y)",
                 "2. Yes, and don't ask again for this command (p)",
                 "3. No, and tell Codex what to do differently (esc)",
-                "Press enter to confirm or esc to cancel",
             ]
         );
         // Aucune séquence d'échappement ni caractère de contrôle ne survit dans ce qui est rendu.
@@ -477,17 +674,14 @@ mod tests {
         assert_eq!(
             useful_lines(&screen, 3),
             [
+                "Do you want to proceed?",
                 "❯ 1. Yes",
                 "2. Yes, and don't ask again for cargo test",
-                "3. No, and tell Claude what to do differently",
             ]
         );
         assert_eq!(
             useful_lines(&screen, 20),
             [
-                "Bash command",
-                "cargo test --workspace",
-                "Run the workspace tests",
                 "Do you want to proceed?",
                 "❯ 1. Yes",
                 "2. Yes, and don't ask again for cargo test",
@@ -506,6 +700,113 @@ mod tests {
             useful_lines(&screen, 3),
             ["Les tests passent.", "Veux-tu que je committe ?"]
         );
+    }
+
+    // Vrais écrans capturés par `tmux capture-pane -e -p` (nettoyés de toute donnée personnelle).
+    const CLAUDE_IDLE_ANSWER: &str = include_str!("testdata/screens/claude-idle-answer.ansi");
+    const CLAUDE_IDLE_UPDATE: &str = include_str!("testdata/screens/claude-idle-update.ansi");
+    const CLAUDE_ASKUSER: &str = include_str!("testdata/screens/claude-askuser.ansi");
+    const CLAUDE_PERMISSION: &str = include_str!("testdata/screens/claude-permission.ansi");
+    const CLAUDE_TRUST_MENU: &str = include_str!("testdata/screens/claude-trust-menu.ansi");
+    const CODEX_QUESTION: &str = include_str!("testdata/screens/codex-question.ansi");
+    const AGY_IDLE: &str = include_str!("testdata/screens/agy-idle.ansi");
+
+    #[test]
+    fn a_real_idle_claude_pane_shows_its_last_message_not_its_status_widgets() {
+        // Durée du tour, widget à jauge, ligne de mise à jour alignée à droite, trait étiqueté : rien n'entre.
+        assert_eq!(useful_lines(CLAUDE_IDLE_ANSWER, 3), ["⏺ ok"]);
+        assert_eq!(useful_lines(CLAUDE_IDLE_UPDATE, 3), ["⏺ ok"]);
+    }
+
+    #[test]
+    fn a_real_claude_menu_shows_its_question_then_its_first_options() {
+        // AskUserQuestion : un trait simple ouvre le menu, des lignes de description s'intercalent, un trait coupe les
+        // options, le rappel de touches est dessous.
+        assert_eq!(
+            useful_lines(CLAUDE_ASKUSER, 3),
+            ["Café ou thé ?", "❯ 1. Café", "2. Thé"]
+        );
+        // Permission : la suite de l'option 2 est une ligne de description.
+        assert_eq!(
+            useful_lines(CLAUDE_PERMISSION, 3),
+            [
+                "Do you want to create hello.txt?",
+                "❯ 1. Yes",
+                "2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this",
+            ]
+        );
+        // Plus de place : toutes les options, jamais les descriptions ni le rappel de touches.
+        assert_eq!(
+            useful_lines(CLAUDE_ASKUSER, 10),
+            [
+                "Café ou thé ?",
+                "❯ 1. Café",
+                "2. Thé",
+                "3. Type something.",
+                "4. Chat about this"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_menu_without_numbers_is_read_by_its_cursor_and_its_key_reminder() {
+        let lines = useful_lines(CLAUDE_TRUST_MENU, 3);
+        assert_eq!(
+            lines,
+            ["Security guide", "❯ No, exit", "Yes, I trust this folder"]
+        );
+        assert!(
+            useful_lines(CLAUDE_TRUST_MENU, 20)
+                .iter()
+                .all(|line| !line.contains("Enter to confirm"))
+        );
+    }
+
+    #[test]
+    fn a_real_codex_pane_shows_its_last_message_not_its_input_line_and_status() {
+        assert_eq!(
+            useful_lines(CODEX_QUESTION, 3),
+            ["• Tu préfères quelle couleur ?", "• 🔴 Rouge", "• 🔵 Bleu"]
+        );
+    }
+
+    #[test]
+    fn a_real_agy_pane_shows_its_answer_without_the_previous_prompt() {
+        assert_eq!(
+            useful_lines(AGY_IDLE, 3),
+            [
+                "Salut Alex ! Prêt à en découdre. Sur quoi",
+                "est-ce qu'on se lance aujourd'hui ?"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_numbered_list_in_an_answer_is_not_a_menu() {
+        // Ni curseur ni rappel de touches : la liste fait partie du message, la boîte de saisie vide est dessous.
+        let screen = "❯ liste\n\nVoici :\n1. un\n2. deux\n\n────────\n❯ \n────────\n  statut\n";
+        assert_eq!(useful_lines(screen, 3), ["Voici :", "1. un", "2. deux"]);
+    }
+
+    #[test]
+    fn turn_durations_gauges_right_aligned_lines_and_labelled_frames_are_not_message_lines() {
+        let aligned = format!("{}✔ Update installed", " ".repeat(60));
+        let labelled = format!("{} opus-ceres-0piq ─", "─".repeat(80));
+        let screen = format!(
+            "❯ question\n\nréponse\nCooked for 1m · done\n  Worked for 12s • 07:28\n▪▪▪▪▪ 99%\n{aligned}\n{labelled}\n❯ \n"
+        );
+        assert_eq!(useful_lines(&screen, 5), ["réponse"]);
+        // Quatre blocs identiques ne font pas une jauge ; « for » sans durée ne fait pas une durée de tour.
+        let kept = "❯ q\n▪▪▪▪ 4 blocs\nWaited for you\n❯ \n";
+        assert_eq!(useful_lines(kept, 5), ["▪▪▪▪ 4 blocs", "Waited for you"]);
+    }
+
+    #[test]
+    fn a_screen_with_nothing_readable_above_the_input_line_falls_back_to_the_old_rule() {
+        // Région vide (seules des lignes de statut) : repli sur la règle du dernier trait, puis sur l'écran entier.
+        let screen = "Cooked for 1s\n────────\n❯ \n────────\nstatut\n";
+        assert_eq!(useful_lines(screen, 3), ["Cooked for 1s"]);
+        assert_eq!(useful_lines("Worked for 1s\n❯ \n", 3), ["Worked for 1s"]);
     }
 
     #[test]
