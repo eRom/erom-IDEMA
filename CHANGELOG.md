@@ -6,11 +6,10 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 
 ### Ajouté
 
-- Compagnon iPhone (éteint par défaut, section `[companion]` ou Personnaliser › Compagnon) : une page web installable sur l'écran d'accueil montre vos sessions, leur écran et leurs notes, accepte votre saisie, et envoie une notification quand un agent attend. Appairage par un code à 6 chiffres, exposition sur votre tailnet par `tailscale serve`, notifications chiffrées de bout en bout vers l'appareil. Rien ne part si le Mac est en veille ou IdemA fermé.
+- Compagnon iPhone (éteint par défaut, section `[companion]` ou Personnaliser › Compagnon) : une page web installable sur l'écran d'accueil montre vos sessions, leur écran et leurs notes, accepte votre saisie, et envoie une notification quand un agent attend. Appairage par un code à 6 chiffres, exposition sur votre tailnet par `tailscale serve`, notifications chiffrées de bout en bout vers l'appareil. Rien ne part si le Mac est en veille ou IdemA fermé. Après une mise à jour qui change les balises de la page, supprimez l'icône de l'écran d'accueil, videz les données du site dans Safari, puis ajoutez-la de nouveau : iOS lit ces réglages à l'installation.
 
 ### Corrigé
 
-- Compagnon iPhone, iOS 26 : plus de voile flou sur le haut de l'écran (la barre d'état prend la couleur de la page) ni de bande sombre sous les onglets. Après la mise à jour, retirez l'icône d'IdemA de l'écran d'accueil et ajoutez-la de nouveau : iOS lit ce réglage à l'installation.
 - Les éditeurs (volet Fichiers, Scratchpad) ne gèlent plus sur les gros fichiers : un fichier de 1 Mo s'ouvre en un dixième de seconde au lieu de 3, et changer la largeur du volet ne fige plus l'interface près de 2 s. Sur le texte et le code courants, les lignes se coupent aux mêmes endroits qu'avant.
 
 ## [0.4.0] - 2026-11-04
