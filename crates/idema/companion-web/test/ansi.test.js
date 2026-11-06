@@ -78,6 +78,33 @@ describe('parseSgr', () => {
   });
 });
 
+describe('parseSgr, tmux 3.8 forms', () => {
+  test('consumes the underline colour parameters like 38 and 48, and ignores 59', () => {
+    const fg = (/** @type {string} */ params) => first(`${ESC}[${params}mx`);
+    expect(fg('58;5;196;31')).toMatchObject({ fg: '#ff6961', underline: false });
+    expect(fg('58;2;1;2;3;1')).toMatchObject({ bold: true, dim: false, italic: false, fg: null });
+    // Les paramètres de 58 ne se lisent pas comme des attributs (1 = gras, 2 = atténué, 3 = italique).
+    expect(fg('58;5;1')).toMatchObject({ bold: false, dim: false });
+    expect(fg('4;58;5;9;32')).toMatchObject({ underline: true, fg: '#a8d672' });
+    expect(fg('59;31')).toMatchObject({ fg: '#ff6961' });
+    // Aucune couleur de soulignement ne devient une couleur de texte ou de fond.
+    expect(fg('58;5;196')).toMatchObject({ fg: null, bg: null });
+  });
+
+  test('the colon forms of the underline: 4:n underlines, 4:0 removes it', () => {
+    expect(first(`${ESC}[4:3mx`).underline).toBe(true);
+    expect(first(`${ESC}[4:1;31mx`)).toMatchObject({ underline: true, fg: '#ff6961' });
+    expect(first(`${ESC}[4;4:0mx`).underline).toBe(false);
+    expect(first(`${ESC}[4:0mx`).underline).toBe(false);
+    expect(parseSgr(`a${ESC}[4:3mb`)[0].map((s) => s.text).join('')).toBe('ab');
+  });
+
+  test('an unterminated OSC does not swallow the following lines', () => {
+    const lines = parseSgr(`a${ESC}]8;;http://x\nb\nc`);
+    expect(lines.map((l) => l.map((s) => s.text).join(''))).toEqual(['a', 'b', 'c']);
+  });
+});
+
 describe('renderScreen', () => {
   test('an <img onerror> in the capture stays text', () => {
     const pre = renderScreen(parseSgr(`${ESC}[31m<img src=x onerror=alert(1)>${ESC}[0m\n<script>alert(2)</script>`));

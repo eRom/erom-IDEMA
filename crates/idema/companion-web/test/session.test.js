@@ -121,7 +121,10 @@ describe('mountSession', () => {
       [`POST ${BASE}/input`]: () => ({ kind: 'ok', data: { outcome: 'sent' } }),
     };
   });
+  /** @param {'visible' | 'hidden'} value */
+  const setVisibility = (value) => Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => value });
   afterEach(() => {
+    setVisibility('visible');
     unmount?.();
     unmount = undefined;
     stopTriage();
@@ -497,5 +500,114 @@ describe('mountSession', () => {
     await flush();
     tap('Retour à la flotte');
     expect(location.hash).toBe('#/');
+  });
+
+  test('every key is on screen at once: the digits on one row, the named keys and y/n on the other', async () => {
+    mount();
+    await flush();
+    const rows = buttons('.keys__row').map((row) => [...row.querySelectorAll('button')].map((b) => b.getAttribute('aria-label')));
+    expect(rows[0]).toEqual(['1', '2', '3', '4', '5', '6', '7', '8', '9']);
+    expect(rows[1]).toEqual(['Flèche haut', 'Flèche bas', 'Entrée', 'Échap', 'Tab', 'Interrompre (⌃C)', 'y', 'n']);
+    expect(rows).toHaveLength(2);
+  });
+
+  test('arming Ctrl+C says what to do in the status line and clears it when the confirmation lapses', async () => {
+    mount();
+    await flush();
+    tap('Interrompre (⌃C)');
+    expect(root.querySelector('.bar__status')?.textContent).toBe('Touchez encore ⌃C pour confirmer');
+    timers.fire(3000);
+    expect(root.querySelector('.bar__status')?.textContent).toBe('');
+  });
+
+  test('a send that throws does not poison the next ones, and the text field is released', async () => {
+    mount();
+    await flush();
+    const field = /** @type {HTMLInputElement} */ (root.querySelector('.reply__input'));
+    const real = crypto.randomUUID;
+    crypto.randomUUID = () => {
+      throw new Error('no uuid');
+    };
+    field.value = 'premier';
+    tap('Envoyer');
+    await flush();
+    crypto.randomUUID = real;
+    expect(inputs()).toHaveLength(0);
+    expect(root.querySelector('.bar__status')?.textContent).toContain("L'envoi a échoué");
+    expect(field.value).toBe('premier');
+    expect(/** @type {HTMLButtonElement} */ (buttons('.reply .btn')[0]).disabled).toBe(false);
+    tap('Envoyer');
+    await flush();
+    expect(inputs()).toHaveLength(1);
+    expect(inputs()[0].body.text).toBe('premier');
+    tap('Entrée');
+    await flush();
+    expect(inputs()).toHaveLength(2);
+  });
+
+  test('the field is kept when it changed while the text was on its way', async () => {
+    /** @type {(value: any) => void} */
+    let answer = () => {};
+    routes[`POST ${BASE}/input`] = () => new Promise((resolve) => (answer = resolve));
+    mount();
+    await flush();
+    const field = /** @type {HTMLInputElement} */ (root.querySelector('.reply__input'));
+    field.value = 'envoyé';
+    tap('Envoyer');
+    await flush();
+    field.value = 'envoyé puis la suite';
+    answer({ kind: 'ok', data: { outcome: 'sent' } });
+    await flush();
+    expect(field.value).toBe('envoyé puis la suite');
+  });
+
+  test('after a send the screen is read at once, then once more about 400 ms later', async () => {
+    mount();
+    await flush();
+    const reads = () => calls.filter((c) => c.path.includes('/screen')).length;
+    const before = reads();
+    tap('Entrée');
+    await flush();
+    expect(reads()).toBe(before + 1);
+    expect(timers.fire(400)).toBe(true);
+    await flush();
+    expect(reads()).toBe(before + 2);
+    expect(timers.pending.some((t) => t.ms === 400)).toBe(false);
+  });
+
+  test('a late 404 from the acknowledgement after leaving the screen sends nobody back to the fleet', async () => {
+    /** @type {(value: any) => void} */
+    let answer = () => {};
+    routes[`POST ${BASE}/ack`] = () => new Promise((resolve) => (answer = resolve));
+    mount();
+    await flush();
+    unmount?.();
+    unmount = undefined;
+    location.hash = '#/absence';
+    answer({ kind: 'http', status: 404, error: 'not_found' });
+    await flush();
+    expect(timers.pending).toHaveLength(0);
+    timers.fire();
+    expect(location.hash).toBe('#/absence');
+  });
+
+  test('while the page is hidden the screen is not read and nothing is acknowledged; back in front, both resume', async () => {
+    setVisibility('hidden');
+    mount();
+    await flush();
+    expect(calls.some((c) => c.path.endsWith('/ack'))).toBe(false);
+    calls.length = 0;
+    expect(timers.fire(5000)).toBe(true);
+    await flush();
+    expect(calls).toHaveLength(0);
+    // La minuterie se réarme : la lecture reprendra seule au retour.
+    expect(timers.pending.map((t) => t.ms)).toContain(5000);
+    setVisibility('visible');
+    expect(timers.fire(5000)).toBe(true);
+    await flush();
+    expect(calls.some((c) => c.path.includes('/screen'))).toBe(true);
+    dispatchEvent(new Event('idema:resume'));
+    await flush();
+    expect(calls.some((c) => c.path.endsWith('/ack'))).toBe(true);
   });
 });

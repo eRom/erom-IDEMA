@@ -96,7 +96,7 @@ p { margin: 0; }
 .sgr-d { opacity: 0.6; }
 .sgr-i { font-style: italic; }
 .sgr-u { text-decoration: underline; }
-.bar { display: flex; flex: none; flex-direction: column; gap: 6px; padding: 8px 12px calc(8px + var(--safe-bottom)); background: var(--bar); border-top: 1px solid var(--separator); }
+.bar { display: flex; flex: none; flex-direction: column; gap: 6px; padding: 8px 8px calc(8px + var(--safe-bottom)); background: var(--bar); border-top: 1px solid var(--separator); }
 .bar__meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 16px; }
 .bar__status { color: var(--text-2); font-size: 13px; font-weight: 600; }
 .bar__status--ok { color: var(--running); }
@@ -109,9 +109,11 @@ p { margin: 0; }
 .choice { flex: none; min-height: var(--target); padding: 0 16px; overflow: hidden; border: 1.5px solid var(--separator); border-radius: var(--radius-control); background: var(--card); color: var(--text); font: 600 16px/1 var(--font); text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .choice.is-selected { border-color: var(--accent); text-decoration: underline; text-underline-offset: 4px; }
 .choice:active, .key:active { opacity: 0.7; }
-.keys { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
-.keys::-webkit-scrollbar { display: none; }
-.key { flex: none; min-width: var(--target); min-height: var(--target); padding: 0 12px; border: 0; border-radius: var(--radius-control); background: var(--press); color: var(--text-2); font: 600 15px/1 var(--font); }
+.keys { display: flex; flex-direction: column; gap: 6px; }
+.keys__row { display: flex; gap: 6px; }
+.keys__row--digits { gap: 2px; }
+.key { flex: 1 1 auto; min-width: var(--target); min-height: var(--target); padding: 0 4px; border: 0; border-radius: var(--radius-control); background: var(--press); color: var(--text-2); font: 600 15px/1 var(--font); white-space: nowrap; }
+.keys__row--digits .key { flex: 1 1 0; min-width: 0; padding: 0; }
 .key--armed { background: var(--error); color: #fff; }
 .reply { display: flex; gap: 8px; }
 

@@ -61,17 +61,20 @@ function validateText(raw) {
   return bytes > TEXT_MAX_BYTES ? { ok: false, error: `Texte trop long : ${bytes} octets sur 1 024 au plus.` } : { ok: true, text };
 }
 
-/** Les touches, ⌃C à part (il demande une confirmation). `y` et `n` ici n'envoient pas Entrée. */
-const KEYS = [
+/** Les touches nommées, ⌃C à part (il demande une confirmation) ; `y` et `n` ici n'envoient pas Entrée. */
+const NAMED_KEYS = [
   ['↑', 'Flèche haut', 'up'],
   ['↓', 'Flèche bas', 'down'],
   ['Entrée', 'Entrée', 'enter'],
   ['Échap', 'Échap', 'escape'],
   ['Tab', 'Tab', 'tab'],
-  ['y', 'y', 'y'],
-  ['n', 'n', 'n'],
-  ...Array.from({ length: 9 }, (_, i) => [String(i + 1), String(i + 1), String(i + 1)]),
 ];
+const LETTER_KEYS = [['y', 'y', 'y'], ['n', 'n', 'n']];
+/** Les chiffres 1 à 9 : le recours quand la lecture du menu a raté. */
+const DIGIT_KEYS = Array.from({ length: 9 }, (_, i) => [String(i + 1), String(i + 1), String(i + 1)]);
+
+const CONFIRM_TEXT = 'Touchez encore ⌃C pour confirmer';
+const FOLLOW_MS = 400;
 
 const visible = () => document.visibilityState === 'visible';
 
@@ -99,6 +102,8 @@ export function mountSession(root, { route, store, request, timers = realTimers 
   let armTimer = null;
   /** @type {any} */
   let closeTimer = null;
+  /** @type {any} */
+  let followTimer = null;
   let chain = Promise.resolve(true);
   let sending = false;
   const stateOfPane = () => store.state.fleet?.sessions.find((s) => s.name === session)?.panes.find((/** @type {{id: number}} */ p) => p.id === pane)?.state;
@@ -116,12 +121,12 @@ export function mountSession(root, { route, store, request, timers = realTimers 
   const next = el('button', { class: 'bar__next', type: 'button', hidden: true, onclick: goNext });
   const choices = el('div', { class: 'choices', hidden: true });
   const ctrl = el('button', { class: 'key', type: 'button', 'aria-label': 'Interrompre (⌃C)', onclick: pressCtrl }, '⌃C');
+  // Toutes les touches sont visibles d'un coup, sans défilement : les chiffres sur une ligne, le reste sur l'autre.
   const keys = el(
     'div',
     { class: 'keys' },
-    KEYS.slice(0, 5).map(([label, name, key]) => keyButton(label, name, key)),
-    ctrl,
-    KEYS.slice(5).map(([label, name, key]) => keyButton(label, name, key)),
+    el('div', { class: 'keys__row keys__row--digits' }, DIGIT_KEYS.map(([label, name, key]) => keyButton(label, name, key))),
+    el('div', { class: 'keys__row' }, NAMED_KEYS.map(([label, name, key]) => keyButton(label, name, key)), ctrl, LETTER_KEYS.map(([label, name, key]) => keyButton(label, name, key))),
   );
   const field = el('input', { class: 'reply__input', type: 'text', placeholder: 'Répondre…', enterkeyhint: 'send', autocomplete: 'off', autocapitalize: 'off', 'aria-label': 'Réponse' });
   const submit = el('button', { class: 'btn btn--primary', type: 'button', onclick: () => void sendText() }, 'Envoyer');
@@ -157,16 +162,21 @@ export function mountSession(root, { route, store, request, timers = realTimers 
   }
 
   function close() {
-    if (closing) return;
+    if (!alive || closing) return;
     closing = true;
     if (readTimer !== null) timers.clearTimeout(readTimer);
+    if (followTimer !== null) timers.clearTimeout(followTimer);
     say({ text: 'Session fermée', tone: 'error', closed: true });
     closeTimer = timers.setTimeout(() => void (location.hash = '#/'), CLOSED_MS);
   }
 
   /** Les envois partent dans l'ordre où on les touche. @param {Record<string, unknown>} body */
   function send(body) {
-    chain = chain.then(() => post(body));
+    // Un `post` qui lève ne doit pas bloquer les envois suivants.
+    chain = chain.then(() => post(body)).catch(() => {
+      say({ text: "L'envoi a échoué : vérifiez l'écran", tone: 'error', closed: false });
+      return false;
+    });
     return chain;
   }
 
@@ -182,7 +192,13 @@ export function mountSession(root, { route, store, request, timers = realTimers 
       close();
       return false;
     }
+    // Une lecture tout de suite, une autre un instant après : l'agent n'a pas encore réagi à la première.
     void refresh();
+    if (followTimer !== null) timers.clearTimeout(followTimer);
+    followTimer = timers.setTimeout(() => {
+      followTimer = null;
+      void refresh();
+    }, FOLLOW_MS);
     return outcome.tone !== 'error';
   }
 
@@ -192,15 +208,22 @@ export function mountSession(root, { route, store, request, timers = realTimers 
     if (!checked.ok) return void (checked.error && say({ text: checked.error, tone: 'error', closed: false }));
     sending = true;
     submit.disabled = true;
-    const sent = await send({ text: checked.text, enter: true });
-    sending = submit.disabled = false;
-    if (sent && alive) field.value = '';
+    const typed = field.value;
+    let sent = false;
+    try {
+      sent = await send({ text: checked.text, enter: true });
+    } finally {
+      sending = submit.disabled = false;
+    }
+    // Le champ n'est vidé que si on n'y a rien changé pendant l'envoi.
+    if (sent && alive && field.value === typed) field.value = '';
   }
 
   function disarm() {
     if (armTimer !== null) timers.clearTimeout(armTimer);
     armTimer = null;
     ctrl.classList.remove('key--armed');
+    if (status.textContent === CONFIRM_TEXT) say({ text: '', tone: 'ok', closed: false });
     ctrl.textContent = '⌃C';
     ctrl.setAttribute('aria-label', 'Interrompre (⌃C)');
   }
@@ -212,8 +235,10 @@ export function mountSession(root, { route, store, request, timers = realTimers 
       return;
     }
     ctrl.classList.add('key--armed');
-    ctrl.textContent = 'Confirmer ⌃C';
+    // Le libellé reste court : la rangée tient sur la largeur de l'iPhone sans défilement.
+    ctrl.textContent = 'Sûr ?';
     ctrl.setAttribute('aria-label', 'Confirmer ⌃C');
+    say({ text: CONFIRM_TEXT, tone: 'warn', closed: false });
     armTimer = timers.setTimeout(disarm, CONFIRM_MS);
   }
 
@@ -364,7 +389,7 @@ export function mountSession(root, { route, store, request, timers = realTimers 
 
   return () => {
     alive = false;
-    for (const timer of [readTimer, noticeTimer, armTimer, closeTimer]) if (timer !== null) timers.clearTimeout(timer);
+    for (const timer of [readTimer, noticeTimer, armTimer, closeTimer, followTimer]) if (timer !== null) timers.clearTimeout(timer);
     unsubscribe();
     removeEventListener('idema:resume', onResume);
   };

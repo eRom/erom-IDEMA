@@ -48,10 +48,13 @@ function extended(codes, at) {
 /** @param {Style} style @param {string} params @returns {Style} */
 function applySgr(style, params) {
   const next = { ...style };
-  const codes = params === '' ? [0] : params.split(';').map((p) => (p === '' ? 0 : Number(p)));
+  const tokens = params === '' ? ['0'] : params.split(';');
+  const codes = tokens.map((p) => (p === '' ? 0 : Number(p)));
   for (let i = 0; i < codes.length; i++) {
     const c = codes[i];
-    if (c === 0) Object.assign(next, PLAIN);
+    // `4:n` : souligné de style n (courbe, pointillé…), sauf `4:0` qui l'ôte.
+    if (/^4:\d$/.test(tokens[i])) next.underline = tokens[i] !== '4:0';
+    else if (c === 0) Object.assign(next, PLAIN);
     else if (c === 1) next.bold = true;
     else if (c === 2) next.dim = true;
     else if (c === 3) next.italic = true;
@@ -67,9 +70,10 @@ function applySgr(style, params) {
     else if (c >= 40 && c <= 47) next.bg = PALETTE[c - 40];
     else if (c >= 100 && c <= 107) next.bg = PALETTE[c - 92];
     else if (c === 49) next.bg = null;
-    else if (c === 38 || c === 48) {
+    else if (c === 38 || c === 48 || c === 58) {
       const { color, used } = extended(codes, i);
-      if (color) next[c === 38 ? 'fg' : 'bg'] = color;
+      // 58 est la couleur du soulignement : ses paramètres sont consommés, la couleur n'est pas rendue. 59 ne change rien.
+      if (color && c !== 58) next[c === 38 ? 'fg' : 'bg'] = color;
       i += used;
     }
     // Tout autre code (99, 5, 53…) est ignoré ; les suivants du même ordre agissent.
@@ -81,7 +85,7 @@ function applySgr(style, params) {
 // Une séquence CSI (même tronquée en fin de texte), une chaîne OSC, un autre échappement, un octet de contrôle sauf
 // la tabulation et le saut de ligne. Le premier groupe porte les paramètres d'une CSI, le second sa lettre finale.
 // eslint-disable-next-line no-control-regex
-const ESCAPES = /\x1b\[([0-?]*)[ -/]*([@-~])?|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[ -/]*[0-~]?|[\x00-\x08\x0b-\x1f\x7f]/g;
+const ESCAPES = /\x1b\[([0-?]*)[ -/]*([@-~])?|\x1b\][^\x07\x1b\n]*(?:\x07|\x1b\\)?|\x1b[ -/]*[0-~]?|[\x00-\x08\x0b-\x1f\x7f]/g;
 
 /**
  * Les lignes d'un écran capturé, chacune en segments de même style. Le style traverse les sauts de ligne.
@@ -114,8 +118,8 @@ export function parseSgr(text) {
   for (const match of text.matchAll(ESCAPES)) {
     add(text.slice(at, match.index));
     at = match.index + match[0].length;
-    // Seule une CSI complète qui finit par `m` et ne porte que des chiffres change le style.
-    if (match[2] === 'm' && /^[0-9;]*$/.test(match[1])) style = applySgr(style, match[1]);
+    // Seule une CSI complète qui finit par `m` et ne porte que des chiffres, `;` et `:` change le style.
+    if (match[2] === 'm' && /^[0-9;:]*$/.test(match[1])) style = applySgr(style, match[1]);
   }
   add(text.slice(at));
   return lines;
