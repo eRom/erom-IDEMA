@@ -2238,8 +2238,8 @@ impl Workspace {
         });
         self.companion.send(ServiceEvent::Presence { away });
         if away {
-            // Une question posée sous les yeux de Romain n'a jamais fait « attend » : elle se réarme avant que
-            // `update_seen` retire le « vu » et publie les états (AC-25).
+            // Une question posée sous les yeux de Romain, ou à l'instant où « vu » est tombé (verrouillage de l'écran,
+            // `REARM_GRACE`), se réarme avant que `update_seen` retire le « vu » et publie les états (AC-25).
             let views: Vec<Entity<SessionView>> = self
                 .entries
                 .iter()

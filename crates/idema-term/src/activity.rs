@@ -27,6 +27,11 @@ pub const ATTACH_GRACE: Duration = Duration::from_secs(3);
 /// décalage (tmux, agent), et une saisie ou un collage rapide l'accumule derrière la dernière touche.
 pub const ECHO_WINDOW: Duration = Duration::from_millis(500);
 
+/// Un pane qui a cessé d'être vu depuis au plus ce temps, quand Romain passe à « absent », réarme sa question restée sans
+/// réponse : le relevé de présence ne passe que toutes les 5 s, et le verrouillage de l'écran rend la fenêtre inactive
+/// (« vu » tombe) avant lui (AC-25). Au-delà, la session a été quittée pour autre chose et la question ne sonne pas (R28).
+pub const REARM_GRACE: Duration = Duration::from_secs(10);
+
 /// La sortie arrivée à `arrival` est-elle l'écho de la dernière saisie, `last_input` ?
 pub fn is_input_echo(last_input: Option<Instant>, arrival: Instant) -> bool {
     last_input.is_some_and(|input| arrival < input + ECHO_WINDOW)
@@ -77,6 +82,8 @@ pub struct PaneActivity {
     /// depuis : la question attend une réponse que personne n'a donnée. `rearm_unanswered` la fait passer en « attend »
     /// quand le pane cesse d'être vu parce que Romain s'éloigne (AC-25).
     unanswered_while_seen: bool,
+    /// Instant où le pane a cessé d'être vu, tant qu'il ne l'est pas redevenu : borne la fenêtre de `REARM_GRACE`.
+    unseen_at: Option<Instant>,
 }
 
 impl PaneActivity {
@@ -226,6 +233,30 @@ impl PaneActivity {
     pub fn mark_seen(&mut self) {
         self.waiting = false;
         self.error = false;
+    }
+
+    /// Le pane vient de cesser d'être vu (fenêtre inactive, autre session au centre) : `rearm_on_departure` peut encore
+    /// réarmer sa question pendant `REARM_GRACE`.
+    pub fn left_view(&mut self, now: Instant) {
+        self.unseen_at = Some(now);
+    }
+
+    /// Le pane est de nouveau vu : plus de départ à rattraper.
+    pub fn entered_view(&mut self) {
+        self.unseen_at = None;
+    }
+
+    /// Romain passe à « absent » : réarme la question restée sans réponse (`rearm_unanswered`) si le pane est vu, ou s'il a
+    /// cessé de l'être depuis au plus `REARM_GRACE`. Rend vrai si l'état « attend » vient d'être posé.
+    pub fn rearm_on_departure(&mut self, seen: bool, now: Instant) -> bool {
+        let just_left = self
+            .unseen_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= REARM_GRACE);
+        if seen || just_left {
+            self.rearm_unanswered()
+        } else {
+            false
+        }
     }
 
     /// Romain s'éloigne (le compagnon passe en absent) et le pane cesse d'être vu : si l'agent a fini son tour ou sonné
@@ -516,6 +547,81 @@ mod tests {
         activity.on_signal(Signal::Notify, true);
         assert!(activity.rearm_unanswered());
         assert_eq!(activity.state(t0), ActivityState::Waiting);
+    }
+
+    /// Un pane qui a posé sa question sous les yeux de Romain, puis cesse d'être vu (verrouillage de l'écran).
+    fn asked_while_seen() -> PaneActivity {
+        let mut activity = PaneActivity::new();
+        activity.on_signal(Signal::Notify, true);
+        activity
+    }
+
+    #[test]
+    fn a_question_left_just_before_the_user_went_away_is_rearmed() {
+        // « Vu » tombe (fenêtre inactive), 3 s plus tard la présence passe à « absent » : le pane attend.
+        let t0 = Instant::now();
+        let mut activity = asked_while_seen();
+        activity.left_view(t0);
+        assert_eq!(activity.state(t0), ActivityState::Idle);
+        assert!(activity.rearm_on_departure(false, t0 + Duration::from_secs(3)));
+        assert_eq!(
+            activity.state(t0 + Duration::from_secs(3)),
+            ActivityState::Waiting
+        );
+    }
+
+    #[test]
+    fn a_question_left_long_before_the_user_went_away_stays_quiet() {
+        // Même chose 30 s plus tard : la session a été quittée pour autre chose, pas de bruit (R28).
+        let t0 = Instant::now();
+        let mut activity = asked_while_seen();
+        activity.left_view(t0);
+        assert!(!activity.rearm_on_departure(false, t0 + Duration::from_secs(30)));
+        assert_eq!(
+            activity.state(t0 + Duration::from_secs(30)),
+            ActivityState::Idle
+        );
+    }
+
+    #[test]
+    fn the_rearming_window_is_ten_seconds_inclusive() {
+        let t0 = Instant::now();
+        let mut at_limit = asked_while_seen();
+        at_limit.left_view(t0);
+        assert!(at_limit.rearm_on_departure(false, t0 + REARM_GRACE));
+
+        let mut past_limit = asked_while_seen();
+        past_limit.left_view(t0);
+        assert!(!past_limit.rearm_on_departure(false, t0 + REARM_GRACE + ms(1)));
+    }
+
+    #[test]
+    fn a_pane_never_seen_or_seen_again_is_not_rearmed_by_the_window() {
+        let t0 = Instant::now();
+        // Jamais quitté : pas de fenêtre, et pas vu non plus.
+        let mut never = asked_while_seen();
+        assert!(!never.rearm_on_departure(false, t0));
+        // Quitté puis revu, puis non vu sans nouveau départ enregistré : la fenêtre est close.
+        let mut back = asked_while_seen();
+        back.left_view(t0);
+        back.entered_view();
+        assert!(!back.rearm_on_departure(false, t0 + Duration::from_secs(1)));
+        // Encore vu : le réarmement ne dépend pas de la fenêtre.
+        let mut seen = asked_while_seen();
+        assert!(seen.rearm_on_departure(true, t0));
+    }
+
+    #[test]
+    fn an_input_after_the_question_cancels_the_window_rearming() {
+        let t0 = Instant::now();
+        let mut activity = asked_while_seen();
+        activity.left_view(t0);
+        activity.on_input();
+        assert!(!activity.rearm_on_departure(false, t0 + Duration::from_secs(3)));
+        assert_eq!(
+            activity.state(t0 + Duration::from_secs(3)),
+            ActivityState::Idle
+        );
     }
 
     #[test]

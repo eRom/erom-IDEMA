@@ -731,12 +731,10 @@ impl SessionView {
         }
     }
 
-    /// Romain s'éloigne et cette session était vue : chacun de ses panes vus réarme la question restée sans réponse.
-    /// Sans effet sur une session non vue. À appeler avant `set_seen(false)`, qui publie les états (AC-25).
+    /// Romain s'éloigne : ceux de ses panes qui étaient vus, ou ne l'ont cessé d'être que depuis `REARM_GRACE` au plus,
+    /// réarment la question restée sans réponse. Le pane date son propre départ : un pane quitté plus tôt, ou d'une
+    /// session jamais vue, n'est pas touché. À appeler avant `set_seen(false)`, qui publie les états (AC-25).
     pub fn rearm_unanswered(&mut self, cx: &mut Context<Self>) {
-        if !self.seen {
-            return;
-        }
         for slot in &self.slots {
             slot.view.update(cx, |pane, _| pane.rearm_unanswered());
         }

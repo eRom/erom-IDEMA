@@ -1334,19 +1334,25 @@ impl PaneView {
 
     /// La session est vue ou ne l'est plus. Vue, « attend » et « erreur » retombent.
     pub fn set_seen(&mut self, seen: bool, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if self.seen && !seen {
+            // Le départ est daté : `rearm_unanswered` rattrape les secondes qui suivent (verrouillage de l'écran).
+            self.activity.left_view(now);
+        } else if seen {
+            self.activity.entered_view();
+        }
         self.seen = seen;
         if seen {
             self.activity.mark_seen();
         }
-        self.publish_state(Instant::now(), cx);
+        self.publish_state(now, cx);
     }
 
-    /// Romain s'éloigne alors que ce pane est vu : la question posée sous ses yeux, restée sans réponse, repasse en
-    /// « attend ». Ne publie rien : `set_seen(false)` suit et publie le pane devenu non vu (AC-25).
+    /// Romain s'éloigne alors que ce pane est vu, ou ne l'a cessé d'être que depuis `REARM_GRACE` au plus : la question
+    /// posée sous ses yeux, restée sans réponse, repasse en « attend ». Ne publie rien : `set_seen(false)` suit et publie
+    /// le pane devenu non vu (AC-25).
     pub fn rearm_unanswered(&mut self) {
-        if self.seen {
-            self.activity.rearm_unanswered();
-        }
+        self.activity.rearm_on_departure(self.seen, Instant::now());
     }
 
     /// Compare l'état du pane au dernier publié ; émet `StateChanged` à un changement seulement.
