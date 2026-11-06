@@ -1,0 +1,14 @@
+{
+  "browser": {
+    "browserName": "webkit",
+    "launchOptions": { "headless": true },
+    "contextOptions": {
+      "viewport": { "width": 430, "height": 932 },
+      "deviceScaleFactor": 3,
+      "isMobile": true,
+      "hasTouch": true,
+      "locale": "fr-FR",
+      "timezoneId": "Europe/Paris"
+    }
+  }
+}

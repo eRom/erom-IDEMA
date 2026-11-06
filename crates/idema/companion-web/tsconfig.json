@@ -11,5 +11,6 @@
     "types": ["bun"],
     "skipLibCheck": true
   },
-  "include": ["js", "test"]
+  "include": ["js", "test"],
+  "exclude": ["test/visual/shoot.js"]
 }

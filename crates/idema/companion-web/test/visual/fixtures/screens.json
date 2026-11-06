@@ -1,0 +1,52 @@
+{
+  "Correctif des tests": {
+    "0": {
+      "accepts_input": false,
+      "cols": 120,
+      "rows": 40,
+      "state": "error",
+      "text": "                                                                                                                        \ndemo@mac blog-demo % false\ndemo@mac blog-demo % \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+      "took_ms": 13
+    }
+  },
+  "Migration des données": {
+    "0": {
+      "accepts_input": true,
+      "cols": 120,
+      "rows": 40,
+      "state": "running",
+      "text": "                                                                                                                        \ndemo@mac idema-demo % for i in $(seq 1 600); do echo \"etape $i : migration du lot\"; sleep 1; done\netape 1 : migration du lot\netape 2 : migration du lot\netape 3 : migration du lot\netape 4 : migration du lot\netape 5 : migration du lot\netape 6 : migration du lot\netape 7 : migration du lot\netape 8 : migration du lot\netape 9 : migration du lot\netape 10 : migration du lot\netape 11 : migration du lot\netape 12 : migration du lot\netape 13 : migration du lot\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+      "took_ms": 14
+    }
+  },
+  "Refonte du rendu": {
+    "0": {
+      "accepts_input": true,
+      "cols": 120,
+      "rows": 40,
+      "state": "waiting",
+      "text": "demo@mac idema-demo % claude\n\u001b[38;5;208m●\u001b[39m \u001b[1mEdit\u001b[0m(src/render.rs)\n  \u001b[2m⎿\u001b[0m  \u001b[32m+ let rows = measure(text)?;\n\u001b[39m  \u001b[2m⎿\u001b[0m  \u001b[31m- let rows = old_measure(text)?;\n\n\u001b[38;2;197;138;249m╭──────────────────────────────────────────────────╮\n│\u001b[39m Do you want to make this edit to render.rs?      \u001b[38;2;197;138;249m│\n│\u001b[39m \u001b[38;2;64;156;255m❯ 1. Yes\u001b[39m                                         \u001b[38;2;197;138;249m│\n│\u001b[39m   2. Yes, allow all edits during this session    \u001b[38;2;197;138;249m│\n│\u001b[39m   3. No, and tell Claude what to do differently  \u001b[38;2;197;138;249m│\n╰──────────────────────────────────────────────────╯\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+      "took_ms": 18
+    }
+  },
+  "Revue de code": {
+    "0": {
+      "accepts_input": true,
+      "cols": 120,
+      "rows": 40,
+      "state": "waiting",
+      "text": "demo@mac blog-demo % codex\n  Would you like to run the following command?\n\n  \u001b[1m$ cargo test -p blog-demo\n\n\u001b[0m\u001b[36m›\u001b[39m \u001b[36m1) Yes, proceed\n\u001b[39m  2) Yes, and don't ask again for this command\n  3) No, and tell Codex what to do differently\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+      "took_ms": 12
+    }
+  },
+  "Tri des notes": {
+    "0": {
+      "accepts_input": false,
+      "cols": 120,
+      "rows": 40,
+      "state": "idle",
+      "text": "                                                                                                                        \ndemo@mac notes-demo % \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+      "took_ms": 13
+    }
+  }
+}

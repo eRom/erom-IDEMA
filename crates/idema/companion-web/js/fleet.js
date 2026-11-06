@@ -3,7 +3,7 @@
 
 import { el } from './dom.js';
 import { icon } from './icons.js';
-import { ageFr, realTimers } from './time.js';
+import { realTimers, relativeFr } from './time.js';
 import { openHash, startTriage, stopTriage, triageHash } from './triage.js';
 
 /** « 2 attendent · 1 erreur · 3 en cours », zéros omis. @param {{sessions: {state: string}[]}} fleet */
@@ -34,13 +34,17 @@ const STATE_TEXT = /** @type {Record<string, string>} */ ({ idle: 'au repos', ru
 const LINK_DOT = /** @type {const} */ ({ ok: 'running', timeout: 'waiting', offline: 'error' });
 
 /** @param {any} s @param {number} now */
-const stateText = (s, now) => `${STATE_TEXT[s.state] ?? s.state} · ${ageFr(s.state_since, now)}`;
+const stateText = (s, now) => `${STATE_TEXT[s.state] ?? s.state} · ${relativeFr(s.state_since, now)}`;
 
 /** @param {any} s @param {[HTMLElement, any][]} ages les durées, remises à jour sur place par la minuterie */
 function row(s, ages) {
-  const agents = s.agents.map((/** @type {{label: string, logo: string | null}} */ a) =>
-    a.logo ? el('img', { class: 'row__logo', src: `/logos/${encodeURIComponent(a.logo)}.png`, alt: a.label }) : el('span', { class: 'row__agent' }, a.label),
-  );
+  const agents = s.agents.map((/** @type {{label: string, logo: string | null}} */ a) => {
+    if (!a.logo) return el('span', { class: 'row__agent' }, a.label);
+    const logo = el('img', { class: 'row__logo', src: `/logos/${encodeURIComponent(a.logo)}.png`, alt: a.label });
+    // Les logos viennent du Mac et ne sont pas dans le cache du service worker : sans lui, le nom de l'agent les remplace.
+    logo.addEventListener('error', () => logo.replaceWith(el('span', { class: 'row__agent' }, a.label)), { once: true });
+    return logo;
+  });
   const hot = s.state === 'waiting' || s.state === 'error';
   const state = el('span', { class: 'row__state' }, stateText(s, Date.now()));
   ages.push([state, s]);

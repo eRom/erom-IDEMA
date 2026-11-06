@@ -164,6 +164,14 @@ describe('mountSession', () => {
     expect(blue.style.color).not.toBe('');
   });
 
+  test('the empty rows under a short screen are not drawn, so the text stays in view', async () => {
+    routes[`GET ${BASE}/screen`] = () => ({ kind: 'ok', data: { text: `$ claude\n\x1b[41m  \x1b[0m\nDo you want?\n${'\n'.repeat(30)}`, accepts_input: true, state: 'idle' }, etag: '"x"' });
+    mount();
+    await flush();
+    // Les lignes vides du bas partent ; celle qui porte un fond, et celles du milieu, restent.
+    expect(root.querySelector('.term__text')?.textContent).toBe('$ claude\n  \nDo you want?');
+  });
+
   test('a capture with markup shows it as text', async () => {
     routes[`GET ${BASE}/screen`] = () => ({ kind: 'ok', data: { text: '<img src=x onerror=alert(1)>', accepts_input: true, state: 'idle' }, etag: '"x"' });
     mount();

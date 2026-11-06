@@ -1,0 +1,117 @@
+{
+  "mac": "Mac de démo",
+  "generated_at": 1793930791288,
+  "badge": 3,
+  "ideation_label": null,
+  "projects": [
+    {
+      "path": "/Users/demo/dev/idema-demo",
+      "name": "idema-demo"
+    },
+    {
+      "path": "/Users/demo/dev/blog-demo",
+      "name": "blog-demo"
+    },
+    {
+      "path": "/Users/demo/dev/notes-demo",
+      "name": "notes-demo"
+    }
+  ],
+  "sessions": [
+    {
+      "name": "idema-54c6ee1b",
+      "display_name": "Refonte du rendu",
+      "project": "/Users/demo/dev/idema-demo",
+      "ideation": false,
+      "state": "waiting",
+      "state_since": 1793930782317,
+      "seen": false,
+      "agents": [
+        {
+          "label": "Claude",
+          "logo": "claude"
+        }
+      ],
+      "panes": [
+        {
+          "id": 0,
+          "active": true,
+          "state": "waiting"
+        }
+      ]
+    },
+    {
+      "name": "idema-447dd1a8",
+      "display_name": "Migration des données",
+      "project": "/Users/demo/dev/idema-demo",
+      "ideation": false,
+      "state": "running",
+      "state_since": 1793930791288,
+      "seen": false,
+      "agents": [],
+      "panes": [
+        {
+          "id": 1,
+          "active": true,
+          "state": "running"
+        }
+      ]
+    },
+    {
+      "name": "idema-6d42efbf",
+      "display_name": "Correctif des tests",
+      "project": "/Users/demo/dev/blog-demo",
+      "ideation": false,
+      "state": "error",
+      "state_since": 1793930780179,
+      "seen": false,
+      "agents": [],
+      "panes": [
+        {
+          "id": 3,
+          "active": true,
+          "state": "error"
+        }
+      ]
+    },
+    {
+      "name": "idema-9c897f77",
+      "display_name": "Revue de code",
+      "project": "/Users/demo/dev/blog-demo",
+      "ideation": false,
+      "state": "waiting",
+      "state_since": 1793930782316,
+      "seen": false,
+      "agents": [
+        {
+          "label": "Codex",
+          "logo": "codex"
+        }
+      ],
+      "panes": [
+        {
+          "id": 4,
+          "active": true,
+          "state": "waiting"
+        }
+      ]
+    },
+    {
+      "name": "idema-0a515aad",
+      "display_name": "Tri des notes",
+      "project": "/Users/demo/dev/notes-demo",
+      "ideation": false,
+      "state": "idle",
+      "state_since": 1793930778996,
+      "seen": false,
+      "agents": [],
+      "panes": [
+        {
+          "id": 2,
+          "active": true,
+          "state": "idle"
+        }
+      ]
+    }
+  ]
+}

@@ -153,6 +153,24 @@ describe('mountFleet', () => {
     expect(state.textContent).toBe('attend · 10 min');
   });
 
+  test('a state under a minute old reads « à l\'instant », short enough to leave the name its room', () => {
+    const store = createStore(localStorage);
+    store.setFleet(fleet([session('a', 'waiting', { state_since: Date.now() - 20_000 })]), NOW);
+    mountFleet(root, /** @type {any} */ ({ store, timers }));
+    expect(root.querySelector('.row__state')?.textContent).toBe("attend · à l'instant");
+  });
+
+  test('a logo the Mac cannot send (offline) gives way to the agent name', () => {
+    const store = createStore(localStorage);
+    store.setFleet(fleet([session('a', 'waiting', { agents: [{ label: 'Claude', logo: 'claude' }] })]), NOW);
+    mountFleet(root, /** @type {any} */ ({ store, timers }));
+    const logo = /** @type {HTMLImageElement} */ (root.querySelector('.row__logo'));
+    expect(logo.getAttribute('src')).toBe('/logos/claude.png');
+    logo.dispatchEvent(new Event('error'));
+    expect(root.querySelector('.row__logo')).toBeNull();
+    expect(root.querySelector('.row__agent')?.textContent).toBe('Claude');
+  });
+
   test('without any fleet yet it says it is reading, and a text from the Mac stays text', () => {
     const { store, unmount } = mount(null);
     expect(root.textContent).toContain('Lecture de la flotte');

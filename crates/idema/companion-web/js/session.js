@@ -61,6 +61,17 @@ function validateText(raw) {
   return bytes > TEXT_MAX_BYTES ? { ok: false, error: `Texte trop long : ${bytes} octets sur 1 024 au plus.` } : { ok: true, text };
 }
 
+/**
+ * Le pane est capturé sur toute sa hauteur : sous un écran court, ses lignes vides collées en bas feraient défiler le
+ * texte hors de vue. Une ligne qui n'est que des espaces mais porte un fond ou une inversion reste (elle se voit).
+ * @param {import('./ansi.js').Segment[][]} lines
+ */
+function withoutTrailingBlankLines(lines) {
+  let end = lines.length;
+  while (end > 0 && lines[end - 1].every((seg) => seg.text.trim() === '' && !seg.bg && !seg.inverse)) end--;
+  return lines.slice(0, end);
+}
+
 /** Les touches nommées, ⌃C à part (il demande une confirmation) ; `y` et `n` ici n'envoient pas Entrée. */
 const NAMED_KEYS = [
   ['↑', 'Flèche haut', 'up'],
@@ -265,7 +276,7 @@ export function mountSession(root, { route, store, request, timers = realTimers 
     drawn = signature;
     const lines = parseSgr(text);
     const gap = screen.scrollHeight - screen.scrollTop - screen.clientHeight;
-    screen.replaceChildren(...(history < HISTORY_MAX ? [more] : []), renderScreen(lines));
+    screen.replaceChildren(...(history < HISTORY_MAX ? [more] : []), renderScreen(withoutTrailingBlankLines(lines)));
     // Collé en bas tant qu'on n'est pas remonté ; sinon la distance au bas est gardée (l'historique s'ajoute au-dessus).
     screen.scrollTop = gap <= STICK_PX ? screen.scrollHeight : screen.scrollHeight - screen.clientHeight - gap;
     controls.hidden = data.accepts_input === false;
