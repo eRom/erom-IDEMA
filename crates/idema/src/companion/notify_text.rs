@@ -279,8 +279,15 @@ fn numbered_menu(lines: &[&str]) -> Option<(usize, Vec<usize>)> {
     let has_cursor = group
         .iter()
         .any(|&(at, _)| split_marker(bare(lines[at]), &CURSOR_MARKERS).is_some());
-    let hint_below = lines[last + 1..].iter().any(|line| is_key_hint(line));
-    (has_cursor || hint_below).then(|| (group[0].0, group.iter().map(|&(at, _)| at).collect()))
+    let below = &lines[last + 1..];
+    let hint_below = below.iter().any(|line| is_key_hint(line));
+    // Un curseur seul ne suffit pas : le message passé de Romain (`❯ 1. …`) en porte un lui aussi. Si une invite de
+    // saisie ou un message de l'agent suit plus bas, le groupe est de l'historique, pas un menu en attente.
+    let superseded = below
+        .iter()
+        .any(|line| is_plain_prompt(line) || is_agent_message(line));
+    (hint_below || (has_cursor && !superseded))
+        .then(|| (group[0].0, group.iter().map(|&(at, _)| at).collect()))
 }
 
 /// Un menu sans numéros : la dernière ligne à curseur avant le dernier rappel de touches, avec au moins une option sœur
@@ -297,10 +304,40 @@ fn cursor_menu(lines: &[&str]) -> Option<(usize, Vec<usize>)> {
     (options.len() >= 2).then_some((cursor, options))
 }
 
-/// La ligne de saisie : la ligne dont le texte commence par un marqueur d'invite, vide ou non (texte d'exemple compris).
-/// Une option de menu à curseur (`❯ 1. Oui`) n'en est pas une.
-fn is_input_line(line: &str) -> bool {
+/// Marqueurs d'un message de l'agent (`⏺` Claude Code, `•` Codex).
+const MESSAGE_MARKERS: [char; 2] = ['⏺', '•'];
+
+/// Une ligne qui ouvre un message de l'agent.
+fn is_agent_message(line: &str) -> bool {
+    split_marker(bare(line), &MESSAGE_MARKERS).is_some()
+}
+
+/// Une invite non numérotée, vide ou suivie de texte (texte d'exemple compris). Une option à curseur (`❯ 1. Oui`) n'en
+/// est pas une : seule la structure de l'écran dit si elle est un menu ou un message passé de Romain.
+fn is_plain_prompt(line: &str) -> bool {
     split_marker(bare(line), &PROMPT_MARKERS).is_some_and(|rest| option_number(rest).is_none())
+}
+
+/// Une ligne de saisie ou un message passé de Romain : toute ligne dont le texte commence par un marqueur d'invite,
+/// numérotée ou non. Ne sert qu'à borner par le haut la région du dernier message, sous une ligne de saisie déjà trouvée
+/// (donc sous aucun menu en attente : `menu_body` passe avant).
+fn is_prompt_line(line: &str) -> bool {
+    split_marker(bare(line), &PROMPT_MARKERS).is_some()
+}
+
+/// L'index qui suit une invite et, si elle est numérotée (`❯ 1. …`), les lignes `2.`, `3.`… qui la prolongent.
+fn after_prompt(lines: &[&str], at: usize) -> usize {
+    let mut end = at + 1;
+    let Some(mut number) = option_number(lines[at]) else {
+        return end;
+    };
+    while let Some(next) = lines.get(end).and_then(|line| option_number(line))
+        && next == number + 1
+    {
+        number = next;
+        end += 1;
+    }
+    end
 }
 
 /// Une ligne de durée de tour : un mot puis `for <n>s|m|h` (`✻ Cooked for 1s · done 7:33`, `Worked for 1s • 07:28`).
@@ -346,16 +383,16 @@ fn is_labelled_frame(line: &str) -> bool {
 }
 
 /// Le dernier message de l'agent : les `count` dernières lignes utiles entre l'invite précédente (le dernier message de
-/// Romain) et la ligne de saisie, la plus basse de l'écran. Écartées : durées de tour, jauges, lignes alignées à droite et
+/// Romain, avec ses lignes numérotées de suite) et la ligne de saisie, la plus basse de l'écran. Écartées : durées de tour, jauges, lignes alignées à droite et
 /// traits étiquetés. Vide sans ligne de saisie, ou quand rien ne reste.
 fn last_message(lines: &[&str], count: usize) -> Vec<String> {
-    let Some(input) = lines.iter().rposition(|line| is_input_line(line)) else {
+    let Some(input) = lines.iter().rposition(|line| is_plain_prompt(line)) else {
         return Vec::new();
     };
     let start = lines[..input]
         .iter()
-        .rposition(|line| is_input_line(line))
-        .map_or(0, |previous| previous + 1);
+        .rposition(|line| is_prompt_line(line))
+        .map_or(0, |previous| after_prompt(lines, previous));
     let mut found: Vec<String> = lines[start..input]
         .iter()
         .filter(|line| {
@@ -786,6 +823,40 @@ mod tests {
         // Ni curseur ni rappel de touches : la liste fait partie du message, la boîte de saisie vide est dessous.
         let screen = "❯ liste\n\nVoici :\n1. un\n2. deux\n\n────────\n❯ \n────────\n  statut\n";
         assert_eq!(useful_lines(screen, 3), ["Voici :", "1. un", "2. deux"]);
+    }
+
+    #[test]
+    fn a_past_numbered_claude_prompt_is_not_a_menu() {
+        // Le message passé de Romain porte un `❯` et deux lignes numérotées, puis la réponse, puis la boîte de saisie vide.
+        let screen = "❯ 1. corrige le parseur\n  2. corrige le test\n\n⏺ Fait.\n\n────────\n❯ \n────────\n  statut\n";
+        assert_eq!(useful_lines(screen, 3), ["⏺ Fait."]);
+        // Même chose quand la boîte de saisie porte déjà du texte.
+        let typed = "❯ 1. corrige le parseur\n  2. corrige le test\n\n⏺ Fait.\n\n────────\n❯ et le README\n────────\n  statut\n";
+        assert_eq!(useful_lines(typed, 3), ["⏺ Fait."]);
+    }
+
+    #[test]
+    fn a_past_numbered_codex_prompt_is_not_a_menu() {
+        let screen = "› 1. corrige le parseur\n  2. corrige le test\n\n• Fait.\n\n› Ask Codex to do anything\n\n  GPT-6-Luna · project\n";
+        assert_eq!(useful_lines(screen, 3), ["• Fait."]);
+    }
+
+    #[test]
+    fn a_past_numbered_agy_prompt_is_not_a_menu() {
+        // Antigravity : pas de marqueur de message, seule l'invite vide plus bas dit que le groupe est passé.
+        let screen = "> 1. corrige le parseur\n  2. corrige le test\n\n  Fait.\n\n────────\n>\n────────\n? for shortcuts\n";
+        assert_eq!(useful_lines(screen, 3), ["Fait."]);
+    }
+
+    #[test]
+    fn a_numbered_menu_with_a_cursor_stays_a_menu_below_an_old_prompt() {
+        // Le vrai menu est le plus bas : l'invite passée au-dessus ne le disqualifie pas, le rappel de touches le confirme.
+        let screen =
+            "❯ corrige\n\n⏺ Fait.\n\nQuelle suite ?\n❯ 1. Oui\n  2. Non\n\nEsc to cancel\n";
+        assert_eq!(
+            useful_lines(screen, 3),
+            ["Quelle suite ?", "❯ 1. Oui", "2. Non"]
+        );
     }
 
     #[test]
