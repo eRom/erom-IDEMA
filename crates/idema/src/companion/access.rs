@@ -269,6 +269,18 @@ impl Access {
         }
     }
 
+    /// Résout quand l'appareil `id` n'est plus dans la liste (oublié), tout de suite s'il n'y est déjà plus. Les flux
+    /// de cet appareil s'y arrêtent : un cookie coupé ne doit pas laisser un flux recevoir la flotte.
+    pub fn removal_of(&self, id: String) -> impl Future<Output = ()> + Send + use<> {
+        let mut status = self.status.subscribe();
+        async move {
+            // Un émetteur disparu veut dire que le service s'arrête : le flux aussi.
+            let _ = status
+                .wait_for(|status| !status.devices.iter().any(|device| device.id == id))
+                .await;
+        }
+    }
+
     /// L'abonnement push de l'appareil, s'il en a un.
     pub fn subscription_of(&self, id: &str) -> Option<Subscription> {
         self.lock()
@@ -493,18 +505,21 @@ mod tests {
         assert!(printed.contains("iPhone"), "the device is still shown");
     }
 
-    /// Une écriture de `devices.json` qui traîne (disque lent) ne fige pas la reconnaissance d'un cookie : le fichier
-    /// voisin est un tube sans lecteur, donc l'écriture reste bloquée tant que le test ne l'ouvre pas en lecture.
+    /// Une écriture de `devices.json` qui traîne (disque lent) ne fige pas la reconnaissance d'un cookie : l'écriture
+    /// reste bloquée, fichier voisin ouvert, tant que le test ne la libère pas.
     #[test]
     fn a_slow_devices_write_never_blocks_authentication() {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
+        use crate::companion::devices::WriteHook;
+        use std::sync::Mutex;
         use std::sync::mpsc;
         use std::time::Duration;
 
         let home = TempDir::new("access");
-        let (access, _) = access(&home);
-        let access = Arc::new(access);
+        let (status, _receiver) = watch::channel(ServiceStatus::default());
+        let access = Arc::new(Access::new(
+            DeviceStore::open(&home.0).unwrap(),
+            Arc::new(status),
+        ));
         let pair = |agent: &str| {
             let display = access.start_pairing();
             access.pair(&display.code, Some(agent)).unwrap()
@@ -512,9 +527,15 @@ mod tests {
         let phone = pair("iPhone");
         let tablet = pair("iPad");
 
-        let fifo = home.0.join("companion").join("devices.json.tmp");
-        let path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // Le point d'arrêt ne vaut que pour l'écriture de l'oubli : on le pose maintenant, après les appairages.
+        let (reached, reached_receiver) = mpsc::channel::<()>();
+        let (release, release_receiver) = mpsc::channel::<()>();
+        let reached = Mutex::new(reached);
+        let release_receiver = Mutex::new(release_receiver);
+        access.lock().devices.write_hook = Some(WriteHook(Arc::new(move || {
+            reached.lock().unwrap().send(()).unwrap();
+            let _ = release_receiver.lock().unwrap().recv();
+        })));
 
         let (started, started_receiver) = mpsc::channel();
         let forgetting = {
@@ -526,8 +547,10 @@ mod tests {
             })
         };
         started_receiver.recv().unwrap();
-        // Laisse l'oubli atteindre l'ouverture bloquée du fichier voisin.
-        std::thread::sleep(Duration::from_millis(200));
+        // L'oubli est arrêté dans son écriture : le fichier voisin est ouvert et rien n'est encore renommé.
+        reached_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the write reached the hook");
 
         let (done, done_receiver) = mpsc::channel();
         {
@@ -541,10 +564,9 @@ mod tests {
         }
         let answered = done_receiver.recv_timeout(Duration::from_secs(2));
 
-        // Libère l'écriture (le tube est vidé, `sync_all` sur un tube échoue : l'oubli est alors refusé).
-        let mut drain = std::fs::File::open(&fifo).unwrap();
-        std::io::Read::read_to_end(&mut drain, &mut Vec::new()).unwrap();
-        forgetting.join().unwrap();
+        // Libère l'écriture : l'oubli aboutit.
+        release.send(()).unwrap();
+        assert!(forgetting.join().unwrap());
 
         let (known, deadline) = answered.expect("authenticate answered while the write was stuck");
         assert!(known);

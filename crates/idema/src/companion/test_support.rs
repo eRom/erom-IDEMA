@@ -465,6 +465,12 @@ impl EventStream {
         }
     }
 
+    /// Le serveur a-t-il terminé le flux (morceau final reçu ou connexion fermée) ? Rend faux tant que rien ne l'a
+    /// montré ; à lire après un `next_frame`, qui est ce qui lit le fil.
+    pub fn has_ended(&self) -> bool {
+        self.ended
+    }
+
     /// La prochaine image (sans sa ligne vide finale), ou `None` si rien n'arrive en `wait` ou si le flux est fini.
     pub fn next_frame(&mut self, wait: Duration) -> Option<String> {
         let deadline = Instant::now() + wait;

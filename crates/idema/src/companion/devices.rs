@@ -88,10 +88,36 @@ impl From<Record> for Device {
     }
 }
 
+/// Combien de noms voisins `persist` essaie avant de renoncer : un reste d'un process mort de même pid en occupe au
+/// plus quelques-uns, huit couvrent tous les cas réalistes sans boucler indéfiniment (comme pour `vapid.key`).
+const TEMPORARY_ATTEMPTS: usize = 8;
+
+/// Le nom du fichier voisin d'une écriture de `devices.json` pour un compteur donné : unique par process et par écriture,
+/// pour que deux écrivains (deux magasins ouverts sur le même dossier, un reste d'un process mort) ne se disputent jamais
+/// le même fichier.
+fn temporary_name(counter: u32) -> String {
+    format!("devices.json.{}.{counter}.tmp", std::process::id())
+}
+
+/// Un point d'arrêt pour les tests : appelé quand le fichier voisin est ouvert, avant d'y écrire. Permet de figer une
+/// écriture « lente » sans disque lent.
+#[cfg(test)]
+#[derive(Clone)]
+pub struct WriteHook(pub std::sync::Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for WriteHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WriteHook")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceStore {
     path: PathBuf,
     devices: Vec<Device>,
+    #[cfg(test)]
+    pub write_hook: Option<WriteHook>,
 }
 
 impl DeviceStore {
@@ -125,7 +151,12 @@ impl DeviceStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
         };
-        Ok(Self { path, devices })
+        Ok(Self {
+            path,
+            devices,
+            #[cfg(test)]
+            write_hook: None,
+        })
     }
 
     /// Ajoute un appareil et rend son identifiant.
@@ -251,29 +282,53 @@ impl DeviceStore {
         }
     }
 
-    /// Écrit le fichier d'un coup : un fichier voisin en 0600, puis un renommage.
+    /// Écrit le fichier d'un coup : un fichier voisin en 0600 au nom unique, puis un renommage.
     fn persist(&self) -> io::Result<()> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        self.persist_with((0..TEMPORARY_ATTEMPTS).map(|_| NEXT.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    /// `persist` avec les compteurs à essayer, dans l'ordre : un nom déjà pris (reste d'un process mort de même pid,
+    /// pid réutilisé) passe au compteur suivant, et le reste d'un autre process n'est jamais touché. Les tests y jouent
+    /// une collision.
+    fn persist_with(&self, counters: impl Iterator<Item = u32>) -> io::Result<()> {
         let content = FileContent {
             devices: self.devices.iter().map(Record::from).collect(),
         };
         let bytes = serde_json::to_vec_pretty(&content).map_err(io::Error::other)?;
-        let temporary = self.path.with_extension("json.tmp");
-        let written = (|| {
-            let mut file = fs::OpenOptions::new()
+        let folder = self.path.parent().unwrap_or(Path::new("."));
+        for counter in counters {
+            let temporary = folder.join(temporary_name(counter));
+            let mut file = match fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
-                .open(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &self.path)
-        })();
-        if written.is_err() {
-            // Le fichier voisin ne doit pas rester : l'échec d'origine est celui qu'on rend.
-            let _ = fs::remove_file(&temporary);
+                .open(&temporary)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
+            let written = (|| {
+                #[cfg(test)]
+                if let Some(hook) = &self.write_hook {
+                    (hook.0)();
+                }
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                fs::rename(&temporary, &self.path)
+            })();
+            if written.is_err() {
+                // Le fichier voisin ne doit pas rester : l'échec d'origine est celui qu'on rend.
+                let _ = fs::remove_file(&temporary);
+            }
+            return written;
         }
-        written
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no free temporary name for devices.json",
+        ))
     }
 }
 
@@ -341,6 +396,79 @@ mod tests {
         assert_eq!(names, ["devices.json"]);
         let text = fs::read_to_string(folder.join("devices.json")).unwrap();
         assert!(text.contains("hash-a"));
+    }
+
+    #[test]
+    fn a_leftover_with_the_first_name_is_skipped_and_never_touched() {
+        let home = TempDir::new("leftover");
+        let mut store = DeviceStore::open(&home.0).unwrap();
+        store.add("iPhone", "hash-a", at(0)).unwrap();
+        let folder = home.0.join("companion");
+        // Le reste d'un process mort de même pid, au nom du compteur que l'écriture va essayer en premier.
+        let leftover = folder.join(temporary_name(1000));
+        fs::write(&leftover, b"leftover of a dead process").unwrap();
+
+        store.add("iPad", "hash-b", at(1)).unwrap();
+        store.persist_with([1000, 1001].into_iter()).unwrap();
+        assert_eq!(fs::read(&leftover).unwrap(), b"leftover of a dead process");
+        assert!(
+            !folder.join(temporary_name(1001)).exists(),
+            "our own neighbour is gone"
+        );
+        let reopened = DeviceStore::open(&home.0).unwrap();
+        assert_eq!(reopened.devices().len(), 2);
+    }
+
+    #[test]
+    fn no_free_name_is_an_error_not_a_write_over_someone_else() {
+        let home = TempDir::new("no-free-name");
+        let mut store = DeviceStore::open(&home.0).unwrap();
+        store.add("iPhone", "hash-a", at(0)).unwrap();
+        let folder = home.0.join("companion");
+        let taken: Vec<_> = (2000..2003)
+            .map(|counter| folder.join(temporary_name(counter)))
+            .collect();
+        for path in &taken {
+            fs::write(path, b"not ours").unwrap();
+        }
+        let error = store.persist_with(2000..2003).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        for path in &taken {
+            assert_eq!(fs::read(path).unwrap(), b"not ours");
+        }
+        // Le fichier d'origine est intact.
+        assert_eq!(DeviceStore::open(&home.0).unwrap().devices().len(), 1);
+    }
+
+    /// Deux magasins ouverts sur le même dossier écrivent en même temps : avec un seul nom voisin ils se volaient le
+    /// fichier (renommage d'un fichier déjà renommé) ; avec un nom par écriture, aucune n'échoue.
+    #[test]
+    fn two_writers_on_the_same_folder_never_fail_each_other() {
+        let home = TempDir::new("two-writers");
+        let dir = home.0.clone();
+        let writers: Vec<_> = (0..2)
+            .map(|writer| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let mut store = DeviceStore::open(&dir).unwrap();
+                    for index in 0..60 {
+                        store
+                            .add("iPhone", &format!("hash-{writer}-{index}"), at(0))
+                            .expect("a write is never refused because of another writer");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let folder = home.0.join("companion");
+        let names: Vec<_> = fs::read_dir(&folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["devices.json"], "no neighbour file is left behind");
+        DeviceStore::open(&home.0).expect("the file is whole");
     }
 
     #[test]

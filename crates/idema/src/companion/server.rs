@@ -295,10 +295,17 @@ async fn fleet(State(state): State<AppState>) -> Response {
 }
 
 /// `GET events` : le flux SSE de la flotte. Un événement `fleet` à chaque nouvel instantané (regroupé sur 250 ms), un
-/// commentaire de maintien toutes les 20 s, et la fin du flux au signal d'arrêt du service.
-async fn events(State(state): State<AppState>) -> impl IntoResponse {
-    let stream =
-        sse::fleet_events(state.fleet.clone(), COALESCE).take_until(stopped(state.stop.clone()));
+/// commentaire de maintien toutes les 20 s, et la fin du flux au signal d'arrêt du service ou à l'oubli de l'appareil.
+async fn events(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> impl IntoResponse {
+    // Le flux s'arrête aussi quand son appareil est oublié : le cookie coupé ne donne plus la flotte.
+    let ended = futures::future::select(
+        Box::pin(stopped(state.stop.clone())),
+        Box::pin(state.access.removal_of(caller.id)),
+    );
+    let stream = sse::fleet_events(state.fleet.clone(), COALESCE).take_until(ended);
     Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEP_ALIVE).text("keepalive"))
 }
 
@@ -420,6 +427,29 @@ enum Rendered {
     Body { json: Vec<u8>, gzip: bool },
 }
 
+/// Où va la ligne de journal d'une lecture d'écran.
+#[derive(Debug, PartialEq, Eq)]
+enum ScreenLog {
+    /// Le journal ordinaire (§3.12).
+    Event(String),
+    /// Le niveau `IDEMA_LOG=debug` seulement.
+    Debug(String),
+}
+
+/// La ligne d'une lecture d'écran : une lecture rendue (200) s'écrit au journal ; un 304 revient toutes les 1,5 s tant
+/// qu'un pane est ouvert sur le téléphone, il ne va qu'au niveau debug (le journal resterait noyé de lectures sans
+/// rien de nouveau). Jamais de texte du terminal.
+fn screen_log(rendered: &Rendered, session: &str, pane: u32, took_ms: u64) -> ScreenLog {
+    let line = format!(
+        "companion screen session={} pane={pane} took_ms={took_ms}",
+        super::log_safe(session)
+    );
+    match rendered {
+        Rendered::Body { .. } => ScreenLog::Event(line),
+        Rendered::NotModified => ScreenLog::Debug(line),
+    }
+}
+
 /// Capture le pane et prépare la réponse. Bloquant : capture tmux, JSON et compression sont ici, sur `spawn_blocking`.
 fn render_screen(
     tmux: &TmuxServer,
@@ -510,10 +540,10 @@ async fn screen(
         Err(_) => return error_reply(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
     };
     let (rendered, etag, took_ms) = rendered;
-    hud::log_event(&format!(
-        "companion screen session={} pane={pane} took_ms={took_ms}",
-        super::log_safe(&session)
-    ));
+    match screen_log(&rendered, &session, pane, took_ms) {
+        ScreenLog::Event(line) => hud::log_event(&line),
+        ScreenLog::Debug(line) => hud::log_debug(&line),
+    }
     let Ok(etag) = HeaderValue::from_str(&etag) else {
         return error_reply(StatusCode::INTERNAL_SERVER_ERROR, "internal");
     };
@@ -721,7 +751,7 @@ async fn scratchpad_append(State(state): State<AppState>, body: Bytes) -> Respon
 
 /// La notification de test (spec §3.7) : un titre et un corps fixes, pour l'appareil qui la demande.
 const TEST_TITLE: &str = "Notification de test";
-const TEST_BODY: &str = "IdemA peut te joindre.";
+const TEST_BODY: &str = "IdemA peut vous joindre.";
 
 fn push_unavailable() -> Response {
     error_reply(StatusCode::SERVICE_UNAVAILABLE, "push_unavailable")
@@ -1425,6 +1455,53 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_device_ends_its_event_stream_and_leaves_the_other_one_open() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let tablet = service.pair("Mozilla/5.0 (iPad; CPU OS 19_0 like Mac OS X)");
+        let phone_id = service
+            .request("GET", "/idema-api/me", &[("Cookie", phone.as_str())], None)
+            .json()["device"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        service.fleet.send(numbered_fleet(1)).unwrap();
+        let mut phone_stream = open_stream(
+            service.port,
+            "/idema-api/events",
+            &[("Cookie", phone.as_str())],
+        );
+        let mut tablet_stream = open_stream(
+            service.port,
+            "/idema-api/events",
+            &[("Cookie", tablet.as_str())],
+        );
+        for stream in [&mut phone_stream, &mut tablet_stream] {
+            assert!(stream.next_frame(Duration::from_secs(2)).is_some());
+        }
+
+        service
+            .events
+            .send(ServiceEvent::ForgetDevice { id: phone_id })
+            .unwrap();
+        service.wait(|status| status.devices.len() == 1);
+        // Le flux de l'appareil oublié se ferme ; il ne reçoit plus la flotte.
+        assert_eq!(phone_stream.next_frame(Duration::from_secs(3)), None);
+        assert!(
+            phone_stream.has_ended(),
+            "the forgotten device keeps its stream"
+        );
+
+        // L'autre appareil reçoit toujours la flotte.
+        service.fleet.send(numbered_fleet(2)).unwrap();
+        let frame = tablet_stream
+            .next_frame(Duration::from_secs(2))
+            .expect("the other device still gets the fleet");
+        assert!(frame.starts_with("event: fleet"), "{frame}");
+        assert!(!tablet_stream.has_ended());
+    }
+
+    #[test]
     fn the_timeline_route_lists_the_transitions_that_count() {
         use idema_term::activity::ActivityState::{Idle, Running, Waiting};
         use std::time::SystemTime;
@@ -1925,6 +2002,22 @@ mod tests {
         );
         assert_eq!(refused.header("content-encoding"), None);
         assert_eq!(refused.json()["text"], plain.json()["text"]);
+    }
+
+    #[test]
+    fn only_a_rendered_screen_read_reaches_the_ordinary_journal() {
+        let body = Rendered::Body {
+            json: b"{}".to_vec(),
+            gzip: false,
+        };
+        assert_eq!(
+            screen_log(&body, "idema-ab12cd34", 5, 12),
+            ScreenLog::Event("companion screen session=idema-ab12cd34 pane=5 took_ms=12".into())
+        );
+        assert!(matches!(
+            screen_log(&Rendered::NotModified, "idema-ab12cd34", 5, 12),
+            ScreenLog::Debug(line) if line == "companion screen session=idema-ab12cd34 pane=5 took_ms=12"
+        ));
     }
 
     #[test]
@@ -2436,6 +2529,32 @@ mod tests {
         );
         // Le message de test ne retire rien.
         assert_eq!(stored_endpoints(&service).iter().flatten().count(), 2);
+    }
+
+    /// Le texte de la notification de test se vouvoie, comme toute la page (R24) : on le lit dans ce que le téléphone
+    /// déchiffre, pas dans le source.
+    #[test]
+    fn the_test_notification_addresses_the_user_formally() {
+        let fake = FakePush::start(201, "");
+        let service = Harness::start_with_push(TempDir::new("push-test-register"), fake.url());
+        let phone = service.pair(IPHONE);
+        let keys = crate::companion::test_support::PhoneKeys::new();
+        let saved = service.request(
+            "PUT",
+            SUBSCRIPTION,
+            &[JSON, ("Cookie", &phone)],
+            Some(&keys.subscription_body("https://web.push.apple.com/QXX-register")),
+        );
+        assert_eq!(saved.status, 200, "{}", saved.text());
+        let sent = service.request("POST", TEST_PUSH, &[JSON, ("Cookie", &phone)], Some("{}"));
+        assert_eq!(sent.status, 200, "{}", sent.text());
+        let requests = fake.wait_for(1);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&keys.decrypt(&requests[0].body)).unwrap();
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.contains("vous"), "{body}");
+        assert!(!body.contains(" te "), "{body}");
+        assert_eq!(payload["type"], "test");
     }
 
     #[test]
