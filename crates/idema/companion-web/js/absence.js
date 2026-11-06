@@ -63,14 +63,55 @@ export function phrases(events, startedAt, lastVisit, labelOf = () => "L'agent")
 }
 
 /**
- * Ce qui s'est passé avant la dernière visite et reste dans le tampon, la plus récente d'abord, `EARLIER_MAX` phrases au
- * plus. Les attentes s'apparient sur tout le tampon. Sans visite précédente, tout est « nouveau » : rien d'antérieur.
+ * Ce qui s'est passé avant la dernière visite et reste dans le tampon, la plus récente d'abord, répétitions fondues
+ * (`mergeRepeats`), `EARLIER_MAX` lignes au plus. Les attentes s'apparient sur tout le tampon. Sans visite précédente,
+ * tout est « nouveau » : rien d'antérieur.
  * @param {TimelineEvent[]} events chronologiques
  * @param {number | null} lastVisit @param {(session: string) => string} [labelOf]
  */
 export function earlierPhrases(events, lastVisit, labelOf = () => "L'agent") {
   if (!lastVisit) return [];
-  return tell(events, labelOf, { pairFrom: 0, from: 0, until: lastVisit }).slice(0, EARLIER_MAX);
+  return mergeRepeats(tell(events, labelOf, { pairFrom: 0, from: 0, until: lastVisit })).slice(0, EARLIER_MAX);
+}
+
+/** Deux phrases identiques d'une même session à moins de 5 min d'écart n'en font qu'une, avec le nombre de fois. */
+export const REPEAT_WINDOW_MS = 5 * 60_000;
+const TRAILING_CLOCK = / \((\d\d:\d\d)\)$/;
+
+/**
+ * La phrase sous l'en-tête de sa ligne : quand l'en-tête est le nom même de l'agent sujet de la phrase (« Opus 5.5 »
+ * au-dessus de « Opus 5.5 a attendu… »), le sujet n'est pas répété et la phrase commence par le verbe.
+ * @param {string} caption l'en-tête de la ligne @param {string} subject l'agent que la phrase nomme @param {string} text
+ */
+export function sentenceUnder(caption, subject, text) {
+  if (!caption || caption !== subject || !text.startsWith(`${subject} `)) return text;
+  const rest = text.slice(subject.length + 1);
+  return rest.charAt(0).toLocaleUpperCase('fr') + rest.slice(1);
+}
+
+/**
+ * Fond les répétitions : des phrases consécutives (la plus récente d'abord) de la même session, au même texte à l'heure
+ * près, à moins de `REPEAT_WINDOW_MS` les unes des autres, deviennent une seule, « …, 3 fois (08:24) », à l'heure de la
+ * plus récente.
+ * @template {{session: string, at: number, text: string}} T
+ * @param {T[]} items la plus récente d'abord
+ * @returns {T[]}
+ */
+export function mergeRepeats(items) {
+  /** @type {{item: T, base: string, clock: string, count: number, oldest: number}[]} */
+  const groups = [];
+  for (const item of items) {
+    const clock = item.text.match(TRAILING_CLOCK)?.[1] ?? '';
+    const base = item.text.replace(TRAILING_CLOCK, '');
+    const last = groups[groups.length - 1];
+    if (last && last.item.session === item.session && last.base === base && last.oldest - item.at <= REPEAT_WINDOW_MS) {
+      last.count += 1;
+      last.oldest = item.at;
+    } else groups.push({ item, base, clock, count: 1, oldest: item.at });
+  }
+  return groups.map(({ item, base, clock, count }) =>
+    count === 1 ? item : { ...item, text: `${base}, ${count} fois${clock ? ` (${clock})` : ''}` },
+  );
 }
 
 /** @type {import('./router.js').View} */
@@ -86,12 +127,15 @@ export function mountAbsence(root, { store, request }) {
     const { data, lastVisit } = last;
     const find = (/** @type {string} */ name) => store.state.fleet?.sessions.find((s) => s.name === name);
     const labelOf = (/** @type {string} */ n) => find(n)?.agents[0]?.label ?? find(n)?.display_name ?? "L'agent";
-    const { head, items } = phrases(data.events, data.started_at, lastVisit, labelOf);
+    const told = phrases(data.events, data.started_at, lastVisit, labelOf);
+    const { head } = told;
+    const items = mergeRepeats(told.items);
     const earlier = earlierPhrases(data.events, lastVisit, labelOf);
     /** @param {{session: string, text: string}} phrase @param {string} [extra] */
     const row = ({ session, text }, extra = '') => {
       const s = find(session);
-      return el('button', { class: `row row--phrase${extra}`, type: 'button', onclick: () => s && void (location.hash = sessionHash(s.name, targetPane(s))) }, el('span', { class: 'row__caption' }, s?.display_name ?? 'Session fermée'), text);
+      const caption = s?.display_name ?? 'Session fermée';
+      return el('button', { class: `row row--phrase${extra}`, type: 'button', onclick: () => s && void (location.hash = sessionHash(s.name, targetPane(s))) }, el('span', { class: 'row__caption' }, caption), sentenceUnder(caption, labelOf(session), text));
     };
     page(
       head && el('p', { class: 'muted' }, head),

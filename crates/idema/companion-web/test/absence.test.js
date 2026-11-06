@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { EARLIER_MAX, earlierPhrases, mountAbsence, phrases } from '../js/absence.js';
+import { EARLIER_MAX, earlierPhrases, mergeRepeats, mountAbsence, phrases, REPEAT_WINDOW_MS, sentenceUnder } from '../js/absence.js';
 import { createStore } from '../js/store.js';
 
 const MIN = 60_000;
@@ -75,6 +75,49 @@ describe('earlierPhrases', () => {
 
   test('a first visit has nothing older: everything is new', () => {
     expect(earlierPhrases([event(at(14, 0), 'a', 'running', 'error')], null)).toEqual([]);
+  });
+});
+
+describe('sentenceUnder', () => {
+  test('drops the subject the caption already names and starts with the verb', () => {
+    expect(sentenceUnder('Opus 5.5', 'Opus 5.5', 'Opus 5.5 a attendu 3 min (08:22)')).toBe('A attendu 3 min (08:22)');
+    expect(sentenceUnder('Opus 5.5', 'Opus 5.5', 'Opus 5.5 est passé en erreur (08:30)')).toBe('Est passé en erreur (08:30)');
+  });
+
+  test('keeps the subject when the caption names something else', () => {
+    expect(sentenceUnder('refonte', 'Codex', 'Codex a fini (16:20)')).toBe('Codex a fini (16:20)');
+    // Un en-tête qui n'est qu'un début du nom de l'agent n'est pas le sujet.
+    expect(sentenceUnder('Opus', 'Opus 5.5', 'Opus 5.5 a fini (16:20)')).toBe('Opus 5.5 a fini (16:20)');
+  });
+});
+
+describe('mergeRepeats', () => {
+  const phrase = (/** @type {number} */ time, /** @type {string} */ session, /** @type {string} */ words) => {
+    const d = new Date(time);
+    const clock = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    return { session, at: time, text: `${words} (${clock})` };
+  };
+
+  test('close identical phrases of one session become one, with the count and the latest time', () => {
+    const items = [
+      phrase(at(8, 24), 'a', 'Opus a attendu moins d’une minute'),
+      phrase(at(8, 23), 'a', 'Opus a attendu moins d’une minute'),
+      phrase(at(8, 22), 'a', 'Opus a attendu moins d’une minute'),
+      phrase(at(8, 22), 'a', 'Opus a attendu 3 min'),
+    ];
+    expect(mergeRepeats(items).map((item) => item.text)).toEqual([
+      'Opus a attendu moins d’une minute, 3 fois (08:24)',
+      'Opus a attendu 3 min (08:22)',
+    ]);
+  });
+
+  test('phrases far apart, of another session, or with another text stay apart', () => {
+    const far = [phrase(at(14, 0), 'a', 'Codex est passé en erreur'), phrase(at(14, 0) - REPEAT_WINDOW_MS - MIN, 'a', 'Codex est passé en erreur')];
+    expect(mergeRepeats(far)).toHaveLength(2);
+    const sessions = [phrase(at(8, 24), 'a', 'X a fini'), phrase(at(8, 23), 'b', 'X a fini')];
+    expect(mergeRepeats(sessions)).toHaveLength(2);
+    const interleaved = [phrase(at(8, 24), 'a', 'X a fini'), phrase(at(8, 23), 'a', 'X a repris'), phrase(at(8, 22), 'a', 'X a fini')];
+    expect(mergeRepeats(interleaved)).toHaveLength(3);
   });
 });
 
@@ -158,12 +201,13 @@ describe('mountAbsence', () => {
   });
 
   test('"Plus tôt" shows 30 lines at most', async () => {
-    const events = Array.from({ length: 45 }, (_, n) => event(at(10, 0) + n * MIN, 'idema-aaaa1111', 'running', 'error'));
+    // Six minutes d'écart : au-delà de la fenêtre des répétitions, chaque erreur garde sa ligne.
+    const events = Array.from({ length: 45 }, (_, n) => event(at(10, 0) + n * 6 * MIN, 'idema-aaaa1111', 'running', 'error'));
     mount({ kind: 'ok', data: { started_at: at(8, 0), events } });
     await flush();
     const rows = root.querySelectorAll('.row--earlier');
     expect(rows.length).toBe(EARLIER_MAX);
-    expect(rows[0]?.textContent).toContain('(10:44)');
+    expect(rows[0]?.textContent).toContain('(14:24)');
   });
 
 
@@ -200,6 +244,27 @@ describe('mountAbsence', () => {
     const row = root.querySelector('.row');
     store.setConnection('offline');
     expect(root.querySelector('.row')).toBe(row);
+  });
+
+  test('a session named after its agent reads "Opus 5.5" once per row, and close repeats are merged', async () => {
+    const store = createStore(localStorage);
+    store.setFleet({ mac: 'Mac', generated_at: 1, badge: 0, projects: [], sessions: [{ name: 'idema-bbbb2222', display_name: 'Opus 5.5', state: 'idle', agents: [{ label: 'Opus 5.5', logo: null }], panes: [{ id: 0, active: true, state: 'idle' }] }] });
+    store.touchVisit(at(15, 0));
+    const events = [
+      event(at(16, 20), 'idema-bbbb2222', 'running', 'waiting'),
+      event(at(16, 20) + 20_000, 'idema-bbbb2222', 'waiting', 'idle'),
+      event(at(16, 21), 'idema-bbbb2222', 'running', 'waiting'),
+      event(at(16, 21) + 20_000, 'idema-bbbb2222', 'waiting', 'idle'),
+    ];
+    const request = async () => ({ kind: 'ok', data: { started_at: at(8, 0), events } });
+    mountAbsence(root, /** @type {any} */ ({ store, request }));
+    await flush();
+    const rows = [...root.querySelectorAll('.row')];
+    expect(rows).toHaveLength(1);
+    const caption = rows[0].querySelector('.row__caption')?.textContent;
+    expect(caption).toBe('Opus 5.5');
+    const sentence = rows[0].textContent?.slice(caption?.length ?? 0);
+    expect(sentence).toBe("A attendu moins d'une minute, 2 fois (16:21)");
   });
 
   test('a session closed since is shown but does not open', async () => {
