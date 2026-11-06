@@ -160,5 +160,9 @@ check "le service worker contrôle la page, la flotte du cache est là, la feuil
 shoot offline
 curl -s "$BASE/__mode/paired" >/dev/null
 
+echo "=== Écritures : aucune ne doit être refusée en 415 comme le ferait le garde du Mac"
+check "toutes les écritures de la page portent un corps JSON (aucun 415)" 'curl -s "$BASE/__rejected" | jq -e ".rejected | length == 0" >/dev/null'
+check "l'acquittement du pane est bien parti (la vérification ci-dessus ne porte pas sur du vide)" 'curl -s "$BASE/__rejected" | jq -e "[.accepted[] | select(endswith(\"/ack\"))] | length >= 1" >/dev/null'
+
 echo "capture $RESULT"
 [ "$RESULT" = PASS ]

@@ -104,6 +104,7 @@ p { margin: 0; }
 .bar__status--error { color: var(--error); }
 .bar__next { min-height: var(--target); padding: 0 12px; border: 0; border-radius: var(--radius-control); background: var(--press); color: var(--accent-text); font: 600 15px/1 var(--font); }
 .bar__controls { display: flex; flex-direction: column; gap: 8px; }
+.bar__controls--off { opacity: 0.4; }
 .bar__idle { margin: 0; padding: 12px 4px; color: var(--text-2); font-size: 15px; text-align: center; }
 .choices { display: flex; flex-direction: column; gap: 6px; max-height: 148px; overflow-y: auto; }
 .choice { flex: none; min-height: var(--target); padding: 0 16px; overflow: hidden; border: 1.5px solid var(--separator); border-radius: var(--radius-control); background: var(--card); color: var(--text); font: 600 16px/1 var(--font); text-align: left; text-overflow: ellipsis; white-space: nowrap; }

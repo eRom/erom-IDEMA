@@ -114,3 +114,63 @@ describe('api', () => {
     expect(await api('GET', '/x', undefined, 4000, false, { 'If-None-Match': '"v1"' })).toEqual({ kind: 'http', status: 304, error: 'unknown' });
   });
 });
+
+describe('api writes', () => {
+  /** @param {RequestInit} init */
+  const contentType = (init) => new Headers(init.headers).get('content-type');
+
+  test('every write leaves with a JSON body and the JSON content type, even when the caller gave none', async () => {
+    /** @type {RequestInit[]} */
+    const seen = [];
+    stubFetch(async (_url, init) => {
+      seen.push(init);
+      return new Response('{}', { status: 200 });
+    });
+    // Les écritures du Mac qui n'ont pas de corps (`ack`, `push/test`) : sans type de contenu le garde rend 415.
+    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) await api(method, '/x');
+    expect(seen).toHaveLength(4);
+    for (const init of seen) {
+      expect(contentType(init)).toBe('application/json');
+      expect(init.body).toBe('{}');
+    }
+  });
+
+  test('a body given by the caller is kept, null included', async () => {
+    /** @type {RequestInit[]} */
+    const seen = [];
+    stubFetch(async (_url, init) => {
+      seen.push(init);
+      return new Response('{}', { status: 200 });
+    });
+    await api('POST', '/x', { a: 1 });
+    await api('PUT', '/x', null);
+    expect(seen.map((init) => init.body)).toEqual(['{"a":1}', 'null']);
+    expect(seen.map(contentType)).toEqual(['application/json', 'application/json']);
+  });
+
+  test('a read carries no body and no content type', async () => {
+    /** @type {RequestInit[]} */
+    const seen = [];
+    stubFetch(async (_url, init) => {
+      seen.push(init);
+      return new Response('{}', { status: 200 });
+    });
+    await api('GET', '/x');
+    await api('HEAD', '/x');
+    for (const init of seen) {
+      expect(init.body).toBeUndefined();
+      expect(contentType(init)).toBeNull();
+    }
+  });
+
+  test('extra headers survive on a write without body', async () => {
+    /** @type {RequestInit[]} */
+    const seen = [];
+    stubFetch(async (_url, init) => {
+      seen.push(init);
+      return new Response('{}', { status: 200 });
+    });
+    await api('POST', '/x', undefined, 4000, false, { 'X-Extra': '1' });
+    expect(seen[0].headers).toEqual({ 'X-Extra': '1', 'Content-Type': 'application/json' });
+  });
+});

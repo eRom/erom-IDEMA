@@ -218,12 +218,22 @@ describe('ensureSubscriptionMatchesKey', () => {
     expect(mac.called('/push/subscription')).toHaveLength(1);
   });
 
-  test('a subscription the Mac forgot (a dead send removed it) is given back to it', async () => {
+  test('a subscription the Mac removed (a dead send, 410) is replaced by a new one, not given back as it was', async () => {
     const browser = fakeBrowser({ permission: 'granted', existing: keyOf(7) });
     const mac = fakeRequest(withKey);
     expect(await ensureSubscriptionMatchesKey({ request: mac.request, env: browser.env, serverSubscribed: false })).toBe('restored');
-    expect(browser.log).toEqual([]);
+    expect(browser.log[0]).toBe('unsubscribe');
+    expect(Array.from(browser.log[1].subscribe.applicationServerKey)).toEqual(Array.from(decode(SERVER_KEY)));
     expect(mac.called('/push/subscription')).toHaveLength(1);
+    // Ce que le Mac reçoit vient de l'abonnement neuf, jamais de l'ancien.
+    expect(browser.registration.current).not.toBeNull();
+  });
+
+  test('a replacement the browser refuses is reported as failed and nothing reaches the Mac', async () => {
+    const browser = fakeBrowser({ permission: 'granted', existing: keyOf(7), subscribeFails: true });
+    const mac = fakeRequest(withKey);
+    expect(await ensureSubscriptionMatchesKey({ request: mac.request, env: browser.env, serverSubscribed: false })).toBe('failed');
+    expect(mac.called('/push/subscription')).toEqual([]);
   });
 
   test('a key the browser does not reveal is not read as a rotation', async () => {

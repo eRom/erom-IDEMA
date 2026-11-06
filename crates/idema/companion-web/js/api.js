@@ -44,9 +44,11 @@ export async function api(method, path, body, timeoutMs = TIMEOUT_MS, keepalive 
   const init = { method, signal: controller.signal, credentials: 'same-origin', cache: 'no-store' };
   if (keepalive) init.keepalive = true;
   if (headers) init.headers = headers;
-  if (body !== undefined) {
+  // Le garde du Mac refuse (415) toute écriture sans type JSON : une écriture sans corps part donc avec `{}`.
+  const write = method !== 'GET' && method !== 'HEAD';
+  if (body !== undefined || write) {
     init.headers = { ...headers, 'Content-Type': 'application/json' };
-    init.body = JSON.stringify(body);
+    init.body = JSON.stringify(body === undefined ? {} : body);
   }
   try {
     const response = await fetch(API_PREFIX + path, init);

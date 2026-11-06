@@ -9,6 +9,7 @@
 //   unpaired  l'API rend 401 `unpaired` (sauf `health` et `pair`) : l'écran d'appairage ;
 //   offline   l'API rend 503, les fichiers sont servis : le bandeau « hors ligne » sur la flotte en cache ;
 //   down      tout rend 503, fichiers compris : seule la copie du service worker répond.
+// GET /__rejected liste les écritures refusées en 415 et celles acceptées (sans `Content-Type: application/json`, comme le garde du Mac).
 // GET /__quit arrête le serveur. Les instants des fixtures sont ramenés à maintenant (la flotte enregistrée il y a
 // des jours se lit « il y a 3 min »), en gardant les écarts entre eux.
 
@@ -168,6 +169,11 @@ async function api(route: string, request: Request): Promise<Response> {
   return json(200, { ok: true });
 }
 
+/** Les écritures refusées en 415 : les captures les relisent par GET /__rejected et échouent s'il y en a. */
+const rejected: string[] = [];
+/** Les écritures acceptées, pour que « aucune refusée » ne puisse pas passer sur du vide. */
+const accepted: string[] = [];
+
 const server = Bun.serve({
   port: PORT,
   hostname: '127.0.0.1',
@@ -177,13 +183,23 @@ const server = Bun.serve({
       setTimeout(() => process.exit(0), 50);
       return json(200, { bye: true });
     }
+    if (pathname === '/__rejected') return json(200, { rejected, accepted });
     const wanted = /^\/__mode\/(paired|unpaired|offline|down)$/.exec(pathname);
     if (wanted) {
       mode = wanted[1] as Mode;
       return json(200, { mode });
     }
     if (mode === 'down') return plain(503);
-    if (pathname.startsWith('/idema-api/')) return api(pathname.slice('/idema-api'.length), request);
+    if (pathname.startsWith('/idema-api/')) {
+      // Le garde du Mac (server.rs, `is_json`) : toute écriture sans `Content-Type: application/json` rend 415.
+      const media = (request.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
+      if (request.method !== 'GET' && request.method !== 'HEAD' && media !== 'application/json') {
+        rejected.push(`${request.method} ${pathname}`);
+        return json(415, { ok: false, error: 'unsupported_media_type' });
+      }
+      if (request.method !== 'GET' && request.method !== 'HEAD') accepted.push(`${request.method} ${pathname}`);
+      return api(pathname.slice('/idema-api'.length), request);
+    }
     if (request.method !== 'GET' && request.method !== 'HEAD') return plain(405);
     return appFile(pathname, request);
   },

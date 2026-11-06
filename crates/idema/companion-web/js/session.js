@@ -117,6 +117,8 @@ export function mountSession(root, { route, store, request, timers = realTimers 
   let followTimer = null;
   let chain = Promise.resolve(true);
   let sending = false;
+  /** La dernière lecture de l'écran a-t-elle abouti ? Sinon le Mac est injoignable : rien ne peut partir. */
+  let reachable = true;
   const stateOfPane = () => store.state.fleet?.sessions.find((s) => s.name === session)?.panes.find((/** @type {{id: number}} */ p) => p.id === pane)?.state;
   let fleetState = stateOfPane();
 
@@ -163,6 +165,17 @@ export function mountSession(root, { route, store, request, timers = realTimers 
   }
 
   // --- La barre : état, envois
+  const canSend = () => reachable && store.state.connection === 'ok';
+
+  /** Désactive les contrôles d'envoi tant que le Mac est injoignable ; le bouton Envoyer reste aussi pris pendant un envoi. */
+  function syncControls() {
+    const off = !canSend();
+    controls.classList.toggle('bar__controls--off', off);
+    for (const node of controls.querySelectorAll('button, input')) {
+      /** @type {HTMLButtonElement | HTMLInputElement} */ (node).disabled = off || (node === submit && sending);
+    }
+  }
+
   /** @param {Outcome} outcome */
   function say({ text, tone }) {
     if (noticeTimer !== null) timers.clearTimeout(noticeTimer);
@@ -194,6 +207,10 @@ export function mountSession(root, { route, store, request, timers = realTimers 
   /** @param {Record<string, unknown>} body */
   async function post(body) {
     if (!alive || closing) return false;
+    if (!canSend()) {
+      say({ text: "Le Mac ne répond pas : rien n'a été envoyé", tone: 'error', closed: false });
+      return false;
+    }
     // Un envoi n'est jamais rejoué : un `command_id` neuf à chaque appui.
     const result = await request('POST', `${base}/input`, { ...body, command_id: crypto.randomUUID() });
     if (!alive) return false;
@@ -218,13 +235,14 @@ export function mountSession(root, { route, store, request, timers = realTimers 
     const checked = validateText(field.value);
     if (!checked.ok) return void (checked.error && say({ text: checked.error, tone: 'error', closed: false }));
     sending = true;
-    submit.disabled = true;
+    syncControls();
     const typed = field.value;
     let sent = false;
     try {
       sent = await send({ text: checked.text, enter: true });
     } finally {
-      sending = submit.disabled = false;
+      sending = false;
+      syncControls();
     }
     // Le champ n'est vidé que si on n'y a rien changé pendant l'envoi.
     if (sent && alive && field.value === typed) field.value = '';
@@ -282,6 +300,7 @@ export function mountSession(root, { route, store, request, timers = realTimers 
     controls.hidden = data.accepts_input === false;
     idle.hidden = !controls.hidden;
     drawChoices(controls.hidden ? null : detectChoices(lines.map((line) => line.map((seg) => seg.text).join(''))));
+    syncControls();
   }
 
   function schedule() {
@@ -306,18 +325,22 @@ export function mountSession(root, { route, store, request, timers = realTimers 
       const result = await request('GET', `${base}/screen?history=${history}`, undefined, false, undefined, etag ? { 'If-None-Match': etag } : undefined);
       if (!alive) return;
       if (result.kind === 'ok') {
+        reachable = true;
         stale.hidden = true;
         etag = result.etag ?? null;
         paneState = result.data.state ?? paneState;
         dot.className = `dot dot--${paneState}`;
         draw(result.data);
       } else if (result.kind === 'http' && result.status === 304) {
+        reachable = true;
         stale.hidden = true;
       } else if (result.kind === 'http' && result.status === 404) {
         close();
       } else if (result.kind !== 'unpaired') {
+        reachable = false;
         stale.hidden = false;
       }
+      syncControls();
     } finally {
       reading = false;
       if (alive && !closing) {
@@ -378,6 +401,7 @@ export function mountSession(root, { route, store, request, timers = realTimers 
         ),
       );
     }
+    syncControls();
     next.hidden = !isTriage();
     if (isTriage()) next.textContent = nextHash() ? 'Suivante' : 'Tout est traité';
     const state = stateOfPane();

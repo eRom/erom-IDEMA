@@ -171,15 +171,14 @@ export async function ensureSubscriptionMatchesKey({ request, env, serverSubscri
     // Sans clé lisible sur l'abonnement, la comparaison est impossible : on garde l'abonnement (un envoi mort le dira).
     const current = subscription.options?.applicationServerKey;
     const rotated = current !== null && current !== undefined && keysDiffer(current, mac.key);
-    if (rotated) {
-      await subscription.unsubscribe();
-      subscription = await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: /** @type {Uint8Array<ArrayBuffer>} */ (keyBytes(mac.key)),
-      });
-    } else if (serverSubscribed) {
-      return 'unchanged';
-    }
+    if (!rotated && serverSubscribed) return 'unchanged';
+    // Clé changée, ou abonnement que le Mac a retiré (410) : l'ancien point d'arrivée est mort pour le service push,
+    // le redonner au Mac renverrait vers lui. On repart d'un abonnement neuf, donc d'un nouveau point d'arrivée.
+    await subscription.unsubscribe();
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: /** @type {Uint8Array<ArrayBuffer>} */ (keyBytes(mac.key)),
+    });
     return (await saveSubscription(request, subscription)) === 'enabled' ? (rotated ? 'resubscribed' : 'restored') : 'failed';
   } catch {
     return 'failed';

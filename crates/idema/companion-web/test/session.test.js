@@ -442,6 +442,56 @@ describe('mountSession', () => {
     expect(root.querySelector('.term__text')?.textContent).toBe('neuf');
   });
 
+  /** Tous les contrôles d'envoi : choix, touches, champ et bouton. */
+  const controlNodes = () => [...root.querySelectorAll('.bar__controls button, .bar__controls input')].map((node) => /** @type {HTMLButtonElement} */ (node));
+
+  test('the reply controls are disabled after a failed read and come back with the next good one', async () => {
+    mount();
+    await flush();
+    expect(controlNodes().length).toBeGreaterThan(10);
+    expect(controlNodes().every((node) => !node.disabled)).toBe(true);
+    routes[`GET ${BASE}/screen`] = () => ({ kind: 'offline' });
+    timers.fire(5000);
+    await flush();
+    expect(controlNodes().every((node) => node.disabled)).toBe(true);
+    // Un clic sur un bouton désactivé ne part pas non plus.
+    calls.length = 0;
+    controlNodes()[0].click();
+    await flush();
+    expect(inputs()).toHaveLength(0);
+    routes[`GET ${BASE}/screen`] = () => ({ kind: 'ok', data: { text: 'neuf', accepts_input: true, state: 'idle' }, etag: '"n"' });
+    timers.fire(5000);
+    await flush();
+    expect(controlNodes().every((node) => !node.disabled)).toBe(true);
+  });
+
+  test('the reply controls are disabled while the app says the Mac is unreachable, and the choices drawn then are too', async () => {
+    const { store } = mount();
+    await flush();
+    store.setConnection('offline');
+    expect(controlNodes().every((node) => node.disabled)).toBe(true);
+    // De nouveaux choix dessinés pendant la coupure naissent désactivés.
+    routes[`GET ${BASE}/screen`] = () => ({ kind: 'ok', data: { text: MENU_TEXT.replace('what to do', 'what to do\n   4. Other'), accepts_input: true, state: 'waiting' }, etag: '"m"' });
+    timers.fire(5000);
+    await flush();
+    expect(controlNodes().every((node) => node.disabled)).toBe(true);
+    store.setConnection('ok');
+    expect(controlNodes().every((node) => !node.disabled)).toBe(true);
+  });
+
+  test('a 304 read counts as a reachable Mac', async () => {
+    mount();
+    await flush();
+    routes[`GET ${BASE}/screen`] = () => ({ kind: 'timeout' });
+    timers.fire(5000);
+    await flush();
+    expect(controlNodes().every((node) => node.disabled)).toBe(true);
+    routes[`GET ${BASE}/screen`] = () => ({ kind: 'http', status: 304, error: 'unknown' });
+    timers.fire(5000);
+    await flush();
+    expect(controlNodes().every((node) => !node.disabled)).toBe(true);
+  });
+
   test('a button being touched is not replaced by a read that changes nothing', async () => {
     mount();
     await flush();

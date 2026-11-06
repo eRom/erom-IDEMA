@@ -312,7 +312,7 @@ describe('push', () => {
 
   test('the test push has no session and no badge: it is shown and the badge is left alone', async () => {
     const worker = await loadWorker();
-    await push(worker, { title: 'Notification de test', body: 'IdemA peut te joindre.', type: 'test', url: '/' });
+    await push(worker, { title: 'Notification de test', body: 'IdemA peut vous joindre.', type: 'test', url: '/' });
     expect(worker.log.shown[0].title).toBe('Notification de test');
     expect(worker.log.shown[0].options.tag).toBe('idema');
     expect(worker.log.shown[0].options.data.url).toBe('/');
