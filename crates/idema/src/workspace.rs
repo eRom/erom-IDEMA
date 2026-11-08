@@ -80,7 +80,7 @@ use crate::machines::probe::{
     MachineFacts, RemoteFailure, ensure_control_dir, probe, probe_spec, retry_delay,
 };
 use crate::machines::registry::{Lease, MachineStatus, RemoteMachine, SlotPool};
-use crate::machines::sessions::{Route, machine_keys, qualify_listing, route};
+use crate::machines::sessions::{Route, machine_keys, pane_agent_names, qualify_listing, route};
 use crate::pane_view::{PaneEvent, PaneView};
 use crate::popover::{
     MenuEntry, MenuItemSpec, MenuSpec, OpenMenu, Placement, SUBMENU_DELAY, hidden_panes_dot,
@@ -117,13 +117,15 @@ use crate::scratchpad::rules::{scratchpad_menu, scratchpad_path};
 use crate::servers::model::{PaneInputs, Servers, ServersEvent, SessionInfo, observe_panes};
 use crate::servers::scan::{Process, SCAN_PERIOD};
 use crate::session_view::{PaneLaunch, SessionEntryInfo, SessionEvent, SessionView};
+use crate::settings::nav::Section;
 use crate::sidebar::{
-    AgentMark, SIDEBAR_WIDTH, TITLE_BAND, agent_marks, render_sidebar, state_dot,
+    AgentMark, SIDEBAR_WIDTH, TITLE_BAND, agent_marks, remote_agent_marks, render_sidebar,
+    state_dot,
 };
 use crate::sidebar_model::{
     SessionSummary, cycle, default_session_name, dock_badge_count, ideation_shown,
-    is_alerting_session, navigation_order, neighbor_after_close, nth_session, session_order,
-    sort_sessions,
+    is_alerting_session, machine_navigation_order, navigation_order, neighbor_after_close,
+    nth_session, session_order, sort_sessions,
 };
 use crate::state::{State, StateNotice, StateStore, UiState, rfc3339};
 use crate::terminal_element::{MARGIN_SIDES, TerminalFont, cell_metrics, content_bounds};
@@ -651,6 +653,11 @@ fn fleet_entries(entries: &[SessionEntry]) -> impl Iterator<Item = &SessionEntry
 }
 
 /// Une clé de session telle qu'elle figure au journal : le nom tmux en local, `<connexion>:<nom tmux>` sur une machine.
+/// Des noms de session empruntés, rendus possédés (l'ordre de navigation mêle des sources de durées de vie différentes).
+fn owned_names(names: Vec<&str>) -> Vec<String> {
+    names.into_iter().map(str::to_owned).collect()
+}
+
 fn key_label(key: &str) -> String {
     match split_session_key(key) {
         SessionTarget::Local(name) => name.to_owned(),
@@ -850,6 +857,9 @@ pub struct Workspace {
     server: Option<Arc<TmuxServer>>,
     /// Les machines distantes de `[machines]`, dans l'ordre du fichier, chacune avec son état de connexion.
     pub(crate) machines: Vec<RemoteMachine>,
+    /// Les noms des agents qui tournent dans les panes de chaque session distante (clé de session), au dernier listage de
+    /// sa machine : la barre en tire les logos.
+    remote_agents: HashMap<String, Vec<String>>,
     /// Les sessions listées, dans l'ordre de la barre (`sort_sessions`).
     pub(crate) entries: Vec<SessionEntry>,
     /// Projet choisi par le dernier geste de sélection : l'écran vide en montre le contexte.
@@ -1122,6 +1132,7 @@ impl Workspace {
             in_memory_state,
             server: None,
             machines: Vec::new(),
+            remote_agents: HashMap::new(),
             entries: Vec::new(),
             selected_project: None,
             project_wins: false,
@@ -1749,6 +1760,21 @@ impl Workspace {
     /// Les marques des agents qui tournent dans la session (relevé des serveurs, toutes les 2 s) ; rien avant le premier
     /// relevé ni sans serveur tmux.
     pub(crate) fn session_agent_marks(&self, session: &str, cx: &App) -> Vec<AgentMark> {
+        // Une session distante : ses agents viennent du listage de sa machine, leurs logos de son `~/.idnma.yml`.
+        if let SessionTarget::Remote { connection, .. } = split_session_key(session) {
+            let names = self
+                .remote_agents
+                .get(session)
+                .map_or(&[][..], Vec::as_slice);
+            let agents = self
+                .machines
+                .iter()
+                .find(|machine| machine.entry.connection == connection)
+                .and_then(|machine| machine.facts.as_ref())
+                .and_then(|facts| facts.agents.as_deref())
+                .unwrap_or_default();
+            return remote_agent_marks(names, agents);
+        }
         let Some(servers) = &self.servers else {
             return Vec::new();
         };
@@ -2549,11 +2575,7 @@ impl Workspace {
             return None;
         }
         let summaries = self.summaries();
-        Some(
-            self.navigation(&summaries)
-                .first()
-                .map(|name| (*name).to_owned()),
-        )
+        Some(self.navigation(&summaries).into_iter().next())
     }
 
     /// Au démarrage, `state.json` peut encore désigner un bouillon alors que la section est absente : la sélection
@@ -2620,6 +2642,16 @@ impl Workspace {
     /// `⌘,`, la ligne « Personnaliser » et le menu : ouvre la fenêtre « Personnaliser », ou ramène celle qui existe au
     /// premier plan.
     fn open_config(&mut self, _: &OpenConfig, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_on(None, window, cx);
+    }
+
+    /// Ouvre « Personnaliser », ou ramène la fenêtre vivante au premier plan, sur `section` quand elle est donnée.
+    fn open_settings_on(
+        &mut self,
+        section: Option<Section>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(handle) = window.window_handle().downcast::<Workspace>() else {
             return;
         };
@@ -2629,6 +2661,7 @@ impl Workspace {
             cx.entity(),
             system_enabled,
             self.config_path.clone(),
+            section,
             cx,
         );
     }
@@ -2818,6 +2851,8 @@ impl Workspace {
         for gone in previous {
             let connection = gone.entry.connection.clone();
             hud::log_event(&format!("machine removed machine={connection}"));
+            self.remote_agents
+                .retain(|key, _| machine_of(key) != connection);
             for key in self.machine_entry_keys(&connection) {
                 self.remove_entry(&key, window, cx);
             }
@@ -2894,6 +2929,7 @@ impl Workspace {
                 }
                 machine.facts = Some(facts);
                 machine.status = MachineStatus::Connected;
+                machine.last_failure = None;
                 machine.attempt = 0;
                 machine.refresh_failures = 0;
                 machine.retry = None;
@@ -2910,6 +2946,7 @@ impl Workspace {
                     failure.short(),
                     delay.as_secs()
                 ));
+                machine.last_failure = Some(failure.clone());
                 machine.status = MachineStatus::Failed(failure);
                 machine.poll = None;
                 let target = connection.to_owned();
@@ -3010,6 +3047,10 @@ impl Workspace {
             (Ok(sessions), Ok(panes)) => {
                 machine.refresh_failures = 0;
                 let (sessions, panes) = qualify_listing(connection, sessions, panes);
+                // Les agents des panes de cette machine remplacent ceux du listage précédent.
+                self.remote_agents
+                    .retain(|key, _| machine_of(key) != connection);
+                self.remote_agents.extend(pane_agent_names(&panes));
                 self.apply_sessions(connection, &snapshot, &sessions, &panes, window, cx);
             }
             (Err(error), _) | (_, Err(error)) => {
@@ -4991,6 +5032,7 @@ impl Workspace {
         let target = {
             let summaries = self.summaries();
             let order = self.navigation(&summaries);
+            let order: Vec<&str> = order.iter().map(String::as_str).collect();
             nth_session(&order, index).map(str::to_owned)
         };
         if let Some(name) = target {
@@ -5003,6 +5045,7 @@ impl Workspace {
         let target = {
             let summaries = self.summaries();
             let order = self.navigation(&summaries);
+            let order: Vec<&str> = order.iter().map(String::as_str).collect();
             cycle(&order, self.selected_name(), forward).map(str::to_owned)
         };
         if let Some(name) = target {
@@ -5024,19 +5067,64 @@ impl Workspace {
 
     /// Les sessions qu'on parcourt au clavier : les bouillons quand leur section est ouverte, puis celles des projets
     /// dépliés, dans l'ordre de la barre.
-    fn navigation<'a>(&self, summaries: &'a [SessionSummary]) -> Vec<&'a str> {
+    fn navigation(&self, summaries: &[SessionSummary]) -> Vec<String> {
         let state = self.state();
         let projects: Vec<PathBuf> = state
             .ordered_projects()
             .into_iter()
             .map(|project| project.path.clone())
             .collect();
-        navigation_order(
-            &projects,
-            |path| state.is_expanded(path),
+        // Les bouillons n'appartiennent à aucune machine : Localhost replié ne les retire pas du cycle.
+        let mut order = owned_names(navigation_order(
+            &[],
+            |_| false,
             ideation_shown(self.ideation().is_some(), state.ui.ideation_collapsed),
             summaries,
-        )
+        ));
+        let local = owned_names(navigation_order(
+            &projects,
+            |path| state.is_expanded(path),
+            false,
+            summaries,
+        ));
+        order.extend(machine_navigation_order(
+            local,
+            &self.machine_groups(summaries, true),
+            self.local_collapsed(),
+        ));
+        order
+    }
+
+    /// Les sessions de chaque machine distante, dans l'ordre de la config : (clé, repliée, clés). `honor_collapse` faux :
+    /// aucune machine n'est repliée.
+    fn machine_groups(
+        &self,
+        summaries: &[SessionSummary],
+        honor_collapse: bool,
+    ) -> Vec<(String, bool, Vec<String>)> {
+        self.machines
+            .iter()
+            .map(|machine| {
+                let key = machine.entry.connection.clone();
+                let collapsed = honor_collapse && self.state().is_machine_collapsed(&key);
+                let keys = summaries
+                    .iter()
+                    .filter(|summary| summary.machine.as_deref() == Some(key.as_str()))
+                    .map(|summary| summary.name.clone())
+                    .collect();
+                (key, collapsed, keys)
+            })
+            .collect()
+    }
+
+    /// Le nom de Localhost dans la barre (`[machines] local_label`, sinon « Localhost »).
+    pub(crate) fn local_machine_label(&self) -> &str {
+        self.config.local_machine_label()
+    }
+
+    /// Localhost est-il replié ? Sans machine distante il n'a pas d'en-tête à replier : jamais.
+    pub(crate) fn local_collapsed(&self) -> bool {
+        !self.machines.is_empty() && self.state().is_machine_collapsed(LOCAL_MACHINE)
     }
 
     /// Toutes les sessions dans l'ordre de la barre, repliement ignoré : le voisin d'une session qui se ferme
@@ -5048,15 +5136,19 @@ impl Workspace {
             .into_iter()
             .map(|project| project.path.clone())
             .collect();
-        navigation_order(
-            &projects,
-            |_| true,
+        let mut order = owned_names(navigation_order(
+            &[],
+            |_| false,
             ideation_shown(self.ideation().is_some(), false),
             summaries,
-        )
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+        ));
+        let local = owned_names(navigation_order(&projects, |_| true, false, summaries));
+        order.extend(machine_navigation_order(
+            local,
+            &self.machine_groups(summaries, false),
+            false,
+        ));
+        order
     }
 
     fn on_session_event(
@@ -6986,6 +7078,59 @@ impl Workspace {
         self.state_mut().set_expanded(path, !expanded);
         self.save();
         cx.notify();
+    }
+
+    /// Clic sur l'en-tête d'une machine (`LOCAL_MACHINE` pour Localhost) : la plie ou la déplie, sans rien sélectionner.
+    pub(crate) fn toggle_machine(&mut self, key: &str, cx: &mut Context<Self>) {
+        let collapsed = self.state().is_machine_collapsed(key);
+        self.state_mut().set_machine_collapsed(key, !collapsed);
+        self.save();
+        cx.notify();
+    }
+
+    /// « Réessayer » : reconnecte la machine tout de suite, sans attendre la minuterie. Le compte des essais repart de 0.
+    pub(crate) fn retry_machine(
+        &mut self,
+        connection: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let machine = &mut self.machines[index];
+        machine.attempt = 0;
+        // L'essai programmé tombe : celui-ci le remplace.
+        machine.retry = None;
+        if machine.status != MachineStatus::Connected {
+            machine.status = MachineStatus::Connecting;
+        }
+        self.connect_machine(connection, window, cx);
+        cx.notify();
+    }
+
+    /// Le menu « ··· » de l'en-tête d'une machine distante. « Ouvrir un terminal » viendra avec le volet Terminal distant.
+    pub(crate) fn open_machine_menu(
+        &mut self,
+        connection: String,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let retry = connection.clone();
+        let spec = MenuSpec {
+            title: None,
+            entries: vec![
+                MenuEntry::Item(MenuItemSpec::new("Réessayer", move |this, window, cx| {
+                    this.retry_machine(&retry, window, cx);
+                })),
+                MenuEntry::Item(MenuItemSpec::new(
+                    "Réglages de la machine",
+                    |this, window, cx| this.open_settings_on(Some(Section::Machines), window, cx),
+                )),
+            ],
+        };
+        self.open_menu(position, spec, window, cx);
     }
 
     /// Clic sur le chevron de la section « Bouillon de neurones » : la plie ou la déplie, comme un projet.

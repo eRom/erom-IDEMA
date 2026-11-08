@@ -131,6 +131,9 @@ impl SlotPool {
 pub struct RemoteMachine {
     pub entry: RemoteMachineEntry,
     pub status: MachineStatus,
+    /// La cause du dernier échec de connexion, gardée pendant l'essai suivant (`Connecting`) pour que la barre ne la
+    /// perde pas à chaque tentative ; effacée par une connexion réussie.
+    pub last_failure: Option<RemoteFailure>,
     pub facts: Option<MachineFacts>,
     /// Le nombre d'essais de connexion depuis le dernier succès (indice de `retry_delay`).
     pub attempt: u32,
@@ -152,11 +155,22 @@ pub struct RemoteMachine {
 }
 
 impl RemoteMachine {
+    /// Ce que la barre dit d'une machine qui ne répond pas : l'échec en cours, ou celui du dernier essai tant que le
+    /// suivant est en vol. Rien pour une machine connectée, ni pour une première connexion.
+    pub fn failure(&self) -> Option<&RemoteFailure> {
+        match &self.status {
+            MachineStatus::Failed(failure) => Some(failure),
+            MachineStatus::Connecting => self.last_failure.as_ref(),
+            MachineStatus::Connected => None,
+        }
+    }
+
     /// Une machine qui vient d'être déclarée : elle se connecte.
     pub fn new(entry: RemoteMachineEntry) -> Self {
         Self {
             entry,
             status: MachineStatus::Connecting,
+            last_failure: None,
             facts: None,
             attempt: 0,
             pool: None,
@@ -189,6 +203,26 @@ mod tests {
 
     fn slot_of(lease: &Lease) -> u8 {
         lease.server.remote_spec().unwrap().slot
+    }
+
+    #[test]
+    fn a_reconnecting_machine_keeps_its_last_failure() {
+        let mut machine = RemoteMachine::new(RemoteMachineEntry {
+            label: "Dell".into(),
+            connection: "dell-lan".into(),
+        });
+        // Première connexion : rien à dire.
+        assert_eq!(machine.failure(), None);
+        machine.status = MachineStatus::Failed(RemoteFailure::Unreachable);
+        machine.last_failure = Some(RemoteFailure::Unreachable);
+        assert_eq!(machine.failure(), Some(&RemoteFailure::Unreachable));
+        // L'essai suivant est en vol : la cause reste affichée.
+        machine.status = MachineStatus::Connecting;
+        assert_eq!(machine.failure(), Some(&RemoteFailure::Unreachable));
+        // Connectée : plus d'échec.
+        machine.status = MachineStatus::Connected;
+        machine.last_failure = None;
+        assert_eq!(machine.failure(), None);
     }
 
     #[test]

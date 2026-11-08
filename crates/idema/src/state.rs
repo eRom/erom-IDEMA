@@ -57,6 +57,10 @@ pub struct UiState {
     /// La section « Bouillon de neurones » est repliée dans la barre. Un état écrit avant ce champ se lit sans lui.
     #[serde(default)]
     pub ideation_collapsed: bool,
+    /// Les machines repliées dans la barre, par clé (`LOCAL_MACHINE` pour Localhost, sinon la connexion). Un état écrit
+    /// avant ce champ se lit sans lui : aucune machine repliée.
+    #[serde(default)]
+    pub collapsed_machines: Vec<String>,
     /// Grille ou liste de la galerie Artifacts. Une valeur illisible se lit « grille », sans rien casser d'autre.
     #[serde(default, deserialize_with = "lenient_or_default")]
     pub artifacts_layout: ArtifactsLayout,
@@ -119,6 +123,7 @@ impl Default for UiState {
             changes_list_width: None,
             changes_list_hidden: false,
             ideation_collapsed: false,
+            collapsed_machines: Vec::new(),
             artifacts_layout: ArtifactsLayout::default(),
             artifacts_filter: KindFilter::default(),
         }
@@ -194,6 +199,18 @@ impl State {
         self.ui.expanded.retain(|p| p != path);
         if expanded {
             self.ui.expanded.push(path.to_path_buf());
+        }
+    }
+
+    /// La machine `key` est-elle repliée dans la barre ?
+    pub fn is_machine_collapsed(&self, key: &str) -> bool {
+        self.ui.collapsed_machines.iter().any(|kept| kept == key)
+    }
+
+    pub fn set_machine_collapsed(&mut self, key: &str, collapsed: bool) {
+        self.ui.collapsed_machines.retain(|kept| kept != key);
+        if collapsed {
+            self.ui.collapsed_machines.push(key.to_owned());
         }
     }
 }
@@ -663,5 +680,37 @@ mod tests {
         assert_eq!(again.state.ui.panel_width, Some(512.));
         assert_eq!(again.state.ui.files_tree_width, Some(262.5));
         assert_eq!(again.state, store.state);
+    }
+
+    #[test]
+    fn collapsed_machines_round_trip() {
+        let dir = temp_dir("collapsed-machines");
+        let path = dir.join("state.json");
+        let mut store = StateStore::load(&path).unwrap();
+        assert!(store.state.ui.collapsed_machines.is_empty());
+        store.state.ui.collapsed_machines = vec!["local".into(), "dell-lan".into()];
+        store.save().unwrap();
+        let again = StateStore::load(&path).unwrap();
+        assert_eq!(again.state.ui.collapsed_machines, ["local", "dell-lan"]);
+        assert_eq!(again.state, store.state);
+        // Un `state.json` d'avant les machines se lit sans le champ, sans partir en `.bak`.
+        let old = r#"{"version":1,"projects":[],"ui":{"sidebar_visible":true,"expanded":[],"selected_session":null}}"#;
+        std::fs::write(&path, old).unwrap();
+        let store = StateStore::load(&path).unwrap();
+        assert_eq!(store.notice, None);
+        assert!(store.state.ui.collapsed_machines.is_empty());
+        assert!(!dir.join("state.json.bak").exists());
+    }
+
+    #[test]
+    fn a_machine_collapses_and_expands_by_key() {
+        let mut state = State::default();
+        assert!(!state.is_machine_collapsed("dell-lan"));
+        state.set_machine_collapsed("dell-lan", true);
+        state.set_machine_collapsed("dell-lan", true);
+        assert!(state.is_machine_collapsed("dell-lan"));
+        assert_eq!(state.ui.collapsed_machines, ["dell-lan"]);
+        state.set_machine_collapsed("dell-lan", false);
+        assert!(!state.is_machine_collapsed("dell-lan"));
     }
 }

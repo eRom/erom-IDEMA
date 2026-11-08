@@ -1,5 +1,7 @@
 //! Les sessions des machines : qualification d'un listage par sa machine, aiguillage d'une clé, et clés d'une machine.
 
+use std::collections::HashMap;
+
 use idema_tmux::server::{ListedPane, ListedSession};
 
 use super::key::{SessionTarget, machine_of, remote_session_key, split_session_key};
@@ -27,6 +29,27 @@ pub fn qualify_listing(
         })
         .collect();
     (sessions, panes)
+}
+
+/// Les noms des agents qui tournent dans les panes de chaque session (clés déjà qualifiées) : `@idema_agent`, sinon
+/// `@idnma_agent` du pane, sans doublon, dans l'ordre des panes. Une session sans agent n'a pas d'entrée.
+pub fn pane_agent_names(panes: &[ListedPane]) -> HashMap<String, Vec<String>> {
+    let mut names: HashMap<String, Vec<String>> = HashMap::new();
+    for pane in panes {
+        let name = if pane.agent.is_empty() {
+            &pane.idnma_agent
+        } else {
+            &pane.agent
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let kept = names.entry(pane.session.clone()).or_default();
+        if !kept.contains(name) {
+            kept.push(name.clone());
+        }
+    }
+    names
 }
 
 /// Où part une commande sur une session : le tmux du Mac (le nom est la clé) ou celui d'une machine.
@@ -130,5 +153,26 @@ mod tests {
             [remote_session_key("dell-lan", "a")]
         );
         assert!(machine_keys(keys.into_iter(), "inconnue").is_empty());
+    }
+
+    #[test]
+    fn pane_agent_names_prefer_the_idema_agent_and_dedupe_per_session() {
+        let key = |name: &str| remote_session_key("dell-lan", name);
+        let tagged = |session: &str, id: u32, agent: &str, idnma: &str| ListedPane {
+            agent: agent.into(),
+            idnma_agent: idnma.into(),
+            ..pane(&key(session), id)
+        };
+        let panes = [
+            tagged("a", 0, "Claude", "sonnet"),
+            tagged("a", 1, "", "glm"),
+            tagged("a", 2, "", "glm"),
+            tagged("a", 3, "", ""),
+            tagged("b", 4, "", ""),
+        ];
+        let names = pane_agent_names(&panes);
+        assert_eq!(names[&key("a")], ["Claude", "glm"]);
+        // Une session sans agent n'a pas d'entrée.
+        assert!(!names.contains_key(&key("b")));
     }
 }

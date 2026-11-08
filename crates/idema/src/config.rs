@@ -406,7 +406,6 @@ impl Config {
     }
 
     /// Le nom de Localhost : `local_label`, sinon « Localhost ».
-    #[allow(dead_code)] // Lu par les tâches suivantes.
     pub fn local_machine_label(&self) -> &str {
         self.machines
             .as_ref()

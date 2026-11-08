@@ -53,6 +53,22 @@ pub fn navigation_order<'a>(
     ideation_sessions.chain(in_projects).collect()
 }
 
+/// L'ordre du clavier avec les machines : Localhost d'abord (`local`, sauf s'il est replié), puis chaque machine distante
+/// dans l'ordre de la config. Une machine repliée est sautée. `machines` : (clé, repliée, clés de ses sessions).
+pub fn machine_navigation_order(
+    local: Vec<String>,
+    machines: &[(String, bool, Vec<String>)],
+    local_collapsed: bool,
+) -> Vec<String> {
+    let mut order = if local_collapsed { Vec::new() } else { local };
+    for (_, collapsed, keys) in machines {
+        if !collapsed {
+            order.extend(keys.iter().cloned());
+        }
+    }
+    order
+}
+
 /// `⌘1` à `⌘9` : `index` part de 0.
 pub fn nth_session<'a>(order: &[&'a str], index: usize) -> Option<&'a str> {
     order.get(index).copied()
@@ -403,5 +419,40 @@ mod tests {
         use ActivityState::*;
         assert_eq!(badge_count([Idle, Waiting, Running, Error, Waiting]), 3);
         assert_eq!(badge_count([Idle, Running]), 0);
+    }
+
+    #[test]
+    fn the_order_skips_collapsed_machines() {
+        let keys = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let machines = vec![
+            ("caserne-claude".to_owned(), false, keys(&["k1", "k2"])),
+            ("dell-lan".to_owned(), true, keys(&["k3"])),
+        ];
+        assert_eq!(
+            machine_navigation_order(keys(&["a"]), &machines, false),
+            ["a", "k1", "k2"]
+        );
+        assert_eq!(
+            machine_navigation_order(keys(&["a"]), &machines, true),
+            ["k1", "k2"]
+        );
+    }
+
+    #[test]
+    fn a_machine_session_never_matches_a_project() {
+        // Une session distante n'a pas de projet du Mac : elle ne sort que par sa machine.
+        let remote = SessionSummary {
+            machine: Some("dell-lan".into()),
+            project: PathBuf::new(),
+            ..session("k1", "", 1)
+        };
+        let sessions = vec![session("a", "/a", 2), remote];
+        let order = navigation_order(&[PathBuf::from("/a")], |_| true, false, &sessions);
+        assert_eq!(order, ["a"]);
     }
 }

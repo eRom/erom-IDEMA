@@ -6,13 +6,18 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, BoxShadow, ClickEvent, Context, Div, FontWeight, MouseButton, MouseDownEvent,
-    Pixels, Rgba, Window, canvas, div, img, point, prelude::*, px, svg,
+    App, Bounds, BoxShadow, ClickEvent, Context, Div, ElementId, FontWeight, MouseButton,
+    MouseDownEvent, Pixels, Point, Rgba, Stateful, Window, canvas, div, img, point, prelude::*, px,
+    svg,
 };
 use idema_term::activity::ActivityState;
 
 use crate::assets::logo_path;
 use crate::config::AgentEntry;
+use crate::machines::idnma::IdnmaAgentInfo;
+use crate::machines::key::LOCAL_MACHINE;
+use crate::machines::probe::RemoteFailure;
+use crate::machines::registry::MachineStatus;
 
 use crate::assets::Icon;
 use crate::errors::{Explained, explain_config};
@@ -33,6 +38,8 @@ pub const SIDEBAR_WIDTH: f32 = 248.;
 pub const TITLE_BAND: f32 = 52.;
 /// Bord de la pastille de repos : 32 % dans la maquette. Une pastille n'est pas un texte, le plancher de 55 % ne s'y applique pas.
 const DOT_IDLE: f32 = 0.32;
+/// Anneau de la pastille de connexion d'une machine non connectée : blanc 30 % dans la maquette.
+const CONNECTION_OFF: f32 = 0.30;
 /// Opacité du halo de la pastille « en cours » : `rgba(48,209,88,0.16)` dans la maquette.
 const RUNNING_HALO: f32 = 0.16;
 
@@ -45,6 +52,16 @@ pub fn render_sidebar(
     let theme = *theme;
     let state = workspace.state();
     let workspace_entity = cx.entity();
+
+    // Avec au moins une machine distante, Localhost devient une section parmi d'autres ; sans, la barre ne change pas.
+    let remote = !workspace.machines.is_empty();
+    let local_collapsed = workspace.local_collapsed();
+    let local_sessions: Vec<ActivityState> = workspace
+        .entries
+        .iter()
+        .filter(|entry| !entry.summary.ideation && entry.summary.machine.is_none())
+        .map(|entry| entry.summary.state)
+        .collect();
 
     let mut projects = div().flex().flex_col().gap(px(1.));
     for (index, entry) in state.ordered_projects().into_iter().enumerate() {
@@ -211,6 +228,62 @@ pub fn render_sidebar(
     // Les bornes du bouton « … » de la légende, écrites à la préparation de la peinture et lues au clic.
     let menu_button: Rc<Cell<Bounds<Pixels>>> = Rc::default();
     let menu_button_writer = menu_button.clone();
+    let projects_legend = div()
+        .flex()
+        .items_center()
+        .h(theme.px(26.))
+        .pl(theme.px(8.))
+        .pr(theme.px(4.))
+        .text_size(theme.text(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(white(TEXT_MIN))
+        .child(div().flex_1().child("Projets"))
+        .child(
+            div()
+                .id("projects-menu")
+                .relative()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(theme.px(22.))
+                .rounded(theme.px(5.))
+                .cursor_pointer()
+                .hover(|style| style.bg(white(BUTTON_HOVER)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                        // Le menu s'ouvre sous le bouton (bord gauche, juste en dessous) : il ne le
+                        // recouvre pas, un second clic au même point tombe sur le fond et le ferme.
+                        let button = menu_button.get();
+                        let anchor = point(button.left(), button.bottom() + theme.px(4.));
+                        this.open_projects_menu(anchor, window, cx);
+                    }),
+                )
+                // Mesure le bouton à la préparation de la peinture, pour que son menu s'y ancre.
+                .child(
+                    canvas(
+                        move |bounds, _, _| menu_button_writer.set(bounds),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .child(
+                    svg()
+                        .path(Icon::MoreHoriz.path())
+                        .size(theme.px(16.))
+                        .text_color(white(TEXT_MIN)),
+                ),
+        );
+    let legend = if remote {
+        local_header(workspace, &theme, local_collapsed, local_sessions, cx).into_any_element()
+    } else {
+        projects_legend.into_any_element()
+    };
+    let machines: Vec<_> = (0..workspace.machines.len())
+        .map(|index| machine_section(workspace, index, &theme, cx))
+        .collect();
     let list = div()
         .id("sidebar-list")
         .flex_1()
@@ -224,58 +297,9 @@ pub fn render_sidebar(
                 .pt(theme.px(22.))
                 .px(theme.px(10.))
                 .children(ideation)
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .h(theme.px(26.))
-                        .pl(theme.px(8.))
-                        .pr(theme.px(4.))
-                        .text_size(theme.text(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(white(TEXT_MIN))
-                        .child(div().flex_1().child("Projets"))
-                        .child(
-                            div()
-                                .id("projects-menu")
-                                .relative()
-                                .flex()
-                                .flex_none()
-                                .items_center()
-                                .justify_center()
-                                .size(theme.px(22.))
-                                .rounded(theme.px(5.))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(white(BUTTON_HOVER)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                        // Le menu s'ouvre sous le bouton (bord gauche, juste en dessous) : il ne le
-                                        // recouvre pas, un second clic au même point tombe sur le fond et le ferme.
-                                        let button = menu_button.get();
-                                        let anchor =
-                                            point(button.left(), button.bottom() + theme.px(4.));
-                                        this.open_projects_menu(anchor, window, cx);
-                                    }),
-                                )
-                                // Mesure le bouton à la préparation de la peinture, pour que son menu s'y ancre.
-                                .child(
-                                    canvas(
-                                        move |bounds, _, _| menu_button_writer.set(bounds),
-                                        |_, _, _, _| {},
-                                    )
-                                    .absolute()
-                                    .size_full(),
-                                )
-                                .child(
-                                    svg()
-                                        .path(Icon::MoreHoriz.path())
-                                        .size(theme.px(16.))
-                                        .text_color(white(TEXT_MIN)),
-                                ),
-                        ),
-                )
-                .child(projects)
+                .child(legend)
+                .children((!local_collapsed).then_some(projects))
+                .children(machines)
                 .children(notice.map(|text| {
                     div()
                         .px(theme.px(8.))
@@ -515,6 +539,259 @@ fn ideation_section(
         .child(block)
 }
 
+/// Le chevron d'un en-tête de machine, qui plie ou déplie.
+fn machine_chevron(theme: &Theme, expanded: bool) -> impl IntoElement {
+    svg()
+        .path(if expanded {
+            Icon::ExpandMore.path()
+        } else {
+            Icon::ChevronRight.path()
+        })
+        .size(theme.px(16.))
+        .text_color(white(ICON_MUTED))
+}
+
+/// Ce que porte une machine repliée à droite : la pastille de sa session la plus urgente et leur nombre (comme un
+/// projet replié) ; rien sans session.
+fn collapsed_summary(theme: &Theme, states: &[ActivityState]) -> Option<Div> {
+    let dot = collapsed_project_dot(states.iter().copied())?;
+    Some(
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(theme.px(6.))
+            .pr(theme.px(4.))
+            .text_size(theme.text(11.))
+            .font_weight(FontWeight::NORMAL)
+            .text_color(white(TEXT_MIN))
+            .child(state_dot(theme, dot))
+            .child(states.len().to_string()),
+    )
+}
+
+/// Le bouton « ··· » d'un en-tête de machine : il ouvre son menu sous lui (bord gauche, juste en dessous) sans
+/// replier l'en-tête.
+fn header_menu_button(
+    theme: &Theme,
+    id: impl Into<ElementId>,
+    cx: &mut Context<Workspace>,
+    open: impl Fn(&mut Workspace, Point<Pixels>, &mut Window, &mut Context<Workspace>) + 'static,
+) -> impl IntoElement {
+    let theme = *theme;
+    let bounds: Rc<Cell<Bounds<Pixels>>> = Rc::default();
+    let writer = bounds.clone();
+    div()
+        .id(id)
+        .relative()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(theme.px(22.))
+        .rounded(theme.px(5.))
+        .cursor_pointer()
+        .hover(|style| style.bg(white(BUTTON_HOVER)))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            cx.stop_propagation();
+            let button = bounds.get();
+            open(
+                this,
+                point(button.left(), button.bottom() + theme.px(4.)),
+                window,
+                cx,
+            );
+        }))
+        .child(
+            canvas(move |area, _, _| writer.set(area), |_, _, _, _| {})
+                .absolute()
+                .size_full(),
+        )
+        .child(
+            svg()
+                .path(Icon::MoreHoriz.path())
+                .size(theme.px(16.))
+                .text_color(white(TEXT_MIN)),
+        )
+}
+
+/// Le gabarit d'un en-tête de machine : la légende « Projets » (11/600), chevron en tête, un clic plie ou déplie.
+fn machine_header(
+    theme: &Theme,
+    id: impl Into<ElementId>,
+    key: String,
+    cx: &mut Context<Workspace>,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(theme.px(6.))
+        .h(theme.px(26.))
+        .pl(theme.px(4.))
+        .pr(theme.px(4.))
+        .rounded(theme.px(6.))
+        .text_size(theme.text(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(white(TEXT_MIN))
+        .cursor_pointer()
+        .hover(|style| style.bg(white(HOVER)))
+        .on_click(cx.listener(move |this, _, _window, cx| {
+            this.toggle_machine(&key, cx);
+        }))
+}
+
+/// L'en-tête de Localhost quand il y a des machines distantes : son label (`[machines] local_label`), replié ou non.
+/// Déplié, « ··· » ouvre le menu « Ouvrir un projet » de l'ancienne légende ; replié, le résumé de ses sessions le remplace.
+fn local_header(
+    workspace: &Workspace,
+    theme: &Theme,
+    collapsed: bool,
+    states: Vec<ActivityState>,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let right = if collapsed {
+        collapsed_summary(theme, &states).map(IntoElement::into_any_element)
+    } else {
+        Some(
+            header_menu_button(theme, "local-menu", cx, |this, anchor, window, cx| {
+                this.open_projects_menu(anchor, window, cx);
+            })
+            .into_any_element(),
+        )
+    };
+    machine_header(theme, "local-machine", LOCAL_MACHINE.to_owned(), cx)
+        .child(machine_chevron(theme, !collapsed))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(workspace.local_machine_label().to_owned()),
+        )
+        .children(right)
+}
+
+/// La pastille de connexion de 7 px : pleine `#30D158` connectée, anneau blanc 30 % sinon.
+fn connection_dot(theme: &Theme, connected: bool) -> Div {
+    let dot = div().flex_none().size(theme.px(7.)).rounded_full();
+    if connected {
+        dot.bg(color(RUNNING))
+    } else {
+        dot.border(px(1.5)).border_color(white(CONNECTION_OFF))
+    }
+}
+
+/// La ligne d'une machine en échec : sa cause, avec une majuscule, puis « Réessayer ».
+pub(crate) fn failure_line(failure: &RemoteFailure) -> String {
+    let cause = failure.short();
+    let mut chars = cause.chars();
+    let head: String = chars
+        .next()
+        .into_iter()
+        .flat_map(char::to_uppercase)
+        .collect();
+    format!("{head}{} · Réessayer", chars.as_str())
+}
+
+/// Une machine distante : son en-tête (chevron, pastille de connexion, label, « ··· » ou résumé), puis, dépliée, ses
+/// sessions à plat, « Aucune session » si elle est connectée sans session, ou la ligne de sa cause d'échec.
+fn machine_section(
+    workspace: &Workspace,
+    index: usize,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let theme = *theme;
+    let machine = &workspace.machines[index];
+    let connection = machine.entry.connection.clone();
+    let collapsed = workspace.state().is_machine_collapsed(&connection);
+    let rows: Vec<usize> = (0..workspace.entries.len())
+        .filter(|at| workspace.entries[*at].summary.machine.as_deref() == Some(connection.as_str()))
+        .collect();
+    let failure = machine.failure().cloned();
+    let right = if collapsed {
+        match &failure {
+            Some(failure) => Some(
+                div()
+                    .flex_none()
+                    .pr(theme.px(4.))
+                    .font_weight(FontWeight::NORMAL)
+                    .child(failure.short())
+                    .into_any_element(),
+            ),
+            None => {
+                let states: Vec<ActivityState> = rows
+                    .iter()
+                    .map(|at| workspace.entries[*at].summary.state)
+                    .collect();
+                collapsed_summary(&theme, &states).map(IntoElement::into_any_element)
+            }
+        }
+    } else {
+        let target = connection.clone();
+        Some(
+            header_menu_button(
+                &theme,
+                ("machine-menu", index),
+                cx,
+                move |this, anchor, window, cx| {
+                    this.open_machine_menu(target.clone(), anchor, window, cx);
+                },
+            )
+            .into_any_element(),
+        )
+    };
+    let header = machine_header(&theme, ("machine", index), connection.clone(), cx)
+        .child(machine_chevron(&theme, !collapsed))
+        .child(connection_dot(
+            &theme,
+            machine.status == MachineStatus::Connected,
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(machine.entry.label.clone()),
+        )
+        .children(right);
+    let mut block = div().flex().flex_col().gap(px(1.)).child(header);
+    if !collapsed {
+        let empty = rows.is_empty();
+        for at in rows {
+            block = block.child(session_row(workspace, at, &theme, cx));
+        }
+        match failure {
+            Some(failure) => {
+                let target = connection;
+                block = block.child(
+                    div()
+                        .id(("machine-failure", index))
+                        .flex()
+                        .items_center()
+                        .h(theme.px(28.))
+                        .pl(theme.px(18.))
+                        .rounded(theme.px(6.))
+                        .text_size(theme.text(12.))
+                        .text_color(white(TEXT_MIN))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(white(HOVER)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.retry_machine(&target, window, cx);
+                        }))
+                        .child(failure_line(&failure)),
+                );
+            }
+            None if empty && machine.status == MachineStatus::Connected => {
+                block = block.child(no_session_line(&theme));
+            }
+            None => {}
+        }
+    }
+    block.pt(theme.px(10.))
+}
+
 /// Pastille d'état de 9 (maquette, « Pastille d'état 9 px ») : anneau blanc au repos, plein et haloté en cours,
 /// jaune quand la session attend, rouge en erreur.
 pub(crate) fn state_dot(theme: &Theme, state: ActivityState) -> Div {
@@ -554,6 +831,25 @@ pub(crate) fn agent_marks(names: &[String], launchers: &[AgentEntry]) -> Vec<Age
             .iter()
             .find(|entry| &entry.name == name)
             .and_then(|entry| logo_path(&entry.icon_name()))
+            .map_or_else(|| AgentMark::Name(name.clone()), AgentMark::Logo);
+        if !marks.contains(&mark) {
+            marks.push(mark);
+        }
+    }
+    marks
+}
+
+/// Les marques des agents `names` d'une session distante : le logo de l'`avatar` de l'agent dans le `~/.idnma.yml` de sa
+/// machine, sinon le logo de son nom en minuscules (la règle locale), sinon son nom. Dédoublonné comme `agent_marks`.
+pub(crate) fn remote_agent_marks(names: &[String], agents: &[IdnmaAgentInfo]) -> Vec<AgentMark> {
+    let mut marks = Vec::new();
+    for name in names {
+        let mark = agents
+            .iter()
+            .find(|agent| &agent.key == name)
+            .and_then(|agent| agent.avatar.as_deref())
+            .and_then(|avatar| logo_path(&avatar.to_lowercase()))
+            .or_else(|| logo_path(&name.to_lowercase()))
             .map_or_else(|| AgentMark::Name(name.clone()), AgentMark::Logo);
         if !marks.contains(&mark) {
             marks.push(mark);
@@ -762,6 +1058,56 @@ mod tests {
                 AgentMark::Name("Maison".into()),
                 AgentMark::Name("Disparu".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn remote_marks_use_the_avatar() {
+        let agent = |key: &str, avatar: Option<&str>| IdnmaAgentInfo {
+            key: key.into(),
+            label: None,
+            avatar: avatar.map(str::to_string),
+        };
+        let agents = [
+            agent("sonnet", Some("claude")),
+            agent("opus", Some("claude")),
+            agent("glm", Some("glm")),
+        ];
+        let names = ["sonnet", "opus", "glm", "mystery"].map(String::from);
+        assert_eq!(
+            remote_agent_marks(&names, &agents),
+            [
+                AgentMark::Logo(logo_path("claude").unwrap()),
+                AgentMark::Logo(logo_path("glm").unwrap()),
+                AgentMark::Name("mystery".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_remote_agent_without_avatar_falls_back_to_the_local_rule() {
+        let agents = [IdnmaAgentInfo {
+            key: "Claude".into(),
+            label: None,
+            avatar: None,
+        }];
+        // Sans avatar : le nom en minuscules ; sans fichier d'agents de la machine : pareil.
+        let names = ["Claude".to_string()];
+        let expected = [AgentMark::Logo(logo_path("claude").unwrap())];
+        assert_eq!(remote_agent_marks(&names, &agents), expected);
+        assert_eq!(remote_agent_marks(&names, &[]), expected);
+    }
+
+    #[test]
+    fn a_failed_machine_line_names_the_cause_with_a_capital() {
+        use crate::machines::probe::RemoteFailure;
+        assert_eq!(
+            failure_line(&RemoteFailure::Unreachable),
+            "Injoignable · Réessayer"
+        );
+        assert_eq!(
+            failure_line(&RemoteFailure::AuthRefused),
+            "Authentification refusée · Réessayer"
         );
     }
 }

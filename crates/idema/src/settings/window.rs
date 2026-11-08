@@ -7,6 +7,7 @@ use gpui::{
     WindowOptions, point, px, size,
 };
 
+use super::nav::Section;
 use super::view::SettingsView;
 use crate::hud;
 use crate::workspace::Workspace;
@@ -22,13 +23,14 @@ pub struct SettingsWindow(Option<WindowHandle<SettingsView>>);
 impl Global for SettingsWindow {}
 
 /// `⌘,`, la ligne « Personnaliser » et le menu : ramène la fenêtre vivante au premier plan, sinon en ouvre une neuve sur
-/// « Général ». `workspace` est la fenêtre principale, que « Éditer config.toml » pilote ; `main` est sa vue, que la
+/// « Général ». `section`, quand elle est donnée, est celle qu'on affiche dans les deux cas. `workspace` est la fenêtre principale, que « Éditer config.toml » pilote ; `main` est sa vue, que la
 /// fenêtre observe (la fenêtre principale est en pleine mise à jour quand `⌘,` arrive : on ne peut pas l'y relire).
 pub fn open_or_focus(
     workspace: WindowHandle<Workspace>,
     main: Entity<Workspace>,
     system_enabled: bool,
     config_path: PathBuf,
+    section: Option<Section>,
     cx: &mut App,
 ) {
     let open = cx
@@ -36,7 +38,12 @@ pub fn open_or_focus(
         .and_then(|global| global.0);
     if let Some(handle) = open
         && handle
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |view, window, cx| {
+                window.activate_window();
+                if let Some(section) = section {
+                    view.select(section, cx);
+                }
+            })
             .is_ok()
     {
         return;
@@ -56,7 +63,14 @@ pub fn open_or_focus(
             ..Default::default()
         },
         |window, cx| {
-            cx.new(|cx| SettingsView::new(workspace, main, system_enabled, config_path, window, cx))
+            cx.new(|cx| {
+                let mut view =
+                    SettingsView::new(workspace, main, system_enabled, config_path, window, cx);
+                if let Some(section) = section {
+                    view.select(section, cx);
+                }
+                view
+            })
         },
     );
     match opened {
