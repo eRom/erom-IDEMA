@@ -180,6 +180,31 @@ pub fn control_dir(idema_home: &Path, uid: u32) -> PathBuf {
     PathBuf::from(format!("/tmp/idema-{uid}-{:08x}", hash >> 32))
 }
 
+/// Les seules variables du processus que ssh reçoit.
+pub const SSH_ENV: [&str; 6] = ["HOME", "USER", "LOGNAME", "PATH", "SSH_AUTH_SOCK", "LANG"];
+
+/// La machine de la sonde : canal 0, dossier de contrôle de cette instance, et pour seul environnement les variables de
+/// `SSH_ENV` que `var` connaît (`home` et `shell` distants sont inconnus tant qu'on ne les a pas sondés). Les réglages
+/// (« Tester ») et les sessions s'en servent tous deux : ils partagent ainsi le maître `%C-0`.
+pub fn probe_spec(
+    connection: &str,
+    idema_home: &Path,
+    uid: u32,
+    var: impl Fn(&str) -> Option<String>,
+) -> RemoteSpec {
+    RemoteSpec {
+        destination: connection.to_string(),
+        control_dir: control_dir(idema_home, uid),
+        slot: 0,
+        ssh_env: SSH_ENV
+            .iter()
+            .filter_map(|name| var(name).map(|value| ((*name).to_string(), value)))
+            .collect(),
+        home: String::new(),
+        shell: String::new(),
+    }
+}
+
 /// Crée le dossier de contrôle en 0700, ou vérifie celui qui existe : il doit appartenir à l'utilisateur courant et
 /// n'être ouvert ni au groupe ni aux autres (sinon un tiers pourrait détourner un maître ssh).
 pub fn ensure_control_dir(dir: &Path) -> io::Result<()> {

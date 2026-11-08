@@ -1,7 +1,8 @@
 //! Le registre des machines distantes et le pool de maîtres ssh de chacune.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use gpui::Task;
 use idema_tmux::remote::RemoteSpec;
 use idema_tmux::server::TmuxServer;
 
@@ -24,7 +25,17 @@ pub enum MachineStatus {
 pub struct Lease {
     pub server: Arc<TmuxServer>,
     /// Compté par `Arc::strong_count` : sa disparition libère le canal.
-    token: Arc<()>,
+    _token: Arc<()>,
+}
+
+impl Lease {
+    /// Un bail hors pool : une session locale n'a aucun maître ssh à compter.
+    pub fn unpooled(server: Arc<TmuxServer>) -> Self {
+        Self {
+            server,
+            _token: Arc::new(()),
+        }
+    }
 }
 
 /// Un maître ssh : le serveur qui l'ouvre et le jeton que ses baux se partagent.
@@ -86,7 +97,7 @@ impl SlotPool {
         let master = &self.masters[index];
         Lease {
             server: Arc::clone(&master.server),
-            token: Arc::clone(&master.token),
+            _token: Arc::clone(&master.token),
         }
     }
 
@@ -96,6 +107,7 @@ impl SlotPool {
         Arc::clone(&self.brief)
     }
 
+    #[cfg(test)]
     pub fn slots(&self) -> usize {
         self.masters.len()
     }
@@ -123,6 +135,40 @@ pub struct RemoteMachine {
     /// Le nombre d'essais de connexion depuis le dernier succès (indice de `retry_delay`).
     pub attempt: u32,
     pub pool: Option<SlotPool>,
+    /// Un sondage de connexion est en vol : un second n'est pas lancé tant que le premier n'a pas rendu.
+    pub probing: bool,
+    /// Une relecture des sessions est en vol (au plus une par machine : un canal bref, jamais empilé).
+    pub refreshing: bool,
+    /// Une relecture a été demandée pendant la précédente : elle repart dès que celle-ci a rendu.
+    pub refresh_again: bool,
+    /// Les relectures de suite qui ont échoué : la connexion est tenue pour perdue au troisième échec.
+    pub refresh_failures: u8,
+    /// Le second canal bref : les commandes ponctuelles (fermer, renommer, `has-session`) passent une à une.
+    pub adhoc: Arc<Mutex<()>>,
+    /// La relecture toutes les 2 s tant que la machine est connectée.
+    pub poll: Option<Task<()>>,
+    /// Le prochain essai de connexion, après `retry_delay`.
+    pub retry: Option<Task<()>>,
+}
+
+impl RemoteMachine {
+    /// Une machine qui vient d'être déclarée : elle se connecte.
+    pub fn new(entry: RemoteMachineEntry) -> Self {
+        Self {
+            entry,
+            status: MachineStatus::Connecting,
+            facts: None,
+            attempt: 0,
+            pool: None,
+            probing: false,
+            refreshing: false,
+            refresh_again: false,
+            refresh_failures: 0,
+            adhoc: Arc::new(Mutex::new(())),
+            poll: None,
+            retry: None,
+        }
+    }
 }
 
 #[cfg(test)]

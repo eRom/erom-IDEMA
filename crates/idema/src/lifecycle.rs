@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use idema_tmux::server::ListedSession;
 
+use crate::machines::sessions::machine_keys;
+
 /// Combien d'essais de reconnexion avant « Session injoignable ».
 pub(crate) const REATTACH_ATTEMPTS: u8 = 3;
 
@@ -82,6 +84,20 @@ pub(crate) fn session_sync(
     SessionSync { added, gone }
 }
 
+/// `session_sync` d'une seule machine : `entries` et `snapshot` portent les clés de toutes, seules celles de `machine`
+/// comptent. Un listage ne parle que de sa machine : sans ce filtre, il déclarerait « disparues » les sessions des autres.
+pub(crate) fn machine_sync(
+    machine: &str,
+    entries: &[String],
+    snapshot: &[String],
+    pending: &[(PathBuf, String)],
+    listed: &[ListedSession],
+) -> SessionSync {
+    let known = machine_keys(entries.iter().map(String::as_str), machine);
+    let snapshot = machine_keys(snapshot.iter().map(String::as_str), machine);
+    session_sync(&known, &snapshot, pending, listed)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -90,7 +106,10 @@ mod tests {
 
     use idema_tmux::server::ListedSession;
 
-    use super::{AfterClose, REATTACH_ATTEMPTS, REATTACH_STABLE, after_close, session_sync};
+    use super::{
+        AfterClose, REATTACH_ATTEMPTS, REATTACH_STABLE, after_close, machine_sync, session_sync,
+    };
+    use crate::machines::key::{LOCAL_MACHINE, remote_session_key};
 
     #[test]
     fn a_session_gone_is_removed_whatever_the_count() {
@@ -203,5 +222,51 @@ mod tests {
         let sync = session_sync(&snapshot, &snapshot, &[], &listing);
         assert_eq!(sync.gone, names(&["idema-b"]));
         assert!(sync.added.is_empty());
+    }
+
+    #[test]
+    fn a_local_refresh_never_removes_remote_entries() {
+        let dell = remote_session_key("dell-lan", "testvpc");
+        let everything = names(&["idema-a", dell.as_str()]);
+        // Le listage local ne connaît aucune clé distante : sans le filtre de machine, `dell` serait « disparue ».
+        let local = [listed("idema-a", "/p", "Shell")];
+        let naive = session_sync(&everything, &everything, &[], &local);
+        assert_eq!(naive.gone, names(&[dell.as_str()]));
+        let sync = machine_sync(LOCAL_MACHINE, &everything, &everything, &[], &local);
+        assert!(sync.gone.is_empty());
+        assert!(sync.added.is_empty());
+    }
+
+    #[test]
+    fn a_machine_refresh_never_removes_local_or_other_machines_entries() {
+        let dell = remote_session_key("dell-lan", "testvpc");
+        let caserne = remote_session_key("caserne-claude", "testvpc");
+        let everything = names(&["idema-a", dell.as_str(), caserne.as_str()]);
+        let mut listing = listed("testvpc", "", "testvpc");
+        listing.name = dell.clone();
+        // La machine répond avec sa seule session : ni la locale ni celle de l'autre machine ne sortent.
+        let sync = machine_sync(
+            "dell-lan",
+            &everything,
+            &everything,
+            &[],
+            &[listing.clone()],
+        );
+        assert!(sync.gone.is_empty());
+        assert!(sync.added.is_empty());
+        // Sa session disparue sort seule.
+        let sync = machine_sync("dell-lan", &everything, &everything, &[], &[]);
+        assert_eq!(sync.gone, names(&[dell.as_str()]));
+        // Une session neuve de la machine entre ; une déjà connue d'une autre machine ne la masque pas.
+        let mut fresh = listed("autre", "", "autre");
+        fresh.name = remote_session_key("dell-lan", "autre");
+        let sync = machine_sync(
+            "dell-lan",
+            &everything,
+            &everything,
+            &[],
+            &[listing, fresh.clone()],
+        );
+        assert_eq!(sync.added, names(&[fresh.name.as_str()]));
     }
 }

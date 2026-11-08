@@ -5,3 +5,4 @@ pub mod idnma;
 pub mod key;
 pub mod probe;
 pub mod registry;
+pub mod sessions;

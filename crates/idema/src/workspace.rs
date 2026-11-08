@@ -22,6 +22,7 @@ use idema_term::activity::{ActivityState, should_chime};
 use idema_term::emulator::GridSize;
 use idema_tmux::layout::Preset;
 use idema_tmux::protocol::PaneId;
+use idema_tmux::remote::RemoteSpec;
 use idema_tmux::server::{
     CreatedSession, ListedPane, ListedSession, NewSession as NewTmuxSession, RestorePane,
     RestoreSession, ServerError, TmuxServer,
@@ -73,7 +74,13 @@ use crate::ideation::{
     ToolbarItem, ideation_command, next_remote_name, remote_prefix, toolbar_items,
 };
 use crate::integrations;
-use crate::lifecycle::{AfterClose, REATTACH_ATTEMPTS, after_close, session_sync};
+use crate::lifecycle::{AfterClose, REATTACH_ATTEMPTS, after_close, machine_sync};
+use crate::machines::key::{LOCAL_MACHINE, SessionTarget, machine_of, split_session_key};
+use crate::machines::probe::{
+    MachineFacts, RemoteFailure, ensure_control_dir, probe, probe_spec, retry_delay,
+};
+use crate::machines::registry::{Lease, MachineStatus, RemoteMachine, SlotPool};
+use crate::machines::sessions::{Route, machine_keys, qualify_listing, route};
 use crate::pane_view::{PaneEvent, PaneView};
 use crate::popover::{
     MenuEntry, MenuItemSpec, MenuSpec, OpenMenu, Placement, SUBMENU_DELAY, hidden_panes_dot,
@@ -598,6 +605,10 @@ fn session_entries(sessions: &[ListedSession], panes: &[ListedPane]) -> Vec<Sess
             created: session.created,
             state: ActivityState::Idle,
             ideation: session.ideation,
+            machine: match split_session_key(&session.name) {
+                SessionTarget::Local(_) => None,
+                SessionTarget::Remote { connection, .. } => Some(connection.to_owned()),
+            },
         })
         .collect();
     sort_sessions(&mut summaries);
@@ -612,11 +623,14 @@ fn session_entries(sessions: &[ListedSession], panes: &[ListedPane]) -> Vec<Sess
                 .unwrap_or(first);
             let listed = sessions.iter().find(|session| session.name == summary.name);
             let preset = listed.map_or(Preset::Single, |session| preset_of(&session.layout));
+            let auto_layout = summary.machine.is_none()
+                || listed.is_some_and(|session| !session.layout.is_empty());
             Some(SessionEntry {
                 agent: tracked.agent.clone(),
                 remote_name: listed.map_or_else(String::new, |session| session.remote_name.clone()),
                 pane: tracked.pane,
                 preset,
+                auto_layout,
                 summary,
                 view: None,
                 attempts: 0,
@@ -626,6 +640,14 @@ fn session_entries(sessions: &[ListedSession], panes: &[ListedPane]) -> Vec<Sess
             })
         })
         .collect()
+}
+
+/// Une clé de session telle qu'elle figure au journal : le nom tmux en local, `<connexion>:<nom tmux>` sur une machine.
+fn key_label(key: &str) -> String {
+    match split_session_key(key) {
+        SessionTarget::Local(name) => name.to_owned(),
+        SessionTarget::Remote { connection, tmux } => format!("{connection}:{}", log_safe(tmux)),
+    }
 }
 
 /// Le résultat d'un amorçage dont le fil s'est arrêté sans répondre : un blocage de démarrage, pas une panique.
@@ -688,6 +710,13 @@ const SESSIONS_RECHECK: Duration = Duration::from_secs(1);
 /// (mesuré à la porte du jalon 4b : avec 2 s, 4 séries sur 5 dépassaient, jusqu'à 2082 ms).
 const SESSIONS_POLL: Duration = Duration::from_secs(1);
 
+/// La relecture des sessions d'une machine distante connectée : elle apporte les `@idnma_agent` posés après coup et les
+/// sessions d'une machine sans vue attachée. Une seule à la fois par machine (un canal bref, jamais empilé).
+const REMOTE_POLL: Duration = Duration::from_secs(2);
+
+/// Les relectures de suite qui échouent avant que la connexion d'une machine soit tenue pour perdue.
+const REMOTE_LISTING_FAILURES: u8 = 3;
+
 /// Le brut d'un arrêt du client sans raison de tmux (`%exit` nu).
 const NO_EXIT_REASON: &str = "control client exited";
 
@@ -743,6 +772,9 @@ pub(crate) struct SessionEntry {
     pane: PaneId,
     /// `@idema_layout` au listage : le preset avec lequel la vue démarre.
     preset: Preset,
+    /// IdemA répare le layout de la session : toujours en local ; sur une machine distante, seulement si la session
+    /// porte un `@idema_layout` (une session créée hors d'IdemA s'affiche telle que tmux la rend).
+    auto_layout: bool,
     /// `None` quand l'attache a échoué ou que les essais sont épuisés : l'entrée reste dans la barre jusqu'à ce
     /// que la session disparaisse.
     pub(crate) view: Option<Entity<SessionView>>,
@@ -808,6 +840,8 @@ pub struct Workspace {
     store: Option<StateStore>,
     in_memory_state: State,
     server: Option<Arc<TmuxServer>>,
+    /// Les machines distantes de `[machines]`, dans l'ordre du fichier, chacune avec son état de connexion.
+    pub(crate) machines: Vec<RemoteMachine>,
     /// Les sessions listées, dans l'ordre de la barre (`sort_sessions`).
     pub(crate) entries: Vec<SessionEntry>,
     /// Projet choisi par le dernier geste de sélection : l'écran vide en montre le contexte.
@@ -1079,6 +1113,7 @@ impl Workspace {
             store,
             in_memory_state,
             server: None,
+            machines: Vec::new(),
             entries: Vec::new(),
             selected_project: None,
             project_wins: false,
@@ -1145,6 +1180,8 @@ impl Workspace {
         if let Some((result, elapsed)) = early {
             workspace.on_bootstrap(result, elapsed, window, cx);
         }
+        // Les machines distantes se connectent à part : une machine injoignable ne retarde ni l'amorçage ni la barre.
+        workspace.sync_machines(window, cx);
         workspace
     }
 
@@ -1706,9 +1743,11 @@ impl Workspace {
     /// du volet Terminal.
     fn pane_inputs(&self, cx: &App) -> PaneInputs {
         PaneInputs {
+            // Les panes lus sont ceux du tmux du Mac : une session distante n'y figure pas.
             sessions: self
                 .entries
                 .iter()
+                .filter(|entry| entry.summary.machine.is_none())
                 .map(|entry| SessionInfo {
                     name: entry.summary.name.clone(),
                     project: entry.summary.project.clone(),
@@ -1760,7 +1799,13 @@ impl Workspace {
             loop {
                 cx.background_executor().timer(SESSIONS_POLL).await;
                 let alive = this.update_in(cx, |this, window, cx| {
-                    if this.entries.iter().all(|entry| entry.view.is_none()) {
+                    // Les entrées des machines distantes ont leur propre relecture (`refresh_machine`).
+                    if this
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.summary.machine.is_none())
+                        .all(|entry| entry.view.is_none())
+                    {
                         this.refresh_sessions(window, cx);
                     }
                 });
@@ -1801,11 +1846,7 @@ impl Workspace {
         let Some(server) = self.server.clone() else {
             return;
         };
-        let snapshot: Vec<String> = self
-            .entries
-            .iter()
-            .map(|entry| entry.summary.name.clone())
-            .collect();
+        let snapshot = self.machine_entry_keys(LOCAL_MACHINE);
         let listing = cx.background_spawn(async move { (server.sessions(), server.panes()) });
         cx.spawn_in(window, async move |this, cx| {
             let (sessions, panes) = listing.await;
@@ -1817,32 +1858,44 @@ impl Workspace {
                 }
             };
             let _ = this.update_in(cx, |this, window, cx| {
-                this.apply_sessions(&snapshot, &sessions, &panes, window, cx);
+                this.apply_sessions(LOCAL_MACHINE, &snapshot, &sessions, &panes, window, cx);
             });
         })
         .detach();
     }
 
+    /// Les clés des entrées de la machine `machine` (`LOCAL_MACHINE` ou une connexion).
+    fn machine_entry_keys(&self, machine: &str) -> Vec<String> {
+        machine_keys(
+            self.entries.iter().map(|entry| entry.summary.name.as_str()),
+            machine,
+        )
+    }
+
+    /// Met la barre d'accord avec le listage de `machine` : seules les entrées de cette machine peuvent sortir (le listage
+    /// d'un tmux ne dit rien des autres), les sessions neuves entrent et s'attachent. `snapshot` : les clés de la
+    /// machine au départ de la relecture.
     fn apply_sessions(
         &mut self,
+        machine: &str,
         snapshot: &[String],
         sessions: &[ListedSession],
         panes: &[ListedPane],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let known: Vec<String> = self
+        let keys: Vec<String> = self
             .entries
             .iter()
             .map(|entry| entry.summary.name.clone())
             .collect();
-        let sync = session_sync(&known, snapshot, &self.pending_names, sessions);
+        let sync = machine_sync(machine, &keys, snapshot, &self.pending_names, sessions);
         for name in &sync.gone {
             // L'entrée a pu partir pendant la relecture (fermeture, `reconcile`) : rien à journaliser alors.
             if self.entry_index(name).is_none() {
                 continue;
             }
-            hud::log_event(&format!("session vanished session={name}"));
+            hud::log_event(&format!("session vanished session={}", key_label(name)));
             self.remove_entry(name, window, cx);
         }
         let newcomers: Vec<ListedSession> = sessions
@@ -1853,8 +1906,11 @@ impl Workspace {
         if newcomers.is_empty() {
             return;
         }
-        self.adopt_projects(&newcomers);
-        self.refresh_missing(cx);
+        // Les projets d'une session distante ne sont pas ceux du Mac : seule la relecture locale en adopte.
+        if machine == LOCAL_MACHINE {
+            self.adopt_projects(&newcomers);
+            self.refresh_missing(cx);
+        }
         // Une session sans pane n'a pas d'entrée (`session_entries`) : la relecture suivante la reprendra.
         let fresh = session_entries(&newcomers, panes);
         let names: Vec<String> = fresh
@@ -1864,7 +1920,7 @@ impl Workspace {
         for entry in fresh {
             hud::log_event(&format!(
                 "session appeared session={} project={}",
-                entry.summary.name,
+                key_label(&entry.summary.name),
                 entry.summary.project.display()
             ));
             self.entries.push(entry);
@@ -1874,7 +1930,10 @@ impl Workspace {
         // Attachées sans taille, comme au lancement : un échec suit les essais de `on_attach_lost` (écart E34).
         for name in names {
             if let Err(error) = self.attach(&name, None, Vec::new(), window, cx) {
-                hud::log_event(&format!("attach failed session={name}: {error}"));
+                hud::log_event(&format!(
+                    "attach failed session={}: {error}",
+                    key_label(&name)
+                ));
                 self.on_attach_lost(&name, error.to_string(), None, window, cx);
             }
         }
@@ -1887,7 +1946,7 @@ impl Workspace {
     pub(crate) fn context_project(&self) -> Option<PathBuf> {
         crate::sidebar_model::target_project(
             self.selected_entry()
-                .filter(|entry| !entry.summary.ideation)
+                .filter(|entry| !entry.summary.ideation && entry.summary.machine.is_none())
                 .map(|entry| entry.summary.project.clone()),
             self.selected_project.clone(),
             self.project_wins,
@@ -2118,6 +2177,7 @@ impl Workspace {
                 let ideation_was_on = self.ideation().is_some();
                 self.config = config;
                 self.config_error = None;
+                self.sync_machines(window, cx);
                 self.sync_companion(window, cx);
                 // Les lanceurs (logos) et le libellé des bouillons viennent de la config.
                 self.publish_fleet(cx);
@@ -2644,6 +2704,355 @@ impl Workspace {
         }
     }
 
+    fn machine_index(&self, connection: &str) -> Option<usize> {
+        self.machines
+            .iter()
+            .position(|machine| machine.entry.connection == connection)
+    }
+
+    /// Le serveur des appels brefs d'une session et son nom tmux. Local : le serveur du Mac et la clé. Distant : le
+    /// serveur bref de la machine, si elle est connectée.
+    fn server_for(&self, key: &str) -> Option<(Arc<TmuxServer>, String)> {
+        match route(key) {
+            Route::Local(name) => Some((self.server.clone()?, name)),
+            Route::Remote { connection, tmux } => {
+                let machine = &self.machines[self.machine_index(&connection)?];
+                if machine.status != MachineStatus::Connected {
+                    return None;
+                }
+                Some((machine.pool.as_ref()?.brief(), tmux))
+            }
+        }
+    }
+
+    /// Un canal long (client de contrôle) pour une session, et son nom tmux. Local : un bail sans pool qui porte le
+    /// serveur du Mac. Distant : un bail du pool de la machine, si elle est connectée.
+    fn long_lived_server_for(&mut self, key: &str) -> Option<(Lease, String)> {
+        match route(key) {
+            Route::Local(name) => Some((Lease::unpooled(self.server.clone()?), name)),
+            Route::Remote { connection, tmux } => {
+                let index = self.machine_index(&connection)?;
+                let machine = &mut self.machines[index];
+                if machine.status != MachineStatus::Connected {
+                    return None;
+                }
+                Some((machine.pool.as_mut()?.long_lived(), tmux))
+            }
+        }
+    }
+
+    /// Lance `work` hors du fil d'interface sur le serveur de la session `key`, avec son nom tmux. Sur une machine, les
+    /// appels ponctuels passent un à un (le second canal bref autorisé, jamais plus). `None` sans serveur utilisable :
+    /// local absent, ou machine non connectée.
+    fn spawn_for<T: Send + 'static>(
+        &self,
+        key: &str,
+        cx: &mut Context<Self>,
+        work: impl FnOnce(&TmuxServer, &str) -> T + Send + 'static,
+    ) -> Option<Task<T>> {
+        let (server, tmux) = self.server_for(key)?;
+        let turn = match route(key) {
+            Route::Local(_) => None,
+            Route::Remote { connection, .. } => self
+                .machine_index(&connection)
+                .map(|index| Arc::clone(&self.machines[index].adhoc)),
+        };
+        Some(cx.background_spawn(async move {
+            let _held = turn.as_ref().map(|turn| {
+                turn.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            work(&server, &tmux)
+        }))
+    }
+
+    /// Aligne les machines sur `[machines]` : une `RemoteMachine` par entrée (l'identité est la connexion, l'ordre celui
+    /// du fichier). Une machine retirée détache ses vues (leurs entrées partent, rien n'est envoyé à la machine) ; une
+    /// machine ajoutée passe à `Connecting` et se connecte.
+    fn sync_machines(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted: Vec<_> = self.config.remote_machines().to_vec();
+        let mut previous = std::mem::take(&mut self.machines);
+        let mut added = Vec::new();
+        for entry in wanted {
+            match previous
+                .iter()
+                .position(|machine| machine.entry.connection == entry.connection)
+            {
+                Some(at) => {
+                    let mut machine = previous.remove(at);
+                    // Le label peut changer sans que la machine change.
+                    machine.entry = entry;
+                    self.machines.push(machine);
+                }
+                None => {
+                    added.push(entry.connection.clone());
+                    self.machines.push(RemoteMachine::new(entry));
+                }
+            }
+        }
+        for gone in previous {
+            let connection = gone.entry.connection.clone();
+            hud::log_event(&format!("machine removed machine={connection}"));
+            for key in self.machine_entry_keys(&connection) {
+                self.remove_entry(&key, window, cx);
+            }
+            // Les tâches de la machine (relecture, essai) tombent avec elle ; ses vues, déjà retirées, lâchent leurs
+            // clients hors du fil d'interface.
+            drop(gone);
+        }
+        for connection in added {
+            self.connect_machine(&connection, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Sonde la machine hors du fil d'interface, puis l'installe `Connected` (ou `Failed`, avec un nouvel essai après
+    /// `retry_delay`). Un seul sondage en vol par machine. Le dossier de contrôle est vérifié avant chaque connexion.
+    fn connect_machine(&mut self, connection: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let machine = &mut self.machines[index];
+        if machine.probing {
+            return;
+        }
+        machine.probing = true;
+        machine.retry = None;
+        // SAFETY: `geteuid` n'a aucune précondition.
+        let uid = unsafe { libc::geteuid() };
+        // Le même dossier de contrôle que « Tester » des réglages : ils partagent le maître `%C-0`.
+        let spec = probe_spec(connection, &self.dir, uid, |name| std::env::var(name).ok());
+        let work = cx.background_spawn(async move {
+            ensure_control_dir(&spec.control_dir).map_err(|error| {
+                hud::log_event(&format!(
+                    "ssh control dir unusable {}: {error}",
+                    spec.control_dir.display()
+                ));
+                RemoteFailure::Unreachable
+            })?;
+            probe(&spec).map(|facts| (spec, facts))
+        });
+        let connection = connection.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = work.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.on_probed(&connection, outcome, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Le sondage a rendu : la machine est connectée (pool créé la première fois, faits mis à jour ensuite) ou échoue.
+    fn on_probed(
+        &mut self,
+        connection: &str,
+        outcome: Result<(RemoteSpec, MachineFacts), RemoteFailure>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let machine = &mut self.machines[index];
+        machine.probing = false;
+        match outcome {
+            Ok((spec, facts)) => {
+                match machine.pool.as_mut() {
+                    Some(pool) => pool.update_facts(facts.home.clone(), facts.shell.clone()),
+                    None => {
+                        machine.pool = Some(SlotPool::new(RemoteSpec {
+                            home: facts.home.clone(),
+                            shell: facts.shell.clone(),
+                            ..spec
+                        }));
+                    }
+                }
+                machine.facts = Some(facts);
+                machine.status = MachineStatus::Connected;
+                machine.attempt = 0;
+                machine.refresh_failures = 0;
+                machine.retry = None;
+                hud::log_event(&format!("machine connected machine={connection}"));
+                self.start_machine_poll(connection, window, cx);
+                self.refresh_machine(connection, window, cx);
+                self.resume_machine_views(connection, window, cx);
+            }
+            Err(failure) => {
+                let delay = retry_delay(machine.attempt);
+                machine.attempt += 1;
+                hud::log_event(&format!(
+                    "machine failed machine={connection} reason={} retry_s={}",
+                    failure.short(),
+                    delay.as_secs()
+                ));
+                machine.status = MachineStatus::Failed(failure);
+                machine.poll = None;
+                let target = connection.to_owned();
+                machine.retry = Some(cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(delay).await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        if let Some(index) = this.machine_index(&target) {
+                            this.machines[index].status = MachineStatus::Connecting;
+                        }
+                        this.connect_machine(&target, window, cx);
+                        cx.notify();
+                    });
+                }));
+            }
+        }
+        cx.notify();
+    }
+
+    /// La relecture toutes les `REMOTE_POLL` d'une machine, tant qu'elle est connectée (`refresh_machine` ne fait rien
+    /// sinon). La tâche vit dans la machine : la retirer l'arrête.
+    fn start_machine_poll(
+        &mut self,
+        connection: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let target = connection.to_owned();
+        self.machines[index].poll = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REMOTE_POLL).await;
+                let alive = this.update_in(cx, |this, window, cx| {
+                    this.refresh_machine(&target, window, cx);
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Relit `list-sessions` et `list-panes` de la machine sur son canal bref, hors du fil d'interface, puis met la
+    /// barre d'accord (`apply_sessions`). Une seule relecture en vol : une demande qui arrive pendant l'une repart
+    /// aussitôt après, sans empiler les canaux.
+    fn refresh_machine(&mut self, connection: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let machine = &mut self.machines[index];
+        if machine.status != MachineStatus::Connected {
+            return;
+        }
+        if machine.refreshing {
+            machine.refresh_again = true;
+            return;
+        }
+        let Some(server) = machine.pool.as_ref().map(SlotPool::brief) else {
+            return;
+        };
+        machine.refreshing = true;
+        let snapshot = self.machine_entry_keys(connection);
+        let listing =
+            cx.background_spawn(async move { (server.remote_sessions(), server.panes()) });
+        let target = connection.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            let listing = listing.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.on_machine_listing(&target, snapshot, listing, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn on_machine_listing(
+        &mut self,
+        connection: &str,
+        snapshot: Vec<String>,
+        listing: (
+            Result<Vec<ListedSession>, ServerError>,
+            Result<Vec<ListedPane>, ServerError>,
+        ),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let machine = &mut self.machines[index];
+        machine.refreshing = false;
+        let again = std::mem::take(&mut machine.refresh_again);
+        // La machine a été perdue pendant la relecture : son résultat est périmé, la reconnexion relira.
+        if machine.status != MachineStatus::Connected {
+            return;
+        }
+        match listing {
+            (Ok(sessions), Ok(panes)) => {
+                machine.refresh_failures = 0;
+                let (sessions, panes) = qualify_listing(connection, sessions, panes);
+                self.apply_sessions(connection, &snapshot, &sessions, &panes, window, cx);
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                machine.refresh_failures = machine.refresh_failures.saturating_add(1);
+                // Une ligne par série d'échecs, pas une toutes les 2 s.
+                if machine.refresh_failures == 1 {
+                    hud::log_event(&format!(
+                        "session listing failed machine={connection}: {error}"
+                    ));
+                }
+                if machine.refresh_failures >= REMOTE_LISTING_FAILURES {
+                    self.lose_machine(connection, &error.to_string(), window, cx);
+                    return;
+                }
+            }
+        }
+        if again {
+            self.refresh_machine(connection, window, cx);
+        }
+    }
+
+    /// La connexion à la machine est perdue (relecture ou contrôle de session en échec, pas une absence de session) :
+    /// elle repasse en `Connecting` et se re-sonde. Ses entrées restent dans la barre ; leurs vues sont reprises à la
+    /// reconnexion (`resume_machine_views`).
+    fn lose_machine(
+        &mut self,
+        connection: &str,
+        reason: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let machine = &mut self.machines[index];
+        if machine.status != MachineStatus::Connected {
+            return;
+        }
+        hud::log_event(&format!(
+            "machine lost machine={connection}: {}",
+            log_safe(reason)
+        ));
+        machine.status = MachineStatus::Connecting;
+        machine.poll = None;
+        machine.refresh_failures = 0;
+        cx.notify();
+        self.connect_machine(connection, window, cx);
+    }
+
+    /// La machine vient de se (re)connecter : les entrées sans vue s'attachent, celles dont le client est tombé se
+    /// reconnectent en place (`reattach_later`). Un client vivant n'est pas touché.
+    fn resume_machine_views(
+        &mut self,
+        connection: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for key in self.machine_entry_keys(connection) {
+            let needs = match self.entry_view(&key) {
+                Some(view) => view.read(cx).control_client_exited(),
+                None => true,
+            };
+            if needs {
+                self.reattach_later(&key, window, cx);
+            }
+        }
+    }
+
     /// Attache le client de contrôle de la session `name` et abonne l'espace de travail à ses événements.
     /// `Some(grid)` pour la session affichée, `None` pour une session de fond. `launches` sont les commandes d'agent
     /// à taper, une par pane, quand le pane est prêt (session neuve ou restaurée seulement).
@@ -2655,16 +3064,25 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), ServerError> {
-        let (Some(server), Some(index)) = (self.server.clone(), self.entry_index(name)) else {
+        let Some(index) = self.entry_index(name) else {
+            return Ok(());
+        };
+        // Un canal long : le bail de la machine (ou, en local, le serveur du Mac). Une machine non connectée n'a rien à
+        // offrir : sa reconnexion rattachera ses sessions (`resume_machine_views`).
+        let Some((lease, tmux)) = self.long_lived_server_for(name) else {
             return Ok(());
         };
         let entry = &self.entries[index];
+        let remote = lease.server.is_remote();
         let info = SessionEntryInfo {
-            name: name.to_owned(),
+            name: tmux,
             project: entry.summary.project.clone(),
             preset: entry.preset,
+            shell: lease.server.remote_spec().map(|spec| spec.shell.clone()),
+            auto_layout: entry.auto_layout,
+            remote,
         };
-        let view = SessionView::spawn(server, &info, launches, size, window, cx)?;
+        let view = SessionView::spawn(lease, &info, launches, size, window, cx)?;
         let subscription = cx.subscribe_in(&view, window, Self::on_session_event);
         let now = SystemTime::now();
         let entry = &mut self.entries[index];
@@ -2722,11 +3140,14 @@ impl Workspace {
                 .then(|| self.central_grid(window, self.stored_gaps(&name)));
             let own = launches.remove(&name).unwrap_or_default();
             if let Err(error) = self.attach(&name, size, own, window, cx) {
-                hud::log_event(&format!("attach failed session={name}: {error}"));
+                hud::log_event(&format!(
+                    "attach failed session={}: {error}",
+                    key_label(&name)
+                ));
                 // Une attache qui échoue suit les mêmes essais qu'un client tombé (écart E34).
                 self.on_attach_lost(&name, error.to_string(), None, window, cx);
             }
-            hud::log_step(&format!("attach session={name}"), step);
+            hud::log_step(&format!("attach session={}", key_label(&name)), step);
         }
         self.show_selected(window, cx);
     }
@@ -4477,7 +4898,8 @@ impl Workspace {
     ) {
         // Un bouillon n'a pas de projet : choisir son dossier d'idéation comme projet de contexte le ferait lire
         // partout (`⌘T` après sa fermeture, `⌘O`). Le dernier projet de contexte reste donc celui d'avant.
-        if !self.entries[index].summary.ideation {
+        // Une session distante n'a pas non plus de projet du Mac : le contexte reste celui d'avant.
+        if !self.entries[index].summary.ideation && self.entries[index].summary.machine.is_none() {
             self.selected_project = Some(self.entries[index].summary.project.clone());
             self.project_wins = false;
         }
@@ -4632,7 +5054,18 @@ impl Workspace {
             }
             SessionEvent::Closed => self.on_session_closed(view, window, cx),
             SessionEvent::FocusChanged => self.sync_keyboard(window, cx),
-            SessionEvent::SessionsChanged => self.on_sessions_changed(window, cx),
+            SessionEvent::SessionsChanged => {
+                // Le client d'une machine distante relit sa machine ; celui du Mac, le tmux du Mac.
+                let machine = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.view.as_ref() == Some(view))
+                    .and_then(|entry| entry.summary.machine.clone());
+                match machine {
+                    Some(connection) => self.refresh_machine(&connection, window, cx),
+                    None => self.on_sessions_changed(window, cx),
+                }
+            }
             SessionEvent::OpenPath(target) => self.open_in_files(target.clone(), false, window, cx),
             SessionEvent::OpenUrl(url) => self.defer_open_in_browser(url.clone(), window, cx),
             SessionEvent::HiddenPaneWaiting { pane } => {
@@ -4678,24 +5111,47 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (Some(server), Some(_)) = (self.server.clone(), self.entry_index(name)) else {
+        if self.entry_index(name).is_none() {
+            return;
+        }
+        // `has-session` est un appel ponctuel (un process, ou un canal bref ssh) : hors du fil d'interface. En local, toute
+        // erreur vaut « absente » ; sur une machine, une erreur de ssh n'est pas une absence (`has_session_checked`).
+        let Some(check) = self.spawn_for(name, cx, |server, tmux| {
+            if server.is_remote() {
+                server.has_session_checked(tmux)
+            } else {
+                Ok(server.has_session(tmux))
+            }
+        }) else {
+            // Sans serveur, ou machine non connectée : sa reconnexion reprend les vues (`resume_machine_views`).
             return;
         };
         let name = name.to_owned();
-        let probe = name.clone();
-        let exists = cx.background_spawn(async move { server.has_session(&probe) });
         cx.spawn_in(window, async move |this, cx| {
-            let exists = exists.await;
+            let exists = check.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 let Some(index) = this.entry_index(&name) else {
                     return;
+                };
+                let exists = match exists {
+                    Ok(exists) => exists,
+                    // Ni présente ni absente : la machine ne répond plus. L'entrée reste, la machine se reconnecte.
+                    Err(error) => {
+                        hud::log_event(&format!(
+                            "session check failed session={}: {error}",
+                            key_label(&name)
+                        ));
+                        this.lose_machine(machine_of(&name), &error.to_string(), window, cx);
+                        return;
+                    }
                 };
                 match after_close(exists, this.entries[index].attempts, alive_for) {
                     AfterClose::Remove => this.remove_entry(&name, window, cx),
                     AfterClose::Retry { attempt } => {
                         this.entries[index].attempts = attempt;
                         hud::log_event(&format!(
-                            "reattach session={name} attempt={attempt} reason={raw}"
+                            "reattach session={} attempt={attempt} reason={raw}",
+                            key_label(&name)
                         ));
                         this.reattach_later(&name, window, cx);
                     }
@@ -4721,9 +5177,13 @@ impl Workspace {
                     return;
                 }
                 let displayed = this.selected_name() == Some(name.as_str());
-                let result = match (this.server.clone(), this.entry_view(&name)) {
-                    (Some(server), Some(view)) => {
-                        view.update(cx, |view, cx| view.reconnect(&server, window, cx))
+                // Rien à offrir (pas de serveur, machine déconnectée) : la reconnexion de la machine reprendra la vue.
+                if this.server_for(&name).is_none() {
+                    return;
+                }
+                let result = match (this.entry_view(&name), this.long_lived_server_for(&name)) {
+                    (Some(view), Some((lease, _))) => {
+                        view.update(cx, |view, cx| view.reconnect(lease, window, cx))
                     }
                     // Sans vue (essais épuisés, ou attache ratée) : une vue neuve, à la taille de la zone si affichée.
                     _ => {
@@ -4841,9 +5301,11 @@ impl Workspace {
                 return;
             };
             let _ = this.update_in(cx, |this, window, cx| {
+                // Le listage est celui du tmux du Mac : les machines distantes se réconcilient par `refresh_machine`.
                 let gone: Vec<String> = this
                     .entries
                     .iter()
+                    .filter(|entry| entry.summary.machine.is_none())
                     .filter(|entry| !listed.iter().any(|s| s.name == entry.summary.name))
                     .map(|entry| entry.summary.name.clone())
                     .collect();
@@ -5754,11 +6216,13 @@ impl Workspace {
                 created: created.created,
                 state: ActivityState::Idle,
                 ideation,
+                machine: None,
             },
             agent,
             remote_name: remote_name.unwrap_or_default(),
             pane: created.pane,
             preset: Preset::Single,
+            auto_layout: true,
             view: None,
             attempts: 0,
             unreachable: None,
@@ -5982,14 +6446,13 @@ impl Workspace {
         // Le pane qui a reçu la commande : l'actif de la session.
         let pane = view.read(cx).active_pane().unwrap_or(entry.pane);
         cx.notify();
-        if let Some(server) = self.server.clone() {
-            let name = agent.name.clone();
-            cx.background_spawn(async move {
-                if let Err(error) = server.set_pane_option(pane, "@idema_agent", &name) {
-                    hud::log_event(&format!("agent option failed pane=%{}: {error}", pane.0));
-                }
-            })
-            .detach();
+        let name = agent.name.clone();
+        if let Some(write) = self.spawn_for(session, cx, move |server, _| {
+            if let Err(error) = server.set_pane_option(pane, "@idema_agent", &name) {
+                hud::log_event(&format!("agent option failed pane=%{}: {error}", pane.0));
+            }
+        }) {
+            write.detach();
         }
     }
 
@@ -6003,6 +6466,10 @@ impl Workspace {
         target: OutsideSession,
         cx: &mut Context<Self>,
     ) {
+        // « Ramener » ne propose rien sur une session distante : les processus qu'il arrête sont ceux du Mac.
+        if machine_of(&session) != LOCAL_MACHINE {
+            return;
+        }
         let Some(view) = self
             .entry_index(&session)
             .and_then(|index| self.entries[index].view.clone())
@@ -6176,13 +6643,13 @@ impl Workspace {
         let name = agent.unwrap_or_default();
         self.entries[index].agent = name.clone();
         cx.notify();
-        if let Some(server) = self.server.clone() {
-            cx.background_spawn(async move {
-                if let Err(error) = server.set_pane_option(pane, "@idema_agent", &name) {
-                    hud::log_event(&format!("agent option failed pane=%{}: {error}", pane.0));
-                }
-            })
-            .detach();
+        let session = self.entries[index].summary.name.clone();
+        if let Some(write) = self.spawn_for(&session, cx, move |server, _| {
+            if let Err(error) = server.set_pane_option(pane, "@idema_agent", &name) {
+                hud::log_event(&format!("agent option failed pane=%{}: {error}", pane.0));
+            }
+        }) {
+            write.detach();
         }
     }
 
@@ -6264,12 +6731,11 @@ impl Workspace {
     /// `kill-session` hors du fil d'interface. La ligne part par `SessionEvent::Closed` ; une entrée sans vue ne
     /// recevra pas d'événement et part dès que la commande a réussi.
     fn kill_session(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(server) = self.server.clone() else {
+        let Some(killed) = self.spawn_for(name, cx, |server, tmux| server.kill_session(tmux))
+        else {
             return;
         };
         let target = name.to_owned();
-        let probe = target.clone();
-        let killed = cx.background_spawn(async move { server.kill_session(&probe) });
         cx.spawn_in(window, async move |this, cx| {
             let result = killed.await;
             let _ = this.update_in(cx, |this, window, cx| match result {
@@ -6284,7 +6750,10 @@ impl Workspace {
                     }
                 }
                 Err(error) => {
-                    hud::log_event(&format!("session kill failed session={target}: {error}"));
+                    hud::log_event(&format!(
+                        "session kill failed session={}: {error}",
+                        key_label(&target)
+                    ));
                 }
             });
         })
@@ -6301,12 +6770,16 @@ impl Workspace {
         let initial = self.entries[index].summary.display_name.clone();
         let project = self.entries[index].summary.project.clone();
         let ideation = self.entries[index].summary.ideation;
+        let remote = self.entries[index].summary.machine.is_some();
         let state = self.state_mut();
         // Un bouillon se révèle en dépliant sa section : son dossier n'est jamais écrit dans `state.json`.
         let revealed = if ideation {
             let collapsed = state.ui.ideation_collapsed;
             state.ui.ideation_collapsed = false;
             collapsed || !state.ui.sidebar_visible
+        } else if remote {
+            // Une session distante n'a pas de projet à déplier.
+            !state.ui.sidebar_visible
         } else {
             let collapsed = !state.is_expanded(&project);
             state.set_expanded(&project, true);
@@ -6361,25 +6834,26 @@ impl Workspace {
         let Some(index) = self.entry_index(name) else {
             return;
         };
-        let Some(server) = self.server.clone() else {
-            return;
-        };
-        let current = &mut self.entries[index].summary.display_name;
         // Un nom vide (ou fait d'espaces) annule ; le même nom ne change rien.
-        if text.is_empty() || *current == text {
+        if text.is_empty() || self.entries[index].summary.display_name == text {
             return;
         }
-        let previous = std::mem::replace(current, text.clone());
+        let written = text.clone();
+        let Some(write) = self.spawn_for(name, cx, move |server, tmux| {
+            server.set_session_option(tmux, "@idema_name", &written)
+        }) else {
+            return;
+        };
+        let previous =
+            std::mem::replace(&mut self.entries[index].summary.display_name, text.clone());
         self.publish_fleet(cx);
         let target = name.to_owned();
-        let written = text.clone();
-        let write = cx.background_spawn({
-            let target = target.clone();
-            async move { server.set_session_option(&target, "@idema_name", &written) }
-        });
         cx.spawn(async move |this, cx| {
             if let Err(error) = write.await {
-                hud::log_event(&format!("rename failed session={target}: {error}"));
+                hud::log_event(&format!(
+                    "rename failed session={}: {error}",
+                    key_label(&target)
+                ));
                 let _ = this.update(cx, |this, cx| {
                     if let Some(index) = this.entry_index(&target)
                         && this.entries[index].summary.display_name == text
@@ -8272,5 +8746,39 @@ mod tests {
                 _ => panic!("a menu line changed kind in translation"),
             }
         }
+    }
+
+    #[test]
+    fn two_machines_with_one_session_name_keep_two_entries() {
+        use crate::machines::sessions::qualify_listing;
+        let mut sessions = Vec::new();
+        let mut panes = Vec::new();
+        for connection in ["caserne-claude", "dell-lan"] {
+            let (listed, own) = qualify_listing(
+                connection,
+                vec![listed_session("testvpc", 1)],
+                vec![listed_pane("testvpc", 0, true, "")],
+            );
+            sessions.extend(listed);
+            panes.extend(own);
+        }
+        sessions.push(listed_session("testvpc", 1));
+        panes.push(listed_pane("testvpc", 0, true, "Shell"));
+        let entries = session_entries(&sessions, &panes);
+        assert_eq!(entries.len(), 3);
+        let mut machines: Vec<Option<&str>> = entries
+            .iter()
+            .map(|entry| entry.summary.machine.as_deref())
+            .collect();
+        machines.sort();
+        assert_eq!(machines, [None, Some("caserne-claude"), Some("dell-lan")]);
+        // Les trois clés diffèrent : chacune est celle d'une seule entrée.
+        let mut names: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.summary.name.as_str())
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 3);
     }
 }

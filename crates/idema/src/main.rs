@@ -22,8 +22,6 @@ mod idnma;
 mod instance;
 mod integrations;
 mod lifecycle;
-// Lu par les tâches suivantes (barre, transport) : `key`, `registry`, `short` et `retry_delay` ne sont pas encore appelés ; les réglages utilisent déjà `probe`.
-#[allow(dead_code)]
 mod machines;
 mod mcp_widgets;
 mod menus;

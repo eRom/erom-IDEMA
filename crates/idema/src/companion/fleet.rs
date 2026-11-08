@@ -287,6 +287,7 @@ mod tests {
                 created: 0,
                 state,
                 ideation,
+                machine: None,
             },
             state_since: UNIX_EPOCH + std::time::Duration::from_secs(100),
             seen: false,

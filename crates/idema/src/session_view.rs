@@ -30,6 +30,7 @@ use crate::config::SHELL_SESSION_NAME;
 use crate::file_open::PathTarget;
 use crate::gutter::{Frame, pane_frame, separator_frame, session_columns};
 use crate::hud;
+use crate::machines::registry::Lease;
 use crate::pane_view::{LaunchRequest, PaneEvent, PaneView, RESIZE_SETTLE, SessionRef};
 use crate::signpost;
 use crate::terminal_element::{TerminalFont, cell_metrics, content_bounds, grid_for};
@@ -92,6 +93,12 @@ pub struct SessionEntryInfo {
     pub project: PathBuf,
     /// Le preset de `@idema_layout` ; `Single` quand l'option manque.
     pub preset: Preset,
+    /// Le shell de la machine distante de la session ; `None` pour une session de ce Mac.
+    pub shell: Option<String>,
+    /// IdemA répare le layout de cette session (`repair_step`) : faux pour une session créée hors d'IdemA.
+    pub auto_layout: bool,
+    /// La session vit sur une machine distante.
+    pub remote: bool,
 }
 
 /// Ce que la vue signale à l'espace de travail.
@@ -257,6 +264,21 @@ fn repair_step(
     }
 }
 
+/// `repair_step`, sauf pour une session que IdemA n'a pas posée lui-même (`auto_layout` faux : créée hors d'IdemA, ou
+/// sur une machine distante) : son layout est celui de tmux, rien n'est jamais réparé d'office.
+fn decide_repair(
+    auto_layout: bool,
+    windows: &SessionWindows,
+    preset: Preset,
+    reapply: bool,
+    attempted: Option<RepairKey>,
+) -> RepairStep {
+    if !auto_layout {
+        return RepairStep::InOrder;
+    }
+    repair_step(windows, preset, reapply, attempted)
+}
+
 /// Où va un événement du client de contrôle.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
@@ -405,7 +427,7 @@ fn connect(
 }
 
 /// Envoie une relecture des fenêtres sur `client` et rend la requête, qui lira la réponse.
-fn start_query(client: &mut ControlClient, counter: &mut u64) -> WindowsQuery {
+fn start_query(client: &mut HeldClient, counter: &mut u64) -> WindowsQuery {
     *counter += 1;
     let query = WindowsQuery::new(&format!("{}-{}", std::process::id(), counter));
     // Une écriture qui échoue veut dire que le client est mort : son fil de lecture le signale par `Exit`.
@@ -413,13 +435,63 @@ fn start_query(client: &mut ControlClient, counter: &mut u64) -> WindowsQuery {
     query
 }
 
+/// Le client de contrôle de la vue. Distant, son `Drop` (jusqu'à 500 ms d'attente de `detach-client`) part sur un fil à
+/// part : il ne bloque jamais le fil d'interface, quelle que soit la façon dont la vue ou la reconnexion le lâche.
+struct HeldClient {
+    client: Option<ControlClient>,
+    remote: bool,
+}
+
+impl HeldClient {
+    fn new(client: ControlClient, remote: bool) -> Self {
+        Self {
+            client: Some(client),
+            remote,
+        }
+    }
+
+    fn client_mut(&mut self) -> &mut ControlClient {
+        self.client
+            .as_mut()
+            .expect("the control client lives until the view is dropped")
+    }
+
+    fn send(&mut self, line: &str) -> std::io::Result<()> {
+        self.client_mut().send(line)
+    }
+
+    fn writer(&self) -> idema_tmux::client::ClientWriter {
+        self.client
+            .as_ref()
+            .expect("the control client lives until the view is dropped")
+            .writer()
+    }
+}
+
+impl Drop for HeldClient {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take()
+            && self.remote
+        {
+            std::thread::spawn(move || drop(client));
+        }
+    }
+}
+
 pub struct SessionView {
-    server: Arc<TmuxServer>,
+    /// Le bail du canal de cette vue : son serveur (local, ou le maître ssh de la machine) sert aussi aux opérations de
+    /// la session ; sa chute libère le canal sur le maître.
+    lease: Lease,
+    /// Le shell de la machine distante, `None` en local.
+    shell: Option<String>,
+    /// IdemA répare le layout de cette session (faux : créée hors d'IdemA, rien n'est jamais reposé d'office).
+    auto_layout: bool,
+    remote: bool,
     /// Nom tmux de la session et dossier de son projet : `apply_preset` crée les shells neufs dans le projet.
     name: String,
     project: PathBuf,
     /// Le client de contrôle de la session : la vue le garde en vie, les panes y écrivent par un `ClientWriter`.
-    client: ControlClient,
+    client: HeldClient,
     /// Génération du client courant : les événements d'un client remplacé sont ignorés.
     client_generation: u64,
     /// Depuis quand le client courant est attaché (`spawn` ou dernier `reconnect`) : un client qui tombe aussitôt
@@ -489,7 +561,7 @@ impl SessionView {
     /// jusqu'à son affichage (spec §3.3). Les panes naissent de la première relecture des fenêtres. `launches` donne,
     /// par pane, la commande d'agent à taper quand il est prêt.
     pub fn spawn(
-        server: Arc<TmuxServer>,
+        lease: Lease,
         session: &SessionEntryInfo,
         launches: Vec<PaneLaunch>,
         size: Option<GridSize>,
@@ -499,7 +571,16 @@ impl SessionView {
         let (sender, mut receiver) = mpsc::unbounded();
         let echo_pane = Arc::new(AtomicU32::new(NO_PANE));
         let step = Instant::now();
-        let mut client = connect(&server, &session.name, 0, sender.clone(), echo_pane.clone())?;
+        let mut client = HeldClient::new(
+            connect(
+                &lease.server,
+                &session.name,
+                0,
+                sender.clone(),
+                echo_pane.clone(),
+            )?,
+            session.remote,
+        );
         hud::log_step("attach.control_client", step);
         // La taille d'abord : la relecture qui suit capture déjà les panes à cette taille. Une session de fond garde
         // la sienne jusqu'à son affichage.
@@ -512,6 +593,8 @@ impl SessionView {
         let name = session.name.clone();
         let project = session.project.clone();
         let preset = session.preset;
+        let (shell, auto_layout, remote) =
+            (session.shell.clone(), session.auto_layout, session.remote);
         let step = Instant::now();
 
         let view = Ok(cx.new(|cx: &mut Context<Self>| {
@@ -545,7 +628,10 @@ impl SessionView {
                 cx.notify();
             })];
             Self {
-                server,
+                lease,
+                shell,
+                auto_layout,
+                remote,
                 name,
                 project,
                 client,
@@ -1137,6 +1223,8 @@ impl SessionView {
             let session = SessionRef {
                 name: &name,
                 project: &project,
+                shell: self.shell.as_deref(),
+                remote: self.remote,
             };
             let view = cx.new(|cx| PaneView::new(writer, added, size, launch, session, window, cx));
             let subscription = cx.subscribe_in(&view, window, Self::on_pane_event);
@@ -1238,7 +1326,7 @@ impl SessionView {
             self.pending_focus = Some((pane, Instant::now()));
             self.set_active(Some(pane), cx);
             self.apply_flags(window, cx);
-            let server = self.server.clone();
+            let server = self.lease.server.clone();
             let selected = cx.background_spawn(async move { server.select_pane(pane) });
             let name = self.name.clone();
             cx.spawn_in(window, async move |this, cx| {
@@ -1281,7 +1369,7 @@ impl SessionView {
         let Some(pane) = self.active else {
             return;
         };
-        let server = self.server.clone();
+        let server = self.lease.server.clone();
         let toggled = cx.background_spawn(async move { server.toggle_zoom(pane) });
         let name = self.name.clone();
         cx.spawn_in(window, async move |_, _| {
@@ -1331,9 +1419,14 @@ impl SessionView {
             self.operation_gaps = Some(preset.column_gaps());
             self.sync_size(window, cx);
         }
-        let server = self.server.clone();
+        let server = self.lease.server.clone();
         let name = self.name.clone();
-        let project = self.project.to_string_lossy().into_owned();
+        // Les panes neufs d'une session distante naissent dans le `$HOME` de la machine : le dossier d'un projet du Mac
+        // n'y existe pas.
+        let project = match self.lease.server.remote_spec() {
+            Some(spec) if self.project.as_os_str().is_empty() => spec.home.clone(),
+            _ => self.project.to_string_lossy().into_owned(),
+        };
         let focused = self.active;
         let done = cx.background_spawn(async move {
             match op {
@@ -1422,7 +1515,8 @@ impl SessionView {
         {
             return;
         }
-        let step = repair_step(
+        let step = decide_repair(
+            self.auto_layout,
             &self.windows,
             self.preset,
             self.reapply_preset,
@@ -1447,18 +1541,21 @@ impl SessionView {
     /// relecture, les fenêtres sont relues et la taille est redemandée si la session est affichée.
     pub fn reconnect(
         &mut self,
-        server: &TmuxServer,
+        lease: Lease,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), ServerError> {
         let generation = self.client_generation + 1;
-        let mut client = connect(
-            server,
-            &self.name,
-            generation,
-            self.sender.clone(),
-            self.echo_pane.clone(),
-        )?;
+        let mut client = HeldClient::new(
+            connect(
+                &lease.server,
+                &self.name,
+                generation,
+                self.sender.clone(),
+                self.echo_pane.clone(),
+            )?,
+            self.remote,
+        );
         if self.displayed
             && let Some(grid) = self.requested
         {
@@ -1470,8 +1567,10 @@ impl SessionView {
         }
         self.query = Some(start_query(&mut client, &mut self.query_counter));
         let _ = client.send(&border_subscription());
-        // L'ancien client est détaché ici ; ses événements en retard portent l'ancienne génération.
+        // L'ancien client est détaché ici (distant, sur un fil à part) ; ses événements en retard portent l'ancienne
+        // génération. L'ancien bail tombe avec lui : le canal qu'il comptait est libéré.
         self.client = client;
+        self.lease = lease;
         self.client_generation = generation;
         self.connected_at = Instant::now();
         self.exit_reason = None;
@@ -1666,6 +1765,23 @@ mod tests {
             y,
             width,
             height,
+        }
+    }
+
+    #[test]
+    fn a_foreign_session_is_never_repaired() {
+        let windows = visible_window(columns_layout(1, 2, 60));
+        // Le même état est réparé quand IdemA a posé le layout lui-même...
+        assert!(matches!(
+            decide_repair(true, &windows, Preset::Single, false, None),
+            RepairStep::Run(..)
+        ));
+        // ... et laissé tel que tmux le rend quand la session vient d'ailleurs, même demandé au redimensionnement.
+        for reapply in [false, true] {
+            assert!(matches!(
+                decide_repair(false, &windows, Preset::Single, reapply, None),
+                RepairStep::InOrder
+            ));
         }
     }
 

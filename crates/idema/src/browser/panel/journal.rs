@@ -315,6 +315,8 @@ impl JournalView {
                 SessionRef {
                     name: &name,
                     project: &project,
+                    shell: None,
+                    remote: false,
                 },
                 window,
                 cx,

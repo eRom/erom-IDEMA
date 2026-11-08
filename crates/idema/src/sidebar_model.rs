@@ -16,6 +16,8 @@ pub struct SessionSummary {
     pub state: ActivityState,
     /// Session d'idéation (« Bouillon de neurones ») : elle vit dans la section du haut, hors de tout projet.
     pub ideation: bool,
+    /// La connexion de la machine distante qui porte la session ; `None` pour une session de ce Mac.
+    pub machine: Option<String>,
 }
 
 /// Ordre de la barre dans un projet : `@idema_created`, puis le nom tmux pour départager.
@@ -170,6 +172,7 @@ mod tests {
             created,
             state: ActivityState::Idle,
             ideation: false,
+            machine: None,
         }
     }
 

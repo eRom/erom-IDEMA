@@ -12,7 +12,6 @@ use gpui::{
     PromptButton, PromptLevel, SharedString, Subscription, Task, Window, div, prelude::*,
 };
 use gpui_component::input::{InputEvent, InputState, TextareaState};
-use idema_tmux::remote::RemoteSpec;
 
 use super::controls::{
     ButtonKind, action_button, area_box, button, column_title, error_line, field_box, icon_button,
@@ -28,7 +27,7 @@ use crate::config::{
     load_config,
 };
 use crate::errors::{Explained, explain_config};
-use crate::machines::probe::{RemoteFailure, control_dir, ensure_control_dir, probe};
+use crate::machines::probe::{RemoteFailure, ensure_control_dir, probe, probe_spec};
 use crate::theme::{ERROR_TEXT, RUNNING, SEPARATOR, TEXT_MIN, TEXT_SECONDARY, Theme, color, white};
 
 /// Un champ texte écrit une fois la frappe arrêtée depuis ce délai.
@@ -55,8 +54,6 @@ const MACHINE_LABEL: &str = "Label";
 const TEST_MACHINE: &str = "Tester";
 const PROBING: &str = "Test en cours";
 const CONTROL_DIR_UNUSABLE: &str = "Dossier de contrôle ssh inutilisable";
-/// Les seules variables du processus que la sonde ssh reçoit.
-const PROBE_ENV: [&str; 6] = ["HOME", "USER", "LOGNAME", "PATH", "SSH_AUTH_SOCK", "LANG"];
 
 /// La liste que porte une ligne : les agents, les machines distantes ou les favoris.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -263,27 +260,6 @@ fn probe_summary(tmux_version: (u32, u32), agents: Option<usize>) -> String {
         None => "pas de ~/.idnma.yml".to_string(),
     };
     format!("Connectée · tmux {major}.{minor} · {agents}")
-}
-
-/// La machine de la sonde : canal 0, dossier de contrôle de cette instance, et pour seul environnement les variables de
-/// `PROBE_ENV` que `var` connaît (`home` et `shell` distants sont inconnus tant qu'on ne les a pas sondés).
-fn probe_spec(
-    connection: &str,
-    idema_home: &Path,
-    uid: u32,
-    var: impl Fn(&str) -> Option<String>,
-) -> RemoteSpec {
-    RemoteSpec {
-        destination: connection.to_string(),
-        control_dir: control_dir(idema_home, uid),
-        slot: 0,
-        ssh_env: PROBE_ENV
-            .iter()
-            .filter_map(|name| var(name).map(|value| ((*name).to_string(), value)))
-            .collect(),
-        home: String::new(),
-        shell: String::new(),
-    }
 }
 
 /// Le message d'une erreur d'écriture ou de lecture, tel qu'il se lit sous un contrôle. Une erreur de syntaxe passe par le
@@ -2396,7 +2372,10 @@ mod tests {
         let spec = probe_spec("dell-lan", home, 501, var);
         assert_eq!(spec.destination, "dell-lan");
         assert_eq!(spec.slot, 0);
-        assert_eq!(spec.control_dir, control_dir(home, 501));
+        assert_eq!(
+            spec.control_dir,
+            crate::machines::probe::control_dir(home, 501)
+        );
         let names: Vec<&str> = spec.ssh_env.iter().map(|(key, _)| key.as_str()).collect();
         assert_eq!(names, ["HOME", "USER", "PATH", "SSH_AUTH_SOCK"]);
     }

@@ -115,6 +115,10 @@ struct SearchState {
 pub struct SessionRef<'a> {
     pub name: &'a str,
     pub project: &'a Path,
+    /// Le shell de la machine distante de la session ; `None` pour une session de ce Mac (la variable `SHELL`).
+    pub shell: Option<&'a str>,
+    /// La session vit sur une machine distante : les chemins du pane ne sont pas ceux du Mac.
+    pub remote: bool,
 }
 
 /// Ce que le pane signale à sa session.
@@ -390,6 +394,15 @@ fn shell_basename(shell: Option<&str>) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("zsh")
         .to_owned()
+}
+
+/// Le nom du shell d'un pane : celui de la machine distante de sa session quand il y en a un, sinon la règle locale
+/// (`local`, la variable `SHELL` du Mac). Il sert à distinguer « au prompt » d'une commande au premier plan.
+fn pane_shell_name(remote_shell: Option<&str>, local: Option<&str>) -> String {
+    match remote_shell {
+        Some(shell) => shell_basename(Some(shell)),
+        None => shell_basename(local),
+    }
 }
 
 /// Les programmes qui tournent au premier plan du pane : la commande si ce n'est pas le shell, sinon un libellé
@@ -679,6 +692,8 @@ pub struct PaneView {
     hover_key: Option<(usize, usize)>,
     /// Le fichier que désigne le chemin survolé : `hovered_link` en porte alors la plage, pour le souligner.
     hovered_file: Option<PathTarget>,
+    /// Le pane vit sur une machine distante : un chemin qu'il affiche n'est pas un fichier du Mac, il ne s'ouvre pas.
+    remote: bool,
     /// Le dossier du projet de la session : un chemin relatif s'y résout tant que tmux n'a pas donné celui du pane.
     project: PathBuf,
     /// `pane_current_path`, tel que tmux l'a signalé ; vide pour le shell local, dont le PTY donne son dossier.
@@ -740,7 +755,7 @@ impl PaneView {
     ) -> Self {
         let mut pane_session = PaneSession::attach(writer, pane, size);
         subscribe_watches(&mut pane_session, pane);
-        Self::with_backend(
+        let mut view = Self::with_backend(
             PaneBackend::Tmux(pane_session),
             theme::WINDOW,
             launch,
@@ -748,7 +763,10 @@ impl PaneView {
             session.project,
             window,
             cx,
-        )
+        );
+        view.shell_name = pane_shell_name(session.shell, std::env::var("SHELL").ok().as_deref());
+        view.remote = session.remote;
+        view
     }
 
     /// Le shell local du volet Terminal (spec §3.1) : un PTY dans `project`, avec l'environnement `env` des panes
@@ -880,6 +898,7 @@ impl PaneView {
             hovered_link: None,
             hover_key: None,
             hovered_file: None,
+            remote: false,
             project: project.to_owned(),
             pane_path: None,
             hud: HudStats::new(),
@@ -894,7 +913,7 @@ impl PaneView {
             activity: PaneActivity::attached(Instant::now()),
             seen: false,
             last_state: ActivityState::Idle,
-            shell_name: shell_basename(std::env::var("SHELL").ok().as_deref()),
+            shell_name: pane_shell_name(None, std::env::var("SHELL").ok().as_deref()),
             launch: launch.map(
                 |LaunchRequest {
                      command,
@@ -2009,6 +2028,12 @@ impl PaneView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Les chemins du Finder n'existent pas sur la machine distante : le dépôt ne tape rien.
+        if self.remote {
+            hud::log_event("drop ignored remote=true");
+            cx.notify();
+            return;
+        }
         match dropped_text(dropped.paths()) {
             Ok(text) => {
                 hud::log_event(&format!("drop paths={}", dropped.paths().len()));
@@ -2313,6 +2338,10 @@ impl PaneView {
 
     /// Ce qu'un chemin du pane désigne : le dossier du pane pour un chemin relatif, sinon le projet.
     fn target_of(&self, found: &PathMatch) -> Option<PathTarget> {
+        // Le chemin d'un pane distant n'existe pas sur le Mac : l'ouvrir ouvrirait un autre fichier, ou rien.
+        if self.remote {
+            return None;
+        }
         let home = std::env::var_os("HOME").map(PathBuf::from)?;
         let pane_folder = match &self.backend {
             PaneBackend::Tmux(_) => self.pane_path.clone(),
@@ -2950,6 +2979,20 @@ mod tests {
     fn the_shell_name_is_the_basename_of_the_shell_variable() {
         assert_eq!(shell_basename(Some("/opt/homebrew/bin/fish")), "fish");
         assert_eq!(shell_basename(Some("/bin/zsh")), "zsh");
+    }
+
+    #[test]
+    fn a_remote_pane_takes_the_shell_of_its_machine() {
+        // Le shell de la machine prime ; sans lui, la règle locale (la variable `SHELL` du Mac).
+        assert_eq!(
+            pane_shell_name(Some("/usr/bin/bash"), Some("/bin/zsh")),
+            "bash"
+        );
+        assert_eq!(
+            pane_shell_name(None, Some("/opt/homebrew/bin/fish")),
+            "fish"
+        );
+        assert_eq!(pane_shell_name(None, None), "zsh");
     }
 
     #[test]
