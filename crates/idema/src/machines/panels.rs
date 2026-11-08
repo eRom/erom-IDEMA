@@ -76,6 +76,28 @@ pub fn remote_start_folder(pane_path: Option<&str>, home: &str) -> String {
         .to_owned()
 }
 
+/// Où part un lien ouvert depuis un pane, la galerie Artifacts ou une page de connexion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRoute {
+    /// Le volet Navigateur d'IdemA (session locale).
+    Browser,
+    /// Le navigateur par défaut du Mac : le Navigateur d'IdemA n'existe pas sur une session distante (spec §3.5).
+    SystemBrowser,
+    /// Ni l'un ni l'autre : un schéma que seul un navigateur du Mac sait ouvrir sans risque n'est pas ouvert.
+    Ignored,
+}
+
+/// Où va `url` : sur une session distante, le navigateur du système pour `http` et `https` seulement, le reste est ignoré.
+pub fn link_route(selected_is_remote: bool, url: &str) -> LinkRoute {
+    if !selected_is_remote {
+        return LinkRoute::Browser;
+    }
+    match url::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => LinkRoute::SystemBrowser,
+        _ => LinkRoute::Ignored,
+    }
+}
+
 /// Les outils qui lisent ce Mac (« Ramener », la galerie Artifacts) : une session de ce Mac seulement.
 pub fn offers_local_tools(session_key: &str) -> bool {
     machine_of(session_key) == LOCAL_MACHINE
@@ -111,11 +133,25 @@ mod tests {
     }
 
     #[test]
-    fn the_unavailable_text_is_the_one_of_the_spec() {
-        assert_eq!(
-            UNAVAILABLE_ON_REMOTE,
-            "Pas encore disponible sur une machine distante"
-        );
+    fn a_link_on_a_remote_session_goes_to_the_system_browser_when_it_is_http() {
+        assert_eq!(link_route(false, "https://claude.ai/x"), LinkRoute::Browser);
+        assert_eq!(link_route(false, "file:///etc/hosts"), LinkRoute::Browser);
+        for url in [
+            "https://claude.ai/artifacts?tab=mine",
+            "http://localhost:3000/a",
+        ] {
+            assert_eq!(link_route(true, url), LinkRoute::SystemBrowser, "{url}");
+        }
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "mailto:a@b.c",
+            "ssh://h",
+            "pas une url",
+            "",
+        ] {
+            assert_eq!(link_route(true, url), LinkRoute::Ignored, "{url}");
+        }
     }
 
     #[test]

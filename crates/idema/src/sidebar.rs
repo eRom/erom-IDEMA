@@ -415,8 +415,7 @@ pub fn render_sidebar(
                     },
                     "Artifacts",
                     "",
-                    // La galerie ne propose rien sur une session distante (spec ssh-tmux §3.7).
-                    !workspace.selected_is_remote(),
+                    true,
                     workspace.artifacts_shown(),
                     move |window, cx| {
                         workspace_entity.update(cx, |this, cx| this.show_artifacts(window, cx));

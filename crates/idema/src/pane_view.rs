@@ -3265,26 +3265,42 @@ mod tests {
 
     #[test]
     fn remote_shell_script_quotes_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
         assert_eq!(
             remote_shell_script("/home/claude/mon projet"),
             "cd '/home/claude/mon projet' 2>/dev/null; exec \"$SHELL\" -l"
         );
-        // Une apostrophe, un dollar ou un point-virgule dans le dossier ne sortent pas de la citation, et le shell
-        // distant (de la famille POSIX) lit le script jusqu'au bout.
-        for folder in [
-            "/home/claude/mon projet",
-            "/srv/o'neil",
-            "/tmp/$HOME;ls",
-            "",
-        ] {
-            let script = remote_shell_script(folder);
-            let status = Command::new("/bin/sh")
-                .args(["-n", "-c", &script])
-                .status()
-                .expect("sh starts");
-            assert!(status.success(), "{script}");
-        }
+        // Un vrai tour : le dossier a une apostrophe, un `$`, un espace et un `;`, et `SHELL` est un petit script qui
+        // imprime son dossier courant. Le shell de login part dans ce dossier, sans rien exécuter d'autre.
+        let root = std::env::temp_dir().join(format!("idema-t8-{}", std::process::id()));
+        let folder = root.join("o'neil $HOME; touch pwned");
+        std::fs::create_dir_all(&folder).unwrap();
+        let fake_shell = root.join("fake-shell");
+        std::fs::write(&fake_shell, "#!/bin/sh\npwd -P\n").unwrap();
+        std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = remote_shell_script(folder.to_str().unwrap());
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("SHELL", &fake_shell)
+            .output()
+            .expect("sh starts");
+        let printed = String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string();
+        let expected = folder.canonicalize().unwrap();
+        let pwned = folder.join("pwned").exists() || root.join("pwned").exists();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(printed, expected.to_str().unwrap());
+        assert!(!pwned, "the folder name was read as a command");
+        // Un dossier disparu ne gêne pas : le shell part là où ssh arrive, sans message.
+        let missing = Command::new("/bin/sh")
+            .args(["-c", &remote_shell_script("/nonexistent/o'neil")])
+            .env("SHELL", "/bin/echo")
+            .output()
+            .expect("sh starts");
+        assert!(missing.status.success());
+        assert!(missing.stderr.is_empty());
     }
 
     #[test]

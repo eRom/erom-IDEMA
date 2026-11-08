@@ -33,6 +33,7 @@ use crate::artifacts::view::{ArtifactsEvent, ArtifactsView};
 use crate::assets::{Icon, logo_path};
 use crate::bootstrap::{self, Bootstrap};
 use crate::browser::BrowserSettings;
+use crate::browser::address::log_form;
 use crate::browser::panel::{
     BROWSER_PANEL_WIDTH, BrowserEvent, BrowserPanel, render_panel as render_browser_panel,
     servers_badge_count,
@@ -85,8 +86,8 @@ use crate::machines::lifecycle::{
     remote_menu_lines, set_extended_keys, windows_to_unpin,
 };
 use crate::machines::panels::{
-    MachineTerminalPin, OPENING_TERMINAL, UNAVAILABLE_ON_REMOTE, offers_local_tools,
-    remote_start_folder, terminal_target, unavailable_open_panel,
+    LinkRoute, MachineTerminalPin, OPENING_TERMINAL, UNAVAILABLE_ON_REMOTE, link_route,
+    offers_local_tools, remote_start_folder, terminal_target, unavailable_open_panel,
 };
 use crate::machines::probe::{
     MachineFacts, RemoteFailure, ensure_control_dir, probe, probe_spec, retry_delay,
@@ -3611,6 +3612,8 @@ impl Workspace {
             return;
         };
         if self.ensure_terminal(&key, window, cx) == TerminalReady::Failed {
+            // La demande d'« Ouvrir un terminal » qui n'a pas abouti ne reste pas en attente.
+            self.machine_terminal = None;
             return;
         }
         self.menu = None;
@@ -3640,6 +3643,8 @@ impl Workspace {
             return;
         }
         self.set_right_panel(None);
+        // Fermé, le volet repart du contexte à sa prochaine ouverture : « Ouvrir un terminal » ne colle pas.
+        self.machine_terminal = None;
         hud::log_event("terminal closed");
         self.restore_focus(window, cx);
         self.sync_keyboard(window, cx);
@@ -4780,6 +4785,23 @@ impl Workspace {
     ) {
         // Un menu ouvert ne survit pas au geste (comme `open_browser`, qui ne passe pas là si le volet est ouvert).
         self.menu = None;
+        // Sur une session distante, le Navigateur n'existe pas : un lien http(s) s'ouvre dans le navigateur du Mac, le
+        // reste est ignoré. Le journal ne garde ni requête ni fragment.
+        match link_route(self.selected_is_remote(), &url) {
+            LinkRoute::Browser => {}
+            LinkRoute::SystemBrowser => {
+                hud::log_event(&format!(
+                    "link opened in system browser url={}",
+                    log_form(&url)
+                ));
+                cx.open_url(&url);
+                return;
+            }
+            LinkRoute::Ignored => {
+                hud::log_event(&format!("link ignored remote=true url={}", log_form(&url)));
+                return;
+            }
+        }
         if !self.browser_open() {
             self.open_browser_with(false, window, cx);
         }
