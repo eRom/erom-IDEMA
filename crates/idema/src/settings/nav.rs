@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub enum Section {
     General,
     Agents,
+    Machines,
     CommitMessage,
     Browser,
     Companion,
@@ -74,9 +75,10 @@ impl SystemItem {
 
 impl Section {
     /// Toutes les sections, dans l'ordre de la barre latérale.
-    pub const ALL: [Section; 9] = [
+    pub const ALL: [Section; 10] = [
         Section::General,
         Section::Agents,
+        Section::Machines,
         Section::CommitMessage,
         Section::Browser,
         Section::Companion,
@@ -91,6 +93,7 @@ impl Section {
         match self {
             Self::General => "Général",
             Self::Agents => "Agents",
+            Self::Machines => "Machines",
             Self::CommitMessage => "Message de commit",
             Self::Browser => "Navigateur",
             Self::Companion => "Compagnon",
@@ -105,6 +108,7 @@ impl Section {
         match self {
             Self::General
             | Self::Agents
+            | Self::Machines
             | Self::CommitMessage
             | Self::Browser
             | Self::Companion => NavGroup::IdemA,
@@ -119,6 +123,7 @@ impl Section {
         match self {
             Self::General
             | Self::Agents
+            | Self::Machines
             | Self::CommitMessage
             | Self::Browser
             | Self::Companion => "config.toml",
@@ -142,6 +147,9 @@ pub mod label {
     pub const HARNESS: &str = "Harness";
     pub const DEFAULT_AGENT: &str = "Par défaut";
     pub const ADD_AGENT: &str = "Ajouter un agent";
+    pub const MACHINES: &str = "Machines";
+    pub const CONNECTION: &str = "Connexion";
+    pub const ADD_MACHINE: &str = "Ajouter une machine";
     pub const COMMIT_ENABLED: &str = "Activer";
     pub const API_KEY: &str = "Clé d'API";
     pub const MODEL: &str = "Modèle";
@@ -174,6 +182,7 @@ pub fn setting_labels(section: Section) -> &'static [&'static str] {
             label::DEFAULT_AGENT,
             label::ADD_AGENT,
         ],
+        Section::Machines => &[label::MACHINES, label::CONNECTION, label::ADD_MACHINE],
         Section::CommitMessage => &[
             label::COMMIT_ENABLED,
             label::API_KEY,
@@ -251,6 +260,7 @@ mod tests {
             vec![
                 Section::General,
                 Section::Agents,
+                Section::Machines,
                 Section::CommitMessage,
                 Section::Browser,
                 Section::Companion,
@@ -283,6 +293,19 @@ mod tests {
         assert_eq!(filter_nav("compagnon"), vec![Section::Companion]);
         assert_eq!(filter_nav("appairer"), vec![Section::Companion]);
         assert_eq!(filter_nav("absent apres"), vec![Section::Companion]);
+    }
+
+    #[test]
+    fn the_machines_section_sits_right_after_the_agents() {
+        let all = Section::ALL;
+        let agents = all.iter().position(|s| *s == Section::Agents).unwrap();
+        assert_eq!(all[agents + 1], Section::Machines);
+        assert_eq!(all[agents + 2], Section::CommitMessage);
+        assert_eq!(Section::Machines.group(), NavGroup::IdemA);
+        assert_eq!(Section::Machines.source(), "config.toml");
+        assert_eq!(filter_nav("machines"), vec![Section::Machines]);
+        assert_eq!(filter_nav("connexion"), vec![Section::Machines]);
+        assert_eq!(filter_nav("ajouter une machine"), vec![Section::Machines]);
     }
 
     #[test]

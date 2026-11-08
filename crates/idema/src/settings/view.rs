@@ -55,6 +55,7 @@ fn section_icon(section: Section) -> Icon {
     match section {
         Section::General => Icon::Tune,
         Section::Agents => Icon::SmartToy,
+        Section::Machines => Icon::Public,
         Section::CommitMessage => Icon::EditNote,
         Section::Browser => Icon::Language,
         Section::Companion => Icon::Smartphone,
@@ -532,6 +533,10 @@ impl SettingsView {
         self.render_idema_section(Section::Agents, theme, cx)
     }
 
+    fn render_machines(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        self.render_idema_section(Section::Machines, theme, cx)
+    }
+
     fn render_commit_message(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         self.render_idema_section(Section::CommitMessage, theme, cx)
     }
@@ -561,6 +566,7 @@ impl SettingsView {
         match self.section {
             Section::General => self.render_general(theme, cx),
             Section::Agents => self.render_agents(theme, cx),
+            Section::Machines => self.render_machines(theme, cx),
             Section::CommitMessage => self.render_commit_message(theme, cx),
             Section::Browser => self.render_browser(theme, cx),
             Section::Companion => self.render_companion(theme, cx),

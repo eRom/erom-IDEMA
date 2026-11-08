@@ -9,23 +9,27 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, Focusable, FontWeight, MouseButton,
-    SharedString, Subscription, Task, Window, div, prelude::*,
+    PromptButton, PromptLevel, SharedString, Subscription, Task, Window, div, prelude::*,
 };
 use gpui_component::input::{InputEvent, InputState, TextareaState};
+use idema_tmux::remote::RemoteSpec;
 
 use super::controls::{
-    area_box, button, column_title, error_line, field_box, icon_button, radio, setting_row, toggle,
+    ButtonKind, action_button, area_box, button, column_title, error_line, field_box, icon_button,
+    radio, setting_row, toggle,
 };
 use super::nav::{Section, label};
 use super::toml_write::{ConfigEdit, write_edit};
 use super::view::SettingsView;
 use crate::assets::Icon;
 use crate::config::{
-    AgentEntry, CommitMessageConfig, Config, ConfigError, ConfigErrorKind, Favorite, FileWatch,
-    harness_groups, load_config,
+    AgentEntry, CommitMessageConfig, Config, ConfigError, ConfigErrorKind, DEFAULT_LOCAL_LABEL,
+    Favorite, FileWatch, RemoteMachineEntry, connection_problem, harness_groups, label_problem,
+    load_config,
 };
 use crate::errors::{Explained, explain_config};
-use crate::theme::{ERROR_TEXT, SEPARATOR, TEXT_MIN, TEXT_SECONDARY, Theme, color, white};
+use crate::machines::probe::{RemoteFailure, control_dir, ensure_control_dir, probe};
+use crate::theme::{ERROR_TEXT, RUNNING, SEPARATOR, TEXT_MIN, TEXT_SECONDARY, Theme, color, white};
 
 /// Un champ texte écrit une fois la frappe arrêtée depuis ce délai.
 const COMMIT_DELAY: Duration = Duration::from_millis(400);
@@ -46,11 +50,19 @@ const EDIT_CONFIG: &str = "Éditer config.toml";
 const NO_FAVORITE: &str = "Aucun favori.";
 const NO_AGENT: &str = "Aucun agent.";
 const NO_HARNESS: &str = "Sans harness";
+const LOCAL_CONNECTION: &str = "Ce Mac";
+const MACHINE_LABEL: &str = "Label";
+const TEST_MACHINE: &str = "Tester";
+const PROBING: &str = "Test en cours";
+const CONTROL_DIR_UNUSABLE: &str = "Dossier de contrôle ssh inutilisable";
+/// Les seules variables du processus que la sonde ssh reçoit.
+const PROBE_ENV: [&str; 6] = ["HOME", "USER", "LOGNAME", "PATH", "SSH_AUTH_SOCK", "LANG"];
 
-/// La liste que porte une ligne : les agents ou les favoris.
+/// La liste que porte une ligne : les agents, les machines distantes ou les favoris.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ListKind {
     Agents,
+    Machines,
     Favorites,
 }
 
@@ -74,6 +86,7 @@ pub(super) enum Field {
     CompanionNotifyWaiting,
     CompanionNotifyError,
     CompanionAwayAfter,
+    LocalMachineLabel,
     Row(ListKind, u64),
     /// Le message qui vaut pour toute une liste (une ligne a changé sur le disque pendant qu'on la modifiait).
     List(ListKind),
@@ -186,6 +199,93 @@ pub fn plan_row_edit<T: PartialEq + Clone>(
     })
 }
 
+/// L'édition d'une ligne de machine distante, d'après la liste `list` du fichier. `baseline` : l'entrée d'où la ligne est
+/// née, `None` pour le brouillon (qui doit alors s'ajouter au rang `index`, juste après la dernière). Une connexion ou un
+/// label refusé revient en texte à montrer sous la ligne, sans rien écrire ; un brouillon auquel il manque le label ou la
+/// connexion n'écrit rien non plus, mais sans erreur : il n'est pas fini.
+fn machine_row_edit(
+    list: &[RemoteMachineEntry],
+    index: usize,
+    baseline: Option<&RemoteMachineEntry>,
+    label: &str,
+    connection: &str,
+) -> Result<Option<ConfigEdit>, String> {
+    let stale = || STALE_LIST.to_string();
+    let others: Vec<&str> = list
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| *position != index)
+        .map(|(_, machine)| machine.connection.as_str())
+        .collect();
+    let entry = RemoteMachineEntry {
+        label: label.to_string(),
+        connection: connection.to_string(),
+    };
+    let planned = match baseline {
+        None => {
+            if list.len() != index {
+                return Err(stale());
+            }
+            if !connection.is_empty()
+                && let Some(problem) = connection_problem(connection, &others)
+            {
+                return Err(problem.to_string());
+            }
+            if label.is_empty() || connection.is_empty() {
+                return Ok(None);
+            }
+            let mut planned = list.to_vec();
+            planned.push(entry);
+            planned
+        }
+        Some(base) => {
+            let planned = plan_row_edit(list, index, base, RowChange::Replace(entry))
+                .map_err(|Stale| stale())?;
+            if let Some(problem) =
+                label_problem(label).or_else(|| connection_problem(connection, &others))
+            {
+                return Err(problem.to_string());
+            }
+            planned
+        }
+    };
+    Ok((planned != list).then_some(ConfigEdit::RemoteMachines(planned)))
+}
+
+/// La ligne de succès d'un test : `Connectée · tmux 3.8 · 10 agents`. `agents` : le nombre d'agents du `~/.idnma.yml` de
+/// la machine, `None` quand elle n'en a pas.
+fn probe_summary(tmux_version: (u32, u32), agents: Option<usize>) -> String {
+    let (major, minor) = tmux_version;
+    let agents = match agents {
+        // Le français accorde « 0 agent » comme « 1 agent ».
+        Some(count) if count <= 1 => format!("{count} agent"),
+        Some(count) => format!("{count} agents"),
+        None => "pas de ~/.idnma.yml".to_string(),
+    };
+    format!("Connectée · tmux {major}.{minor} · {agents}")
+}
+
+/// La machine de la sonde : canal 0, dossier de contrôle de cette instance, et pour seul environnement les variables de
+/// `PROBE_ENV` que `var` connaît (`home` et `shell` distants sont inconnus tant qu'on ne les a pas sondés).
+fn probe_spec(
+    connection: &str,
+    idema_home: &Path,
+    uid: u32,
+    var: impl Fn(&str) -> Option<String>,
+) -> RemoteSpec {
+    RemoteSpec {
+        destination: connection.to_string(),
+        control_dir: control_dir(idema_home, uid),
+        slot: 0,
+        ssh_env: PROBE_ENV
+            .iter()
+            .filter_map(|name| var(name).map(|value| ((*name).to_string(), value)))
+            .collect(),
+        home: String::new(),
+        shell: String::new(),
+    }
+}
+
 /// Le message d'une erreur d'écriture ou de lecture, tel qu'il se lit sous un contrôle. Une erreur de syntaxe passe par le
 /// catalogue français ; les autres portent déjà leur phrase (validation d'IdemA, « écriture impossible »).
 fn error_text(error: &ConfigError) -> String {
@@ -209,6 +309,7 @@ struct EntryRow {
 #[derive(Debug, Clone, PartialEq)]
 enum Baseline {
     Agent(AgentEntry),
+    Machine(RemoteMachineEntry),
     Favorite(Favorite),
 }
 
@@ -240,6 +341,7 @@ struct Inputs {
     endpoint: Entity<InputState>,
     instructions: Entity<TextareaState>,
     away_after: Entity<InputState>,
+    local_label: Entity<InputState>,
 }
 
 impl Inputs {
@@ -255,6 +357,7 @@ impl Inputs {
             Field::Model => Some(&self.model),
             Field::Endpoint => Some(&self.endpoint),
             Field::CompanionAwayAfter => Some(&self.away_after),
+            Field::LocalMachineLabel => Some(&self.local_label),
             _ => None,
         }
     }
@@ -283,10 +386,22 @@ pub(super) struct IdemaState {
     agent_groups: Vec<(Option<String>, Vec<u64>)>,
     /// La ligne « Ajouter un agent » pas encore écrite : le fichier refuse un agent sans nom ni commande.
     agent_draft: Option<EntryRow>,
+    /// Les machines distantes, dans l'ordre du fichier, et la ligne « Ajouter une machine » pas encore écrite.
+    machines: Vec<EntryRow>,
+    machine_draft: Option<EntryRow>,
+    /// Le dernier « Tester » de chaque connexion : la ligne qui porte cette connexion en montre le résultat.
+    probes: HashMap<String, ProbeState>,
     favorites: Vec<EntryRow>,
     favorite_draft: Option<EntryRow>,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
+}
+
+/// Où en est le test d'une connexion : en cours, ou son verdict déjà rédigé pour l'interface.
+#[derive(Debug, Clone, PartialEq)]
+enum ProbeState {
+    Running,
+    Done(Result<String, String>),
 }
 
 impl IdemaState {
@@ -316,6 +431,7 @@ impl IdemaState {
             endpoint: single("Point d'accès par défaut", window, cx),
             instructions: cx.new(|cx| TextareaState::new(window, cx)),
             away_after: single("120", window, cx),
+            local_label: single(DEFAULT_LOCAL_LABEL, window, cx),
         };
 
         let mut subscriptions = Vec::new();
@@ -329,6 +445,7 @@ impl IdemaState {
             Field::Model,
             Field::Endpoint,
             Field::CompanionAwayAfter,
+            Field::LocalMachineLabel,
         ] {
             if let Some(input) = inputs.input(field) {
                 subscriptions.push(watch_input(field, input, window, cx));
@@ -366,6 +483,9 @@ impl IdemaState {
             agents: Vec::new(),
             agent_groups: Vec::new(),
             agent_draft: None,
+            machines: Vec::new(),
+            machine_draft: None,
+            probes: HashMap::new(),
             favorites: Vec::new(),
             favorite_draft: None,
             _subscriptions: subscriptions,
@@ -381,6 +501,7 @@ impl IdemaState {
     fn rows(&self, kind: ListKind) -> &Vec<EntryRow> {
         match kind {
             ListKind::Agents => &self.agents,
+            ListKind::Machines => &self.machines,
             ListKind::Favorites => &self.favorites,
         }
     }
@@ -388,6 +509,7 @@ impl IdemaState {
     fn draft(&self, kind: ListKind) -> &Option<EntryRow> {
         match kind {
             ListKind::Agents => &self.agent_draft,
+            ListKind::Machines => &self.machine_draft,
             ListKind::Favorites => &self.favorite_draft,
         }
     }
@@ -395,6 +517,7 @@ impl IdemaState {
     fn draft_mut(&mut self, kind: ListKind) -> &mut Option<EntryRow> {
         match kind {
             ListKind::Agents => &mut self.agent_draft,
+            ListKind::Machines => &mut self.machine_draft,
             ListKind::Favorites => &mut self.favorite_draft,
         }
     }
@@ -402,6 +525,7 @@ impl IdemaState {
     fn rows_mut(&mut self, kind: ListKind) -> &mut Vec<EntryRow> {
         match kind {
             ListKind::Agents => &mut self.agents,
+            ListKind::Machines => &mut self.machines,
             ListKind::Favorites => &mut self.favorites,
         }
     }
@@ -490,6 +614,12 @@ impl SettingsView {
             .map(|section| section.away_after_seconds.to_string())
             .unwrap_or_default();
         changed |= self.sync_input(Field::CompanionAwayAfter, &away, window, cx);
+        let local_label = config
+            .machines
+            .as_ref()
+            .and_then(|machines| machines.local_label.clone())
+            .unwrap_or_default();
+        changed |= self.sync_input(Field::LocalMachineLabel, &local_label, window, cx);
         changed |= self.sync_input(
             Field::ApiKey,
             commit.api_key.as_deref().unwrap_or(""),
@@ -505,6 +635,7 @@ impl SettingsView {
         );
         changed |= self.sync_instructions(commit.instructions.as_deref().unwrap_or(""), window, cx);
         changed |= self.sync_rows(ListKind::Agents, false, window, cx);
+        changed |= self.sync_rows(ListKind::Machines, false, window, cx);
         changed |= self.sync_rows(ListKind::Favorites, false, window, cx);
         if !self.list_busy(ListKind::Agents, window, cx) {
             changed |= self.regroup_agents();
@@ -604,6 +735,11 @@ impl SettingsView {
                     ]
                 })
                 .collect(),
+            ListKind::Machines => config
+                .remote_machines()
+                .iter()
+                .map(|machine| vec![machine.label.clone(), machine.connection.clone()])
+                .collect(),
             ListKind::Favorites => config
                 .browser
                 .iter()
@@ -620,6 +756,12 @@ impl SettingsView {
         };
         match kind {
             ListKind::Agents => config.agents.iter().cloned().map(Baseline::Agent).collect(),
+            ListKind::Machines => config
+                .remote_machines()
+                .iter()
+                .cloned()
+                .map(Baseline::Machine)
+                .collect(),
             ListKind::Favorites => config
                 .browser
                 .iter()
@@ -741,6 +883,7 @@ impl SettingsView {
         self.idema.next_key += 1;
         let placeholders: &[&str] = match kind {
             ListKind::Agents => &["Nom", "Commande", "Icône", "Harness"],
+            ListKind::Machines => &[MACHINE_LABEL, label::CONNECTION],
             ListKind::Favorites => &["Nom", "Adresse"],
         };
         let mut fields = Vec::new();
@@ -993,6 +1136,14 @@ impl SettingsView {
                 Ok((wanted.or(Some(DEFAULT_AWAY_AFTER)) != current)
                     .then_some(ConfigEdit::CompanionAwayAfter(wanted)))
             }
+            Field::LocalMachineLabel => {
+                let wanted = optional(read(&inputs.local_label));
+                let current = config
+                    .machines
+                    .as_ref()
+                    .and_then(|machines| machines.local_label.clone());
+                Ok((wanted != current).then_some(ConfigEdit::LocalMachineLabel(wanted)))
+            }
             Field::Row(kind, key) => self.build_row_edit(kind, key, cx),
             Field::SoundOnWait
             | Field::CommitEnabled
@@ -1057,6 +1208,23 @@ impl SettingsView {
                         .map_err(|Stale| stale())?
                 };
                 Ok((planned != list).then_some(ConfigEdit::Agents(planned)))
+            }
+            ListKind::Machines => {
+                let base = if is_draft {
+                    None
+                } else {
+                    match baseline {
+                        Some(Baseline::Machine(base)) => Some(base),
+                        _ => return Err(stale()),
+                    }
+                };
+                machine_row_edit(
+                    disk.remote_machines(),
+                    index,
+                    base.as_ref(),
+                    &values[0],
+                    &values[1],
+                )
             }
             ListKind::Favorites => {
                 let list = disk
@@ -1183,6 +1351,11 @@ impl SettingsView {
                     (list != disk.agents).then_some(ConfigEdit::Agents(list))
                 })
             }
+            (ListKind::Machines, Baseline::Machine(base)) => {
+                let list = disk.remote_machines();
+                plan_row_edit(list, index, &base, row_change(change))
+                    .map(|updated| (updated != list).then_some(ConfigEdit::RemoteMachines(updated)))
+            }
             (ListKind::Favorites, Baseline::Favorite(base)) => {
                 let list = disk
                     .browser
@@ -1219,6 +1392,90 @@ impl SettingsView {
         first.update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
     }
+
+    /// « Tester » : sonde `connection` hors du fil d'interface (un appel ssh, jusqu'à quelques secondes) et range le
+    /// verdict. Une connexion refusée ou déjà en cours de test ne lance rien.
+    fn start_probe(&mut self, connection: String, cx: &mut Context<Self>) {
+        if connection_problem(&connection, &[]).is_some()
+            || self.idema.probes.get(&connection) == Some(&ProbeState::Running)
+        {
+            return;
+        }
+        let home = self
+            .config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        // SAFETY: `geteuid` n'a aucune précondition.
+        let uid = unsafe { libc::geteuid() };
+        let spec = probe_spec(&connection, &home, uid, |name| std::env::var(name).ok());
+        self.idema
+            .probes
+            .insert(connection.clone(), ProbeState::Running);
+        let work = cx.background_spawn(async move {
+            if let Err(error) = ensure_control_dir(&spec.control_dir) {
+                crate::hud::log_event(&format!(
+                    "ssh control dir unusable {}: {error}",
+                    spec.control_dir.display()
+                ));
+                return Err(CONTROL_DIR_UNUSABLE.to_string());
+            }
+            probe(&spec)
+                .map(|facts| probe_summary(facts.tmux_version, facts.agents.as_ref().map(Vec::len)))
+                .map_err(|failure: RemoteFailure| failure.message(&spec.destination))
+        });
+        cx.spawn(async move |this, cx| {
+            let verdict = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.idema
+                    .probes
+                    .insert(connection, ProbeState::Done(verdict));
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Le geste « supprimer » d'une machine : la confirmation d'abord (les sessions de la machine ne sont pas touchées),
+    /// puis `change_entry`. Un brouillon part sans question : il n'est pas encore dans le fichier.
+    fn confirm_machine_removal(&mut self, key: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let row = self
+            .idema
+            .rows(ListKind::Machines)
+            .iter()
+            .find(|row| row.key == key);
+        let label = match row {
+            // Le nom sous lequel IdemA connaît la machine, pas la saisie en cours.
+            Some(EntryRow {
+                baseline: Some(Baseline::Machine(machine)),
+                ..
+            }) => machine.label.clone(),
+            Some(row) => row.values(cx)[0].clone(),
+            None => {
+                self.change_entry(ListKind::Machines, key, Change::Delete, window, cx);
+                return;
+            }
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Retirer « {label} » d'IdemA ?"),
+            Some("Ses sessions continuent de tourner sur la machine."),
+            &[
+                PromptButton::new("Retirer"),
+                PromptButton::cancel("Annuler"),
+            ],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(0) = answer.await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.change_entry(ListKind::Machines, key, Change::Delete, window, cx);
+                });
+            }
+        })
+        .detach();
+    }
 }
 
 // ---- Rendu --------------------------------------------------------------------------------------------------------------
@@ -1232,6 +1489,9 @@ const NAME_COLUMN: f32 = 130.;
 const HARNESS_COLUMN: f32 = 120.;
 const ICON_COLUMN: f32 = 72.;
 const FAVORITE_NAME_COLUMN: f32 = 170.;
+/// Une ligne de machine : le label, la connexion qui prend le reste, puis « Tester » et supprimer.
+const MACHINE_LABEL_COLUMN: f32 = 170.;
+const MACHINE_ACTIONS_COLUMN: f32 = 104.;
 /// Largeur des champs d'une ligne de réglage.
 const NUMBER_WIDTH: f32 = 80.;
 const TEXT_WIDTH: f32 = 260.;
@@ -1254,6 +1514,7 @@ impl SettingsView {
             Ok(config) => match section {
                 Section::General => self.general_rows(&config, theme, cx).into_any_element(),
                 Section::Agents => self.agent_rows(&config, theme, cx).into_any_element(),
+                Section::Machines => self.machine_rows(theme, cx).into_any_element(),
                 Section::CommitMessage => self.commit_rows(&config, theme, cx).into_any_element(),
                 _ => self.favorite_rows(theme, cx).into_any_element(),
             },
@@ -1280,6 +1541,7 @@ impl SettingsView {
         let theme = *cx.global::<Theme>();
         let (kind, text) = match section {
             Section::Agents => (ListKind::Agents, label::ADD_AGENT),
+            Section::Machines => (ListKind::Machines, label::ADD_MACHINE),
             Section::Browser => (ListKind::Favorites, label::ADD_FAVORITE),
             _ => return None,
         };
@@ -1528,6 +1790,143 @@ impl SettingsView {
         )
     }
 
+    /// La section Machines : Localhost en tête (son label seul se modifie), puis les machines distantes du fichier et le
+    /// brouillon éventuel.
+    fn machine_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let mut list = self.list_header(ListKind::Machines, theme);
+        list = list.children(
+            self.error_of(Field::List(ListKind::Machines))
+                .map(|text| error_line(text, theme)),
+        );
+        list = list.child(self.local_machine_row(theme, cx));
+        self.push_entries(list, ListKind::Machines, &[], theme, cx)
+    }
+
+    /// Localhost : un champ pour son label, la connexion « Ce Mac » en lecture seule, ni « Tester » ni supprimer.
+    fn local_machine_row(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let field = Field::LocalMachineLabel;
+        let label_box = field_box(
+            "settings-local-machine-label",
+            &self.idema.inputs.local_label,
+            Some(MACHINE_LABEL_COLUMN),
+            self.idema.errors.contains_key(&field),
+            theme,
+            cx,
+        );
+        div()
+            .flex()
+            .flex_col()
+            .py(theme.px(6.))
+            .border_b_1()
+            .border_color(white(SEPARATOR))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(theme.px(8.))
+                    .child(label_box)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(theme.px(10.))
+                            .text_color(white(TEXT_SECONDARY))
+                            .child(LOCAL_CONNECTION),
+                    )
+                    .child(div().w(theme.px(MACHINE_ACTIONS_COLUMN)).flex_none()),
+            )
+            .children(self.error_of(field).map(|text| error_line(text, theme)))
+    }
+
+    /// Une machine distante : label, connexion, « Tester » et supprimer, puis le verdict du dernier test et l'erreur de la
+    /// ligne. « Tester » est éteint tant que la connexion est refusée (vide, avec espace, réservée).
+    fn machine_entry_row(
+        &self,
+        row: &EntryRow,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let kind = ListKind::Machines;
+        let key = row.key;
+        let field = Field::Row(kind, key);
+        let invalid = self.idema.errors.contains_key(&field);
+        let id = |part: &str| SharedString::from(format!("settings-{kind:?}-{key}-{part}"));
+        let connection = row.values(cx)[1].clone();
+        let testable = connection_problem(&connection, &[]).is_none();
+
+        let mut test = action_button(
+            id("test"),
+            TEST_MACHINE,
+            None,
+            ButtonKind::Ghost,
+            testable,
+            theme,
+        );
+        if testable {
+            let target = connection.clone();
+            test = test.on_click(cx.listener(move |this, _, _, cx| {
+                this.start_probe(target.clone(), cx);
+            }));
+        }
+        let delete = icon_button(id("delete"), Icon::Delete, true, theme).on_click(
+            cx.listener(move |this, _, window, cx| this.confirm_machine_removal(key, window, cx)),
+        );
+        let verdict = self.idema.probes.get(&connection).map(|state| {
+            let (text, tint) = match state {
+                ProbeState::Running => (PROBING.to_string(), white(TEXT_SECONDARY)),
+                ProbeState::Done(Ok(summary)) => (summary.clone(), color(RUNNING)),
+                ProbeState::Done(Err(message)) => (message.clone(), white(TEXT_SECONDARY)),
+            };
+            div()
+                .mt(theme.px(6.))
+                .text_size(theme.text(12.))
+                .text_color(tint)
+                .child(SharedString::from(text))
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .py(theme.px(6.))
+            .border_b_1()
+            .border_color(white(SEPARATOR))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(theme.px(8.))
+                    .child(field_box(
+                        id("label"),
+                        &row.fields[0],
+                        Some(MACHINE_LABEL_COLUMN),
+                        invalid,
+                        theme,
+                        cx,
+                    ))
+                    .child(field_box(
+                        id("connection"),
+                        &row.fields[1],
+                        None,
+                        invalid,
+                        theme,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(theme.px(2.))
+                            .w(theme.px(MACHINE_ACTIONS_COLUMN))
+                            .flex_none()
+                            .child(test)
+                            .child(delete),
+                    ),
+            )
+            .children(verdict)
+            .children(self.error_of(field).map(|text| error_line(text, theme)))
+    }
+
     fn favorite_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let mut list = self.list_header(ListKind::Favorites, theme);
         list = list.children(
@@ -1574,6 +1973,15 @@ impl SettingsView {
                         .flex_none(),
                 )
                 .child(div().w(theme.px(AGENT_ACTIONS_COLUMN)).flex_none()),
+            ),
+            ListKind::Machines => div().flex().flex_col().child(
+                row.child(
+                    column_title(MACHINE_LABEL, theme)
+                        .w(theme.px(MACHINE_LABEL_COLUMN))
+                        .flex_none(),
+                )
+                .child(column_title(label::CONNECTION, theme).flex_1())
+                .child(div().w(theme.px(MACHINE_ACTIONS_COLUMN)).flex_none()),
             ),
             ListKind::Favorites => div().flex().flex_col().child(
                 row.child(
@@ -1661,6 +2069,9 @@ impl SettingsView {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        if kind == ListKind::Machines {
+            return self.machine_entry_row(row, theme, cx);
+        }
         let key = row.key;
         let field = Field::Row(kind, key);
         let invalid = self.idema.errors.contains_key(&field);
@@ -1696,7 +2107,7 @@ impl SettingsView {
                     None => radio_cell,
                 });
             }
-            ListKind::Favorites => {
+            ListKind::Favorites | ListKind::Machines => {
                 line = line
                     .child(box_of(0, Some(FAVORITE_NAME_COLUMN), "name", cx))
                     .child(box_of(1, None, "address", cx));
@@ -1709,7 +2120,7 @@ impl SettingsView {
         };
         let actions_width = match kind {
             ListKind::Agents => AGENT_ACTIONS_COLUMN,
-            ListKind::Favorites => ACTIONS_COLUMN,
+            ListKind::Favorites | ListKind::Machines => ACTIONS_COLUMN,
         };
         let mut actions = div()
             .flex()
@@ -1855,6 +2266,160 @@ mod tests {
             plan_row_edit(&[] as &[char], 0, &'a', RowChange::Delete),
             Err(Stale)
         );
+    }
+
+    fn machine(label: &str, connection: &str) -> RemoteMachineEntry {
+        RemoteMachineEntry {
+            label: label.into(),
+            connection: connection.into(),
+        }
+    }
+
+    fn machines_file(name: &str, text: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("idema-machines-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_draft_machine_with_a_bad_connection_writes_nothing() {
+        let file = "[[machines.remote]]\nlabel = \"Dell\"\nconnection = \"dell-lan\"\n";
+        let path = machines_file("bad-draft", file);
+        let list = vec![machine("Dell", "dell-lan")];
+        let refused = machine_row_edit(&list, 1, None, "Pi", "a b");
+        assert_eq!(
+            refused,
+            Err(connection_problem("a b", &["dell-lan"])
+                .unwrap()
+                .to_string())
+        );
+        // Une connexion déjà prise par une autre machine, ou réservée à Localhost, est refusée de même.
+        assert_eq!(
+            machine_row_edit(&list, 1, None, "Pi", "dell-lan"),
+            Err("Cette connexion est déjà celle d'une autre machine.".to_string())
+        );
+        assert_eq!(
+            machine_row_edit(&list, 1, None, "Pi", "local"),
+            Err("Ce nom est réservé à la machine locale.".to_string())
+        );
+        // Rien n'a pu être écrit : le fichier est intact.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
+        // Un brouillon incomplet n'écrit rien non plus, sans erreur.
+        assert_eq!(machine_row_edit(&list, 1, None, "", ""), Ok(None));
+        assert_eq!(machine_row_edit(&list, 1, None, "Pi", ""), Ok(None));
+        assert_eq!(
+            machine_row_edit(&list, 1, None, "", "pi@raspberry"),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_complete_draft_machine_is_appended() {
+        let path = machines_file(
+            "append",
+            "[[machines.remote]]\nlabel = \"Dell\"\nconnection = \"dell-lan\"\n",
+        );
+        let list = vec![machine("Dell", "dell-lan")];
+        let edit = machine_row_edit(&list, 1, None, "Pi", "pi@raspberry")
+            .unwrap()
+            .expect("a complete draft is written");
+        assert_eq!(
+            edit,
+            ConfigEdit::RemoteMachines(vec![
+                machine("Dell", "dell-lan"),
+                machine("Pi", "pi@raspberry")
+            ])
+        );
+        let config = write_edit(&path, &edit).unwrap();
+        assert_eq!(config.remote_machines().len(), 2);
+        assert_eq!(config.remote_machines()[1], machine("Pi", "pi@raspberry"));
+        // Le fichier a changé pendant que le brouillon se remplissait : la liste est périmée.
+        assert_eq!(
+            machine_row_edit(&[], 1, None, "Pi", "pi@raspberry"),
+            Err(STALE_LIST.to_string())
+        );
+    }
+
+    #[test]
+    fn an_edited_machine_row_is_checked_against_the_others() {
+        let list = vec![machine("Dell", "dell-lan"), machine("Pi", "pi@raspberry")];
+        let base = list[1].clone();
+        // Le nouveau label seul : l'entrée est remplacée à son rang.
+        assert_eq!(
+            machine_row_edit(&list, 1, Some(&base), "Raspberry", "pi@raspberry"),
+            Ok(Some(ConfigEdit::RemoteMachines(vec![
+                machine("Dell", "dell-lan"),
+                machine("Raspberry", "pi@raspberry"),
+            ])))
+        );
+        // Aucune différence : rien à écrire.
+        assert_eq!(
+            machine_row_edit(&list, 1, Some(&base), "Pi", "pi@raspberry"),
+            Ok(None)
+        );
+        // Une connexion prise par l'autre machine, un label vidé : refus sous la ligne.
+        assert_eq!(
+            machine_row_edit(&list, 1, Some(&base), "Pi", "dell-lan"),
+            Err("Cette connexion est déjà celle d'une autre machine.".to_string())
+        );
+        assert_eq!(
+            machine_row_edit(&list, 1, Some(&base), "", "pi@raspberry"),
+            Err("Le label est vide.".to_string())
+        );
+        // Une autre machine à ce rang : la liste a changé sur le disque.
+        assert_eq!(
+            machine_row_edit(&list, 0, Some(&base), "Pi", "pi@raspberry"),
+            Err(STALE_LIST.to_string())
+        );
+    }
+
+    #[test]
+    fn the_probe_machine_gets_slot_zero_and_only_the_whitelisted_environment() {
+        let process = [
+            ("HOME", "/Users/r"),
+            ("USER", "r"),
+            ("PATH", "/usr/bin"),
+            ("AWS_SECRET_ACCESS_KEY", "never"),
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+        ];
+        let var = |name: &str| {
+            process
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        };
+        let home = std::path::Path::new("/Users/r/.config/idema");
+        let spec = probe_spec("dell-lan", home, 501, var);
+        assert_eq!(spec.destination, "dell-lan");
+        assert_eq!(spec.slot, 0);
+        assert_eq!(spec.control_dir, control_dir(home, 501));
+        let names: Vec<&str> = spec.ssh_env.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(names, ["HOME", "USER", "PATH", "SSH_AUTH_SOCK"]);
+    }
+
+    #[test]
+    fn the_probe_summary_counts_agents_and_names_the_missing_file() {
+        assert_eq!(
+            probe_summary((3, 8), Some(10)),
+            "Connectée · tmux 3.8 · 10 agents"
+        );
+        assert_eq!(
+            probe_summary((3, 8), Some(1)),
+            "Connectée · tmux 3.8 · 1 agent"
+        );
+        assert_eq!(
+            probe_summary((3, 8), Some(0)),
+            "Connectée · tmux 3.8 · 0 agent"
+        );
+        assert_eq!(
+            probe_summary((3, 9), None),
+            "Connectée · tmux 3.9 · pas de ~/.idnma.yml"
+        );
+        assert!(!probe_summary((3, 8), None).contains('—'));
     }
 
     #[test]

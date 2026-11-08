@@ -205,8 +205,8 @@ pub struct RemoteMachineEntry {
     pub connection: String,
 }
 
-#[allow(dead_code)] // Lu par les tâches suivantes.
-const DEFAULT_LOCAL_LABEL: &str = "Localhost";
+/// Le nom de Localhost tant que `[machines] local_label` ne le change pas.
+pub(crate) const DEFAULT_LOCAL_LABEL: &str = "Localhost";
 
 /// Pourquoi une connexion est refusée, `None` si elle convient. `others` : les connexions des autres machines.
 pub fn connection_problem(connection: &str, others: &[&str]) -> Option<&'static str> {
@@ -415,7 +415,6 @@ impl Config {
     }
 
     /// Les machines distantes, dans l'ordre du fichier.
-    #[allow(dead_code)] // Lu par les tâches suivantes.
     pub fn remote_machines(&self) -> &[RemoteMachineEntry] {
         self.machines
             .as_ref()

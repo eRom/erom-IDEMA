@@ -7,7 +7,9 @@ use std::path::Path;
 
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, TableLike, Value};
 
-use crate::config::{AgentEntry, Config, ConfigError, ConfigErrorKind, Favorite, parse_config};
+use crate::config::{
+    AgentEntry, Config, ConfigError, ConfigErrorKind, Favorite, RemoteMachineEntry, parse_config,
+};
 
 /// Une modification d'une clé de `config.toml`. `None` ou une chaîne vide retire la clé (la valeur par défaut
 /// d'IdemA reprend la main).
@@ -38,6 +40,10 @@ pub enum ConfigEdit {
     CompanionNotifyError(bool),
     /// `None` retire la clé (le délai par défaut reprend la main).
     CompanionAwayAfter(Option<u64>),
+    /// Remplace tout le tableau `[[machines.remote]]` ; la table `[machines]` qui reste vide est retirée.
+    RemoteMachines(Vec<RemoteMachineEntry>),
+    /// Le nom de Localhost sous `[machines]` ; `None` retire la clé (et la table, si elle reste vide).
+    LocalMachineLabel(Option<String>),
 }
 
 /// Le port que la table `[companion]` reçoit quand l'interrupteur l'ajoute (celui de la spec, §3.2).
@@ -141,6 +147,28 @@ fn apply(document: &mut DocumentMut, edit: &ConfigEdit) {
         ConfigEdit::Favorites(favorites) => {
             let tables = favorites.iter().map(favorite_table).collect();
             replace_tables(document, &["browser"], "favorites", tables);
+        }
+        ConfigEdit::RemoteMachines(machines) => {
+            let tables = machines.iter().map(machine_table).collect();
+            replace_tables(document, &["machines"], "remote", tables);
+            drop_empty_machines(document.as_table_mut());
+        }
+        ConfigEdit::LocalMachineLabel(value) => {
+            if root.get("machines").is_none() {
+                if value.is_none() {
+                    return;
+                }
+                let mut section = Table::new();
+                // Une ligne vide sépare la table de ce qui la précède, sauf sur un fichier vide.
+                if !root.is_empty() {
+                    section.decor_mut().set_prefix("\n");
+                }
+                root.insert("machines", Item::Table(section));
+            }
+            if let Some(section) = root.get_mut("machines").and_then(Item::as_table_like_mut) {
+                set(section, "local_label", optional_text(value));
+            }
+            drop_empty_machines(root);
         }
         ConfigEdit::CompanionEnabled(true) => {
             if root.get("companion").is_none() {
@@ -249,6 +277,27 @@ fn agent_table(agent: &AgentEntry) -> Table {
     table
 }
 
+fn machine_table(machine: &RemoteMachineEntry) -> Table {
+    let mut table = Table::new();
+    table.insert("label", Item::Value(Value::from(machine.label.as_str())));
+    table.insert(
+        "connection",
+        Item::Value(Value::from(machine.connection.as_str())),
+    );
+    table
+}
+
+/// Retire `[machines]` quand elle ne porte plus rien : ni `local_label` ni machine distante.
+fn drop_empty_machines(root: &mut Table) {
+    let empty = root
+        .get("machines")
+        .and_then(Item::as_table_like)
+        .is_some_and(|section| section.is_empty());
+    if empty {
+        root.remove("machines");
+    }
+}
+
 fn favorite_table(favorite: &Favorite) -> Table {
     let mut table = Table::new();
     table.insert("name", Item::Value(Value::from(favorite.name.as_str())));
@@ -319,7 +368,9 @@ fn replace_tables(document: &mut DocumentMut, parents: &[&str], key: &str, table
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentEntry, ConfigErrorKind, DEFAULT_CONFIG, Favorite, parse_config};
+    use crate::config::{
+        AgentEntry, ConfigErrorKind, DEFAULT_CONFIG, Favorite, RemoteMachineEntry, parse_config,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -424,6 +475,75 @@ mod tests {
             .collect();
         assert_eq!(names, ["B", "A"]);
         assert!(parse_config(&text).is_ok());
+    }
+
+    fn remote(label: &str, connection: &str) -> RemoteMachineEntry {
+        RemoteMachineEntry {
+            label: label.into(),
+            connection: connection.into(),
+        }
+    }
+
+    #[test]
+    fn remote_machines_replace_the_array_and_keep_comments() {
+        let base = format!(
+            "{DEFAULT_CONFIG}\n# machines\n[[machines.remote]]\nlabel = \"Dell\"\nconnection = \"dell-lan\"\n"
+        );
+        let machines = vec![remote("Dell", "dell-lan"), remote("Pi", "pi@raspberry")];
+        let (text, config) =
+            apply_edit(&base, &ConfigEdit::RemoteMachines(machines.clone())).unwrap();
+        assert_eq!(config.remote_machines(), machines.as_slice());
+        // Le commentaire au-dessus de `[[agents]]` (et celui de la première machine) survivent.
+        assert!(text.contains("# Entrées du lanceur"), "{text}");
+        assert!(text.contains("# machines"), "{text}");
+        assert!(text.contains("[[agents]]"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_machines_table_disappears() {
+        let base = "ui_font_size = 14\n\n[machines]\n\n[[machines.remote]]\nlabel = \"Dell\"\nconnection = \"dell-lan\"\n";
+        let (text, config) = apply_edit(base, &ConfigEdit::RemoteMachines(vec![])).unwrap();
+        assert!(!text.contains("machines"), "{text}");
+        assert!(config.machines.is_none());
+        // Avec un `local_label`, la table reste.
+        let named = "[machines]\nlocal_label = \"Mon Mac\"\n\n[[machines.remote]]\nlabel = \"Dell\"\nconnection = \"dell-lan\"\n";
+        let (text, config) = apply_edit(named, &ConfigEdit::RemoteMachines(vec![])).unwrap();
+        assert!(text.contains("local_label = \"Mon Mac\""), "{text}");
+        assert_eq!(config.local_machine_label(), "Mon Mac");
+        assert!(config.remote_machines().is_empty());
+    }
+
+    #[test]
+    fn local_label_is_written_under_machines() {
+        let base = "ui_font_size = 14\n";
+        let (text, config) =
+            apply_edit(base, &ConfigEdit::LocalMachineLabel(Some("Mon Mac".into()))).unwrap();
+        assert!(
+            text.contains("[machines]\nlocal_label = \"Mon Mac\""),
+            "{text}"
+        );
+        assert_eq!(config.local_machine_label(), "Mon Mac");
+        // Les machines distantes déjà écrites gardent leur place sous la même table.
+        let with_remote = "[[machines.remote]]\nlabel = \"Dell\"\nconnection = \"dell-lan\"\n";
+        let (text, config) = apply_edit(
+            with_remote,
+            &ConfigEdit::LocalMachineLabel(Some("Mon Mac".into())),
+        )
+        .unwrap();
+        assert_eq!(config.local_machine_label(), "Mon Mac");
+        assert_eq!(config.remote_machines().len(), 1, "{text}");
+        // Vider le label retire la clé, et la table vide avec elle.
+        let (text, config) = apply_edit(&text, &ConfigEdit::LocalMachineLabel(None)).unwrap();
+        assert!(!text.contains("local_label"), "{text}");
+        assert_eq!(config.local_machine_label(), "Localhost");
+        assert_eq!(config.remote_machines().len(), 1);
+        let (text, config) =
+            apply_edit("ui_font_size = 14\n", &ConfigEdit::LocalMachineLabel(None)).unwrap();
+        assert!(
+            !text.contains("machines"),
+            "never created to remove a key: {text}"
+        );
+        assert!(config.machines.is_none());
     }
 
     #[test]
