@@ -696,11 +696,13 @@ pub(crate) fn failure_line(failure: &RemoteFailure) -> String {
 
 /// Le texte que la barre met sous une machine qui ne répond pas : sa cause et « Réessayer » quand elle a échoué, « Connexion… »
 /// tant que l'essai suivant est en vol (la cause périmée ne reste pas affichée : un clic sur « Réessayer » se voit).
-/// Rien pour une machine connectée, ni pour une première connexion.
+/// Même « Connexion… » pour une machine qui vient de perdre sa connexion (`reconnecting`). Rien pour une machine connectée,
+/// ni pour une première connexion.
 pub(crate) fn machine_status_line(machine: &RemoteMachine) -> Option<String> {
     match (&machine.status, machine.failure()) {
         (MachineStatus::Failed(failure), _) => Some(failure_line(failure)),
         (MachineStatus::Connecting, Some(_)) => Some("Connexion…".to_owned()),
+        (MachineStatus::Connecting, None) if machine.reconnecting => Some("Connexion…".to_owned()),
         _ => None,
     }
 }
@@ -1194,6 +1196,36 @@ mod tests {
         assert_eq!(machine_status_line(&machine).as_deref(), Some("Connexion…"));
         machine.status = MachineStatus::Connected;
         machine.last_failure = None;
+        assert_eq!(machine_status_line(&machine), None);
+    }
+
+    #[test]
+    fn a_lost_link_shows_connecting_until_the_first_result_of_the_resume() {
+        use crate::config::RemoteMachineEntry;
+        use crate::machines::registry::RemoteMachine;
+        let mut machine = RemoteMachine::new(RemoteMachineEntry {
+            label: "Dell".into(),
+            connection: "dell-lan".into(),
+        });
+        // Une machine neuve en `Connecting` reste muette.
+        assert_eq!(machine_status_line(&machine), None);
+        machine.status = MachineStatus::Connected;
+        assert_eq!(machine_status_line(&machine), None);
+        // La perte (`lose_machine`) : « Connexion… » tout de suite, sans attendre un premier échec de reprise.
+        machine.status = MachineStatus::Connecting;
+        machine.reconnecting = true;
+        assert_eq!(machine_status_line(&machine).as_deref(), Some("Connexion…"));
+        // Premier échec de la reprise : la ligne de sa cause.
+        machine.status = MachineStatus::Failed(RemoteFailure::Unreachable);
+        machine.last_failure = Some(RemoteFailure::Unreachable);
+        assert_eq!(
+            machine_status_line(&machine).as_deref(),
+            Some("Injoignable · Réessayer")
+        );
+        // Reconnectée : rien.
+        machine.status = MachineStatus::Connected;
+        machine.last_failure = None;
+        machine.reconnecting = false;
         assert_eq!(machine_status_line(&machine), None);
     }
 

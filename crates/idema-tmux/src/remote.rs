@@ -71,27 +71,45 @@ pub fn remote_tmux_line(args: &[&str]) -> String {
     line
 }
 
-/// Les arguments de `ssh` qui ferment le maître d'une connexion (`%C` doit correspondre à l'ouverture).
-pub fn control_exit_arguments(spec: &RemoteSpec) -> Vec<String> {
+/// Les arguments de `ssh -O <operation>` sur le maître d'une connexion (`%C` doit correspondre à l'ouverture).
+fn control_arguments(spec: &RemoteSpec, operation: &str) -> Vec<String> {
     vec![
         "-o".into(),
         format!("ControlPath={}", control_path(spec)),
         "-O".into(),
-        "exit".into(),
+        operation.into(),
         "--".into(),
         spec.destination.clone(),
     ]
 }
 
+/// Les arguments de `ssh` qui ferment le maître d'une connexion.
+pub fn control_exit_arguments(spec: &RemoteSpec) -> Vec<String> {
+    control_arguments(spec, "exit")
+}
+
 /// La commande qui ferme le maître ssh d'une connexion (`ssh -O exit`), avec l'environnement remplacé de la machine. Au
 /// réveil du Mac, les maîtres d'avant la veille ne répondent plus : on les ferme avant de se reconnecter.
 pub fn control_exit_command(spec: &RemoteSpec) -> Command {
+    control_command(spec, "exit")
+}
+
+/// La commande qui interroge le maître ssh d'une connexion (`ssh -O check`) : il répond « Master running (pid=N) » sur
+/// stderr.
+pub fn control_check_command(spec: &RemoteSpec) -> Command {
+    control_command(spec, "check")
+}
+
+fn control_command(spec: &RemoteSpec, operation: &str) -> Command {
     let mut command = Command::new(SSH_BINARY);
-    command.args(control_exit_arguments(spec)).env_clear().envs(
-        spec.ssh_env
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str())),
-    );
+    command
+        .args(control_arguments(spec, operation))
+        .env_clear()
+        .envs(
+            spec.ssh_env
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
     reset_signal_state(&mut command);
     command
 }

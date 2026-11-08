@@ -82,8 +82,8 @@ use crate::machines::key::{
 };
 use crate::machines::lifecycle::{
     RemoteAfterClose, RemoteMenuLine, after_remote_close, close_master, default_remote_agent,
-    idnma_run_command, is_wake_jump, link_stalled, list_pinned_windows, release_windows,
-    remote_menu_lines, set_extended_keys, windows_to_unpin,
+    idnma_run_command, is_wake_jump, link_stalled, list_pinned_windows, master_pid,
+    release_windows, remote_menu_lines, set_extended_keys, windows_to_unpin,
 };
 use crate::machines::panels::{
     LinkRoute, MachineTerminalPin, OPENING_TERMINAL, UNAVAILABLE_ON_REMOTE, link_route,
@@ -3035,6 +3035,7 @@ impl Workspace {
             .unwrap_or_default();
         let was_connected = machine.status == MachineStatus::Connected;
         machine.status = MachineStatus::Connecting;
+        machine.reconnecting |= was_connected;
         machine.poll = None;
         machine.retry = None;
         machine.attempt = 0;
@@ -3098,7 +3099,9 @@ impl Workspace {
             });
             set_extended_keys(&server);
             let pinned = list_pinned_windows(&server);
-            Ok((spec, facts, pinned))
+            // Le pid du maître ssh, noté au journal : les scripts d'acceptation le tuent pour simuler une coupure.
+            let master = master_pid(&spec);
+            Ok((spec, facts, pinned, master))
         });
         let connection = connection.to_owned();
         cx.spawn_in(window, async move |this, cx| {
@@ -3114,7 +3117,7 @@ impl Workspace {
     fn on_probed(
         &mut self,
         connection: &str,
-        outcome: Result<(RemoteSpec, MachineFacts, String), RemoteFailure>,
+        outcome: Result<(RemoteSpec, MachineFacts, String, Option<u32>), RemoteFailure>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3124,7 +3127,7 @@ impl Workspace {
         let machine = &mut self.machines[index];
         machine.probing = false;
         match outcome {
-            Ok((spec, facts, pinned)) => {
+            Ok((spec, facts, pinned, master)) => {
                 match machine.pool.as_mut() {
                     Some(pool) => pool.update_facts(facts.home.clone(), facts.shell.clone()),
                     None => {
@@ -3138,10 +3141,14 @@ impl Workspace {
                 machine.facts = Some(facts);
                 machine.status = MachineStatus::Connected;
                 machine.last_failure = None;
+                machine.reconnecting = false;
                 machine.attempt = 0;
                 machine.refresh_failures = 0;
                 machine.retry = None;
-                hud::log_event(&format!("machine connected machine={connection}"));
+                let master = master.map_or_else(|| "?".to_owned(), |pid| pid.to_string());
+                hud::log_event(&format!(
+                    "machine connected machine={connection} master_pid={master}"
+                ));
                 self.release_stale_pins(connection, &pinned, cx);
                 self.start_machine_poll(connection, window, cx);
                 self.refresh_machine(connection, window, cx);
@@ -3377,6 +3384,8 @@ impl Workspace {
             log_safe(reason)
         ));
         machine.status = MachineStatus::Connecting;
+        // La barre dit « Connexion… » dès la perte, jusqu'au premier résultat de la reprise.
+        machine.reconnecting = true;
         machine.poll = None;
         machine.refresh_failures = 0;
         // Une relecture partie avant la perte ne rendra peut-être jamais : la reconnexion en lance une neuve.

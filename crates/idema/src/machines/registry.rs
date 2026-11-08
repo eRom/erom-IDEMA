@@ -157,6 +157,9 @@ pub struct RemoteMachine {
     /// La cause du dernier échec de connexion, gardée pendant l'essai suivant (`Connecting`) pour que la barre ne la
     /// perde pas à chaque tentative ; effacée par une connexion réussie.
     pub last_failure: Option<RemoteFailure>,
+    /// La machine était connectée et se reconnecte (`lose_machine`, réveil du Mac) : la barre dit « Connexion… » dès la
+    /// perte, sans attendre un premier échec. Effacée par une connexion réussie ; la première connexion reste muette.
+    pub reconnecting: bool,
     pub facts: Option<MachineFacts>,
     /// Le nombre d'essais de connexion depuis le dernier succès (indice de `retry_delay`).
     pub attempt: u32,
@@ -198,6 +201,7 @@ impl RemoteMachine {
             entry,
             status: MachineStatus::Connecting,
             last_failure: None,
+            reconnecting: false,
             facts: None,
             attempt: 0,
             pool: None,

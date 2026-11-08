@@ -4,7 +4,7 @@
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
 
-use idema_tmux::remote::{RemoteSpec, control_exit_command};
+use idema_tmux::remote::{RemoteSpec, control_check_command, control_exit_command};
 use idema_tmux::server::{ServerError, TmuxServer};
 
 use super::idnma::IdnmaAgentInfo;
@@ -361,6 +361,24 @@ pub fn close_master(spec: &RemoteSpec) {
     }
 }
 
+/// Le pid que `ssh -O check` annonce (« Master running (pid=1234) »).
+pub fn parse_master_pid(stderr: &str) -> Option<u32> {
+    let rest = stderr.split("(pid=").nth(1)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Le pid du maître ssh de `spec`, lu par `ssh -O check` : bloquant, hors du fil d'interface. `None` quand la lecture
+/// échoue : elle ne bloque jamais la connexion, le journal écrit alors `?`.
+pub fn master_pid(spec: &RemoteSpec) -> Option<u32> {
+    let output = control_check_command(spec)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .ok()?;
+    parse_master_pid(&String::from_utf8_lossy(&output.stderr))
+}
+
 fn words(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_owned()).collect()
 }
@@ -391,6 +409,19 @@ mod tests {
             label: None,
             avatar: None,
         }
+    }
+
+    #[test]
+    fn parse_master_pid_reads_the_check_answer() {
+        assert_eq!(
+            parse_master_pid("Master running (pid=4242)\r\n"),
+            Some(4242)
+        );
+        assert_eq!(
+            parse_master_pid("Control socket connect(/tmp/x): No such file or directory"),
+            None
+        );
+        assert_eq!(parse_master_pid("Master running (pid=)"), None);
     }
 
     #[test]
