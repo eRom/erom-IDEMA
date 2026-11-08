@@ -339,6 +339,12 @@ impl Inputs {
     }
 }
 
+/// Le champ s'écrit-il pendant la frappe (après 400 ms de pause) ? Non pour une ligne de machine distante : elle ne
+/// s'écrit qu'à la validation, car l'écrire ouvre une connexion ssh.
+fn writes_while_typing(field: Field) -> bool {
+    !matches!(field, Field::Row(ListKind::Machines, _))
+}
+
 /// L'état des quatre sections, tenu par `SettingsView`.
 pub(super) struct IdemaState {
     watch: FileWatch,
@@ -915,8 +921,14 @@ impl SettingsView {
         }
     }
 
-    /// Écrira `field` quand la frappe se sera arrêtée 400 ms ; une frappe de plus repousse l'échéance.
+    /// Écrira `field` quand la frappe se sera arrêtée 400 ms ; une frappe de plus repousse l'échéance. Une ligne de
+    /// machine n'a pas de minuterie : un marqueur d'attente protège le champ, et seuls Entrée, la sortie du champ ou
+    /// `flush_pending` écrivent (sinon chaque préfixe de la connexion deviendrait une machine, donc une connexion ssh).
     fn schedule_commit(&mut self, field: Field, window: &mut Window, cx: &mut Context<Self>) {
+        if !writes_while_typing(field) {
+            self.idema.pending.insert(field, Task::ready(()));
+            return;
+        }
         let task = cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(COMMIT_DELAY).await;
             let _ = this.update_in(cx, |this, window, cx| this.commit(field, window, cx));
@@ -2242,6 +2254,18 @@ mod tests {
             plan_row_edit(&[] as &[char], 0, &'a', RowChange::Delete),
             Err(Stale)
         );
+    }
+
+    #[test]
+    fn a_machine_row_never_writes_while_typing() {
+        // Chaque préfixe tapé ferait une machine neuve et une connexion ssh : seuls Entrée et la sortie du champ écrivent.
+        assert!(!writes_while_typing(Field::Row(ListKind::Machines, 1)));
+        assert!(!writes_while_typing(Field::Row(ListKind::Machines, 42)));
+        // Les autres champs gardent l'écriture au fil de la frappe.
+        assert!(writes_while_typing(Field::Row(ListKind::Agents, 1)));
+        assert!(writes_while_typing(Field::Row(ListKind::Favorites, 1)));
+        assert!(writes_while_typing(Field::UiFontSize));
+        assert!(writes_while_typing(Field::LocalMachineLabel));
     }
 
     fn machine(label: &str, connection: &str) -> RemoteMachineEntry {
