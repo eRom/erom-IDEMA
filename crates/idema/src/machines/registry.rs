@@ -170,6 +170,10 @@ pub struct RemoteMachine {
     pub refreshing: bool,
     /// Depuis quand la relecture en vol est partie : une relecture qui ne rend pas signale un lien figé (`link_stalled`).
     pub refresh_started: Option<Instant>,
+    /// Le lien est tenu pour bloqué (une relecture ne rend pas, `link_stalled`) alors que la machine est encore
+    /// `Connected` : la barre dit « Connexion… ». Effacé quand une relecture rend, que la machine est perdue ou
+    /// reconnectée.
+    pub link_stalled: bool,
     /// Une relecture a été demandée pendant la précédente : elle repart dès que celle-ci a rendu.
     pub refresh_again: bool,
     /// Les relectures de suite qui ont échoué : la connexion est tenue pour perdue au troisième échec.
@@ -194,6 +198,12 @@ impl RemoteMachine {
         }
     }
 
+    /// Lève le drapeau « lien bloqué ». Vrai à la première détection d'un blocage (la seule à journaliser), faux tant
+    /// que le même blocage dure.
+    pub fn mark_link_stalled(&mut self) -> bool {
+        !std::mem::replace(&mut self.link_stalled, true)
+    }
+
     /// Une machine qui vient d'être déclarée : elle se connecte.
     pub fn new(entry: RemoteMachineEntry) -> Self {
         let connection = entry.connection.clone();
@@ -209,6 +219,7 @@ impl RemoteMachine {
             refreshing: false,
             refresh_again: false,
             refresh_started: None,
+            link_stalled: false,
             refresh_failures: 0,
             adhoc: adhoc_gate(&connection),
             poll: None,
@@ -255,6 +266,21 @@ mod tests {
         machine.status = MachineStatus::Connected;
         machine.last_failure = None;
         assert_eq!(machine.failure(), None);
+    }
+
+    #[test]
+    fn a_stall_is_reported_once_until_it_is_cleared() {
+        let mut machine = RemoteMachine::new(RemoteMachineEntry {
+            label: "Dell".into(),
+            connection: "dell-lan".into(),
+        });
+        // Première détection : à journaliser. Les suivantes, pendant le même blocage : non.
+        assert!(machine.mark_link_stalled());
+        assert!(!machine.mark_link_stalled());
+        assert!(!machine.mark_link_stalled());
+        // Le blocage levé, le suivant est de nouveau une première détection.
+        machine.link_stalled = false;
+        assert!(machine.mark_link_stalled());
     }
 
     #[test]

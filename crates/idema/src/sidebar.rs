@@ -703,6 +703,8 @@ pub(crate) fn machine_status_line(machine: &RemoteMachine) -> Option<String> {
         (MachineStatus::Failed(failure), _) => Some(failure_line(failure)),
         (MachineStatus::Connecting, Some(_)) => Some("Connexion…".to_owned()),
         (MachineStatus::Connecting, None) if machine.reconnecting => Some("Connexion…".to_owned()),
+        // Encore connectée, mais une relecture ne rend plus : le lien est bloqué (`link_stalled`).
+        (MachineStatus::Connected, _) if machine.link_stalled => Some("Connexion…".to_owned()),
         _ => None,
     }
 }
@@ -823,7 +825,7 @@ fn machine_section(
         .child(machine_chevron(&theme, !collapsed))
         .child(connection_dot(
             &theme,
-            machine.status == MachineStatus::Connected,
+            machine.status == MachineStatus::Connected && !machine.link_stalled,
         ))
         .child(
             div()
@@ -1226,6 +1228,24 @@ mod tests {
         machine.status = MachineStatus::Connected;
         machine.last_failure = None;
         machine.reconnecting = false;
+        assert_eq!(machine_status_line(&machine), None);
+    }
+
+    #[test]
+    fn a_stalled_link_shows_connecting_on_a_machine_that_is_still_connected() {
+        use crate::config::RemoteMachineEntry;
+        use crate::machines::registry::RemoteMachine;
+        let mut machine = RemoteMachine::new(RemoteMachineEntry {
+            label: "Dell".into(),
+            connection: "dell-lan".into(),
+        });
+        machine.status = MachineStatus::Connected;
+        assert_eq!(machine_status_line(&machine), None);
+        // Une relecture qui ne rend pas : l'état est encore `Connected`, mais l'en-tête ne ment plus.
+        assert!(machine.mark_link_stalled());
+        assert_eq!(machine_status_line(&machine).as_deref(), Some("Connexion…"));
+        // Une relecture qui rend efface le drapeau.
+        machine.link_stalled = false;
         assert_eq!(machine_status_line(&machine), None);
     }
 

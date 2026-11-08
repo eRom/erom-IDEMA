@@ -3077,6 +3077,7 @@ impl Workspace {
         let was_connected = machine.status == MachineStatus::Connected;
         machine.status = MachineStatus::Connecting;
         machine.reconnecting |= was_connected;
+        machine.link_stalled = false;
         machine.poll = None;
         machine.retry = None;
         machine.attempt = 0;
@@ -3183,6 +3184,7 @@ impl Workspace {
                 machine.status = MachineStatus::Connected;
                 machine.last_failure = None;
                 machine.reconnecting = false;
+                machine.link_stalled = false;
                 machine.attempt = 0;
                 machine.refresh_failures = 0;
                 machine.retry = None;
@@ -3304,6 +3306,11 @@ impl Workspace {
             machine.refresh_again = true;
             // Une relecture qui ne rend pas : ssh ne dira la coupure qu'après ses 30 s, la saisie est coupée dès maintenant.
             if link_stalled(machine.refresh_started, Instant::now()) {
+                // Une seule ligne de journal par blocage ; l'en-tête dit « Connexion… » tant qu'il dure.
+                if machine.mark_link_stalled() {
+                    hud::log_event(&format!("machine link stalled machine={connection}"));
+                    cx.notify();
+                }
                 self.set_machine_link(connection, true, cx);
             }
             return;
@@ -3351,6 +3358,10 @@ impl Workspace {
         match listing {
             (Ok(sessions), Ok(panes)) => {
                 machine.refresh_failures = 0;
+                // Une relecture a rendu : le lien n'est plus bloqué.
+                if std::mem::take(&mut machine.link_stalled) {
+                    cx.notify();
+                }
                 // La machine répond : les clients encore vivants reprennent la saisie.
                 self.live_clients_resume(connection, cx);
                 let (sessions, panes) = qualify_listing(connection, sessions, panes);
@@ -3427,6 +3438,7 @@ impl Workspace {
         machine.status = MachineStatus::Connecting;
         // La barre dit « Connexion… » dès la perte, jusqu'au premier résultat de la reprise.
         machine.reconnecting = true;
+        machine.link_stalled = false;
         machine.poll = None;
         machine.refresh_failures = 0;
         // Une relecture partie avant la perte ne rendra peut-être jamais : la reconnexion en lance une neuve.
