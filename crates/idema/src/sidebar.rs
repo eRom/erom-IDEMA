@@ -17,7 +17,7 @@ use crate::config::AgentEntry;
 use crate::machines::idnma::IdnmaAgentInfo;
 use crate::machines::key::LOCAL_MACHINE;
 use crate::machines::probe::RemoteFailure;
-use crate::machines::registry::MachineStatus;
+use crate::machines::registry::{MachineStatus, RemoteMachine};
 
 use crate::assets::Icon;
 use crate::errors::{Explained, explain_config};
@@ -694,6 +694,68 @@ pub(crate) fn failure_line(failure: &RemoteFailure) -> String {
     format!("{head}{} · Réessayer", chars.as_str())
 }
 
+/// Le texte que la barre met sous une machine qui ne répond pas : sa cause et « Réessayer » quand elle a échoué, « Connexion… »
+/// tant que l'essai suivant est en vol (la cause périmée ne reste pas affichée : un clic sur « Réessayer » se voit).
+/// Rien pour une machine connectée, ni pour une première connexion.
+pub(crate) fn machine_status_line(machine: &RemoteMachine) -> Option<String> {
+    match (&machine.status, machine.failure()) {
+        (MachineStatus::Failed(failure), _) => Some(failure_line(failure)),
+        (MachineStatus::Connecting, Some(_)) => Some("Connexion…".to_owned()),
+        _ => None,
+    }
+}
+
+/// Le logo d'un agent d'une machine : celui de son `avatar` dans le `~/.idnma.yml` de la machine, sinon celui de sa clé en
+/// minuscules (la règle locale). `None` : l'agent n'a pas de logo.
+pub(crate) fn remote_agent_logo(agent: &IdnmaAgentInfo) -> Option<&'static str> {
+    agent
+        .avatar
+        .as_deref()
+        .and_then(|avatar| logo_path(&avatar.to_lowercase()))
+        .or_else(|| logo_path(&agent.key.to_lowercase()))
+}
+
+/// Le « + » d'un en-tête de machine, du même dessin que celui d'un projet : un clic crée une session avec l'agent par
+/// défaut de la machine, un clic droit ouvre le menu de ses agents. Aucun des deux ne replie l'en-tête.
+fn machine_plus(
+    theme: &Theme,
+    index: usize,
+    connection: &str,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let theme = *theme;
+    let plus_group = format!("machine-plus-{index}");
+    let (new_target, menu_target) = (connection.to_owned(), connection.to_owned());
+    div()
+        .id(("machine-plus", index))
+        .group(plus_group.clone())
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(theme.px(22.))
+        .rounded(theme.px(5.))
+        .hover(|style| style.bg(white(BUTTON_HOVER)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            this.new_remote_session_default(&new_target, window, cx);
+        }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.open_remote_launcher_menu(&menu_target, event.position, window, cx);
+            }),
+        )
+        .child(
+            svg()
+                .path(Icon::Add.path())
+                .size(theme.px(16.))
+                .text_color(white(ICON_SECONDARY))
+                .group_hover(plus_group, |style| style.text_color(white(TEXT_FULL))),
+        )
+}
+
 /// Une machine distante : son en-tête (chevron, pastille de connexion, label, « ··· » ou résumé), puis, dépliée, ses
 /// sessions à plat, « Aucune session » si elle est connectée sans session, ou la ligne de sa cause d'échec.
 fn machine_section(
@@ -710,6 +772,7 @@ fn machine_section(
         .filter(|at| workspace.entries[*at].summary.machine.as_deref() == Some(connection.as_str()))
         .collect();
     let failure = machine.failure().cloned();
+    let connecting = machine.status == MachineStatus::Connecting;
     let right = if collapsed {
         match &failure {
             Some(failure) => Some(
@@ -717,7 +780,11 @@ fn machine_section(
                     .flex_none()
                     .pr(theme.px(4.))
                     .font_weight(FontWeight::NORMAL)
-                    .child(failure.short())
+                    .child(if connecting {
+                        "connexion…"
+                    } else {
+                        failure.short()
+                    })
                     .into_any_element(),
             ),
             None => {
@@ -730,16 +797,24 @@ fn machine_section(
         }
     } else {
         let target = connection.clone();
+        // Créer une session suppose une machine connectée : sinon seul « ··· » reste.
+        let plus = (machine.status == MachineStatus::Connected)
+            .then(|| machine_plus(&theme, index, &connection, cx));
+        let menu = header_menu_button(
+            &theme,
+            ("machine-menu", index),
+            cx,
+            move |this, anchor, window, cx| {
+                this.open_machine_menu(target.clone(), anchor, window, cx);
+            },
+        );
         Some(
-            header_menu_button(
-                &theme,
-                ("machine-menu", index),
-                cx,
-                move |this, anchor, window, cx| {
-                    this.open_machine_menu(target.clone(), anchor, window, cx);
-                },
-            )
-            .into_any_element(),
+            div()
+                .flex()
+                .items_center()
+                .child(menu)
+                .children(plus)
+                .into_any_element(),
         )
     };
     let header = machine_header(&theme, ("machine", index), connection.clone(), cx)
@@ -762,8 +837,8 @@ fn machine_section(
         for at in rows {
             block = block.child(session_row(workspace, at, &theme, cx));
         }
-        match failure {
-            Some(failure) => {
+        match machine_status_line(machine) {
+            Some(text) => {
                 let target = connection;
                 block = block.child(
                     div()
@@ -780,7 +855,7 @@ fn machine_section(
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.retry_machine(&target, window, cx);
                         }))
-                        .child(failure_line(&failure)),
+                        .child(text),
                 );
             }
             None if empty && machine.status == MachineStatus::Connected => {
@@ -1096,6 +1171,45 @@ mod tests {
         let expected = [AgentMark::Logo(logo_path("claude").unwrap())];
         assert_eq!(remote_agent_marks(&names, &agents), expected);
         assert_eq!(remote_agent_marks(&names, &[]), expected);
+    }
+
+    #[test]
+    fn a_retry_in_flight_shows_connecting_instead_of_the_stale_cause() {
+        use crate::config::RemoteMachineEntry;
+        use crate::machines::registry::RemoteMachine;
+        let mut machine = RemoteMachine::new(RemoteMachineEntry {
+            label: "Dell".into(),
+            connection: "dell-lan".into(),
+        });
+        // Première connexion, rien à dire.
+        assert_eq!(machine_status_line(&machine), None);
+        machine.status = MachineStatus::Failed(RemoteFailure::Unreachable);
+        machine.last_failure = Some(RemoteFailure::Unreachable);
+        assert_eq!(
+            machine_status_line(&machine).as_deref(),
+            Some("Injoignable · Réessayer")
+        );
+        // « Réessayer » est cliqué : l'essai suivant est en vol, la cause périmée cède la place à « Connexion… ».
+        machine.status = MachineStatus::Connecting;
+        assert_eq!(machine_status_line(&machine).as_deref(), Some("Connexion…"));
+        machine.status = MachineStatus::Connected;
+        machine.last_failure = None;
+        assert_eq!(machine_status_line(&machine), None);
+    }
+
+    #[test]
+    fn a_remote_agent_logo_follows_the_avatar_then_the_key() {
+        let agent = |key: &str, avatar: Option<&str>| IdnmaAgentInfo {
+            key: key.into(),
+            label: None,
+            avatar: avatar.map(str::to_string),
+        };
+        assert_eq!(
+            remote_agent_logo(&agent("sonnet", Some("Claude"))),
+            logo_path("claude")
+        );
+        assert_eq!(remote_agent_logo(&agent("glm", None)), logo_path("glm"));
+        assert_eq!(remote_agent_logo(&agent("mystery", None)), None);
     }
 
     #[test]

@@ -64,6 +64,9 @@ pub(crate) const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 /// Durée d'affichage de la bulle du pane : un vidage de grille, un fichier introuvable (valeur à ratifier).
 const NOTICE_DURATION: Duration = Duration::from_secs(2);
 
+/// La bulle d'une saisie qui n'est pas partie parce que le lien vers la machine est tombé (spec ssh-tmux §3.2).
+const LINK_DOWN_NOTICE: &str = "Connexion perdue, saisie non envoyée";
+
 /// La bulle du pane, en haut à droite : ce qu'un geste a fait, ou son échec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneNotice {
@@ -732,6 +735,11 @@ pub struct PaneView {
     /// Lecture seule (le journal d'un serveur, spec P4 §4.5) : aucune touche, aucun collage ni aucun rapport de souris
     /// n'atteint le programme ; la sélection, `⌘C`, `⌘F` et le défilement restent.
     read_only: bool,
+    /// Le lien vers la machine de la session est tombé (posé par la `SessionView`, comme `rebind`) : rien de ce qu'on
+    /// taperait n'arriverait, et rien n'est écrit sur l'entrée de ssh (une saisie retenue ne serait jamais rejouée).
+    link_down: bool,
+    /// Une saisie a été refusée parce que le lien était tombé : la bulle la dit au prochain passage qui a la main.
+    dropped_input: bool,
     _subscriptions: Vec<Subscription>,
     /// La tâche qui vide les événements du PTY local, ou les octets du fichier suivi, dans la vue ; elle meurt avec elle.
     _pty_task: Option<Task<()>>,
@@ -934,6 +942,8 @@ impl PaneView {
             last_input: None,
             following: true,
             read_only: false,
+            link_down: false,
+            dropped_input: false,
             _subscriptions: subscriptions,
             _pty_task: None,
             _tail: None,
@@ -945,6 +955,23 @@ impl PaneView {
     /// programme. Les touches ne sont pas retenues non plus, `⌘C` et `⌘F` restent aux actions du pane.
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
+    }
+
+    /// Le lien vers la machine tombe ou revient. Tant qu'il est tombé, la saisie, le collage et les rapports du pane ne
+    /// sont pas écrits.
+    pub fn set_link_down(&mut self, link_down: bool) {
+        self.link_down = link_down;
+        if !link_down {
+            self.dropped_input = false;
+        }
+    }
+
+    /// Dit par la bulle qu'une saisie n'est pas partie, si c'est arrivé depuis le dernier passage. Une seule bulle par
+    /// série de touches : elle se renouvelle à chaque appel tant qu'on tape.
+    fn announce_dropped_input(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.dropped_input) {
+            self.show_failure(LINK_DOWN_NOTICE.to_owned(), cx);
+        }
     }
 
     /// La vue est-elle en lecture seule (un journal) ? L'élément n'y dessine pas de curseur.
@@ -1214,7 +1241,11 @@ impl PaneView {
     /// désarme le tour d'agent (l'écho n'en est pas un) ; pendant qu'un lancement attend, elle est retenue, et un
     /// Ctrl-C abandonne le lancement (m1).
     fn send_user_input(&mut self, bytes: &[u8]) {
-        if !input_reaches_program(self.read_only) {
+        if !input_reaches_program(self.read_only, false) {
+            return;
+        }
+        if self.link_down {
+            self.dropped_input = true;
             return;
         }
         self.activity.on_input();
@@ -1232,7 +1263,7 @@ impl PaneView {
             }
         }
         self.backend.scroll_to_bottom();
-        write_user_input(self.read_only, &mut self.backend, bytes);
+        write_user_input(self.read_only, self.link_down, &mut self.backend, bytes);
     }
 
     /// Le pane prend-il une saisie venue du téléphone ? Fermé par défaut : hors lecture seule, et seulement si une
@@ -1457,6 +1488,8 @@ impl PaneView {
         self.activity.tick(now, bracketed_paste, self.seen);
         self.publish_state(now, cx);
         self.poll_launch(now);
+        // Une saisie refusée sans geste qui puisse le dire (souris, molette) ne reste pas muette.
+        self.announce_dropped_input(cx);
         if self.hud.visible {
             cx.notify();
         }
@@ -1917,7 +1950,7 @@ impl PaneView {
     }
 
     fn report_focus(&mut self, active: bool) {
-        if input_reaches_program(self.read_only)
+        if input_reaches_program(self.read_only, self.link_down)
             && self
                 .backend
                 .emulator()
@@ -1929,6 +1962,7 @@ impl PaneView {
             self.activity.on_focus_report(Instant::now());
             write_user_input(
                 self.read_only,
+                self.link_down,
                 &mut self.backend,
                 if active { b"\x1b[I" } else { b"\x1b[O" },
             );
@@ -1958,6 +1992,7 @@ impl PaneView {
         // `None` : le texte arrive par le gestionnaire de saisie.
         if let Some(bytes) = encode_key(&keystroke.key, mods, modes) {
             self.send_user_input(&bytes);
+            self.announce_dropped_input(cx);
             cx.stop_propagation();
             cx.notify();
         }
@@ -1968,6 +2003,7 @@ impl PaneView {
             return;
         };
         self.paste_text(&text);
+        self.announce_dropped_input(cx);
         cx.notify();
     }
 
@@ -2490,14 +2526,19 @@ impl EventEmitter<PaneEvent> for PaneView {}
 /// Ce que la saisie, le collage, le texte de l'IME, le rapport de souris et celui du focus ont le droit de faire : atteindre
 /// le programme du pane, sauf dans un journal en lecture seule. Toutes les écritures de la vue vers le programme passent par
 /// cette porte (`send_user_input`, `report_focus`) ; la touche enfoncée d'un journal n'est même pas encodée (`on_key_down`).
-fn input_reaches_program(read_only: bool) -> bool {
-    !read_only
+fn input_reaches_program(read_only: bool, link_down: bool) -> bool {
+    !read_only && !link_down
 }
 
 /// Écrit ce que l'utilisateur a saisi (ou le rapport de focus) vers le programme du pane, si la vue le permet. Faux : rien
 /// n'est parti.
-fn write_user_input(read_only: bool, backend: &mut PaneBackend, bytes: &[u8]) -> bool {
-    if !input_reaches_program(read_only) {
+fn write_user_input(
+    read_only: bool,
+    link_down: bool,
+    backend: &mut PaneBackend,
+    bytes: &[u8],
+) -> bool {
+    if !input_reaches_program(read_only, link_down) {
         return false;
     }
     backend.send_bytes(bytes);
@@ -2676,6 +2717,7 @@ impl EntityInputHandler for PaneView {
         self.marked_text = None;
         if !text.is_empty() {
             self.send_user_input(text.as_bytes());
+            self.announce_dropped_input(cx);
         }
         cx.notify();
     }
@@ -3205,11 +3247,11 @@ mod tests {
         drop(backend);
     }
 
-    /// La porte de la lecture seule, sur un vrai PTY (`cat`, dont le terminal répète ce qu'on lui écrit) : ce qu'un journal
-    /// « tape » ne part pas, la même écriture sur une vue ordinaire part et revient en écho. Le test échouerait si la porte
-    /// laissait passer un octet.
+    /// La porte de la lecture seule et celle du lien tombé, sur un vrai PTY (`cat`, dont le terminal répète ce qu'on lui
+    /// écrit) : ce qu'un journal « tape », ou ce qu'on tape quand le lien vers la machine est tombé, ne part pas ; la même
+    /// écriture sur une vue ordinaire part et revient en écho. Le test échouerait si la porte laissait passer un octet.
     #[test]
-    fn a_read_only_view_writes_nothing_to_its_program_and_an_ordinary_one_does() {
+    fn a_closed_view_writes_nothing_to_its_program_and_an_ordinary_one_does() {
         let (sender, receiver) = std::sync::mpsc::channel();
         let size = GridSize {
             columns: 80,
@@ -3245,12 +3287,17 @@ mod tests {
             }
             false
         };
-        assert!(!write_user_input(true, &mut backend, b"tapeici\n"));
+        assert!(!write_user_input(true, false, &mut backend, b"tapeici\n"));
         assert!(
             !echoed("tapeici", Duration::from_millis(800)),
             "a read-only view must not reach the program"
         );
-        assert!(write_user_input(false, &mut backend, b"tapeici\n"));
+        assert!(!write_user_input(false, true, &mut backend, b"coupeici\n"));
+        assert!(
+            !echoed("coupeici", Duration::from_millis(800)),
+            "a view whose link is down must not reach the program"
+        );
+        assert!(write_user_input(false, false, &mut backend, b"tapeici\n"));
         assert!(
             echoed("tapeici", Duration::from_secs(10)),
             "an ordinary view reaches it (the control)"

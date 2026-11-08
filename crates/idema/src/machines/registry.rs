@@ -107,6 +107,15 @@ impl SlotPool {
         Arc::clone(&self.brief)
     }
 
+    /// Les specs de tous les maîtres du pool, un par numéro de canal : ce qu'il faut pour les fermer (`ssh -O exit`) quand le
+    /// Mac sort de veille et que leurs connexions sont mortes.
+    pub fn master_specs(&self) -> Vec<RemoteSpec> {
+        self.masters
+            .iter()
+            .filter_map(|master| master.server.remote_spec().cloned())
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn slots(&self) -> usize {
         self.masters.len()
@@ -250,6 +259,14 @@ mod tests {
         assert_eq!(pool.slots(), 2);
         assert!(fresh.iter().all(|lease| slot_of(lease) == 0));
         assert_eq!(clones.len(), 100);
+    }
+
+    #[test]
+    fn every_master_of_the_pool_can_be_closed_by_its_own_control_path() {
+        let mut pool = SlotPool::new(spec());
+        let _held: Vec<Lease> = (0..7).map(|_| pool.long_lived()).collect();
+        let slots: Vec<u8> = pool.master_specs().iter().map(|spec| spec.slot).collect();
+        assert_eq!(slots, vec![0, 1]);
     }
 
     #[test]

@@ -23,8 +23,9 @@ pub struct SettingsWindow(Option<WindowHandle<SettingsView>>);
 impl Global for SettingsWindow {}
 
 /// `⌘,`, la ligne « Personnaliser » et le menu : ramène la fenêtre vivante au premier plan, sinon en ouvre une neuve sur
-/// « Général ». `section`, quand elle est donnée, est celle qu'on affiche dans les deux cas. `workspace` est la fenêtre principale, que « Éditer config.toml » pilote ; `main` est sa vue, que la
-/// fenêtre observe (la fenêtre principale est en pleine mise à jour quand `⌘,` arrive : on ne peut pas l'y relire).
+/// « Général ». `section`, quand elle est donnée, est celle qu'on affiche dans les deux cas. `workspace` est la fenêtre
+/// principale, que « Éditer config.toml » pilote ; `main` est sa vue, que la fenêtre observe (la fenêtre principale est
+/// en pleine mise à jour quand `⌘,` arrive : on ne peut pas l'y relire).
 pub fn open_or_focus(
     workspace: WindowHandle<Workspace>,
     main: Entity<Workspace>,

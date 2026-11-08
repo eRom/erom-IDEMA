@@ -1,5 +1,9 @@
 //! Les agents du `~/.idnma.yml` d'une machine distante : leur clé, leur `label` et leur `avatar`, rien d'autre.
 
+use std::process::Stdio;
+
+use idema_tmux::remote::{RemoteSpec, remote_command};
+
 /// Un agent déclaré sous `agents:`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IdnmaAgentInfo {
@@ -97,6 +101,29 @@ pub fn parse_idnma_agent_list(text: &str) -> Vec<IdnmaAgentInfo> {
     agents
 }
 
+/// Ce que la relecture du `~/.idnma.yml` apprend : `Some(Some(agents))` le fichier lu, `Some(None)` pas de fichier (`cat`
+/// sort en 1), `None` rien d'appris (ssh en 255, signal) : la dernière lecture reste. Le contenu n'est jamais journalisé.
+pub fn agents_of_cat(exit: Option<i32>, stdout: &str) -> Option<Option<Vec<IdnmaAgentInfo>>> {
+    match exit {
+        Some(0) => Some(Some(parse_idnma_agent_list(stdout))),
+        Some(1) => Some(None),
+        _ => None,
+    }
+}
+
+/// Relit `~/.idnma.yml` de la machine par `cat`, à travers ssh. Bloquant : hors du fil d'interface.
+pub fn read_agents(spec: &RemoteSpec) -> Option<Option<Vec<IdnmaAgentInfo>>> {
+    let output = remote_command(spec, "cat \"$HOME/.idnma.yml\"", false)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    agents_of_cat(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +134,19 @@ mod tests {
             label: Some(label.into()),
             avatar: Some(avatar.into()),
         }
+    }
+
+    #[test]
+    fn a_reread_distinguishes_a_missing_file_from_a_broken_link() {
+        let text = "agents:\n  claude:\n    label: Claude\n";
+        // `cat` a lu le fichier.
+        let read = agents_of_cat(Some(0), text).expect("a file was read");
+        assert_eq!(read.expect("the file exists")[0].key, "claude");
+        // `cat` ne trouve pas le fichier : la machine n'en a pas.
+        assert_eq!(agents_of_cat(Some(1), ""), Some(None));
+        // ssh (255), signal ou autre : la relecture n'a rien appris, la dernière lecture reste.
+        assert_eq!(agents_of_cat(Some(255), ""), None);
+        assert_eq!(agents_of_cat(None, ""), None);
     }
 
     #[test]

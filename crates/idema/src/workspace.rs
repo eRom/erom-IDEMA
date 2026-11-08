@@ -74,8 +74,15 @@ use crate::ideation::{
     ToolbarItem, ideation_command, next_remote_name, remote_prefix, toolbar_items,
 };
 use crate::integrations;
-use crate::lifecycle::{AfterClose, REATTACH_ATTEMPTS, after_close, machine_sync};
-use crate::machines::key::{LOCAL_MACHINE, SessionTarget, machine_of, split_session_key};
+use crate::lifecycle::{AfterClose, REATTACH_ATTEMPTS, machine_sync};
+use crate::machines::idnma::{IdnmaAgentInfo, read_agents};
+use crate::machines::key::{
+    LOCAL_MACHINE, SessionTarget, machine_of, remote_session_key, split_session_key,
+};
+use crate::machines::lifecycle::{
+    RemoteAfterClose, RemoteMenuLine, after_remote_close, close_master, default_remote_agent,
+    idnma_run_command, is_wake_jump, remote_menu_lines, set_extended_keys, settle_server,
+};
 use crate::machines::probe::{
     MachineFacts, RemoteFailure, ensure_control_dir, probe, probe_spec, retry_delay,
 };
@@ -119,8 +126,8 @@ use crate::servers::scan::{Process, SCAN_PERIOD};
 use crate::session_view::{PaneLaunch, SessionEntryInfo, SessionEvent, SessionView};
 use crate::settings::nav::Section;
 use crate::sidebar::{
-    AgentMark, SIDEBAR_WIDTH, TITLE_BAND, agent_marks, remote_agent_marks, render_sidebar,
-    state_dot,
+    AgentMark, SIDEBAR_WIDTH, TITLE_BAND, agent_marks, remote_agent_logo, remote_agent_marks,
+    render_sidebar, state_dot,
 };
 use crate::sidebar_model::{
     SessionSummary, cycle, default_session_name, dock_badge_count, ideation_shown,
@@ -652,12 +659,12 @@ fn fleet_entries(entries: &[SessionEntry]) -> impl Iterator<Item = &SessionEntry
         .filter(|entry| entry.summary.machine.is_none())
 }
 
-/// Une clé de session telle qu'elle figure au journal : le nom tmux en local, `<connexion>:<nom tmux>` sur une machine.
 /// Des noms de session empruntés, rendus possédés (l'ordre de navigation mêle des sources de durées de vie différentes).
 fn owned_names(names: Vec<&str>) -> Vec<String> {
     names.into_iter().map(str::to_owned).collect()
 }
 
+/// Une clé de session telle qu'elle figure au journal : le nom tmux en local, `<connexion>:<nom tmux>` sur une machine.
 fn key_label(key: &str) -> String {
     match split_session_key(key) {
         SessionTarget::Local(name) => name.to_owned(),
@@ -728,6 +735,9 @@ const SESSIONS_POLL: Duration = Duration::from_secs(1);
 /// La relecture des sessions d'une machine distante connectée : elle apporte les `@idnma_agent` posés après coup et les
 /// sessions d'une machine sans vue attachée. Une seule à la fois par machine (un canal bref, jamais empilé).
 const REMOTE_POLL: Duration = Duration::from_secs(2);
+
+/// Pas de la minuterie qui compare l'horloge murale pour reconnaître la sortie de veille du Mac.
+const WAKE_TICK: Duration = Duration::from_secs(2);
 
 /// Les relectures de suite qui échouent avant que la connexion d'une machine soit tenue pour perdue.
 const REMOTE_LISTING_FAILURES: u8 = 3;
@@ -838,6 +848,8 @@ struct SessionRequest {
     command: Option<String>,
     /// Le nom Remote Control d'un bouillon ; `None` pour une session de projet.
     remote_name: Option<String>,
+    /// La connexion de la machine distante qui héberge la session ; `None` : le Mac.
+    machine: Option<String>,
 }
 
 pub struct Workspace {
@@ -900,6 +912,8 @@ pub struct Workspace {
     _sessions_task: Option<Task<()>>,
     /// Le sondage de `list-sessions` pour le cas sans client.
     _sessions_poll: Option<Task<()>>,
+    /// La minuterie du réveil du Mac (`start_wake_clock`) : elle vit autant que la fenêtre.
+    _wake_clock: Option<Task<()>>,
     _bootstrap_task: Option<Task<()>>,
     /// L'attache différée des sessions listées au démarrage.
     _attach_task: Option<Task<()>>,
@@ -1092,6 +1106,7 @@ impl Workspace {
             for view in this.terminal.views() {
                 view.update(cx, |view, _| view.terminate_local());
             }
+            this.release_size_pins(cx);
             // Les onglets partent sur le disque avant la sortie (spec P2 §4.6).
             this.save_files_panels("quit", cx);
             this.save_browser_tabs(cx);
@@ -1105,6 +1120,7 @@ impl Workspace {
         window.on_window_should_close(cx, move |_, cx| {
             if let Some(workspace) = closing.upgrade() {
                 workspace.update(cx, |this, cx| {
+                    this.release_size_pins(cx);
                     this.save_files_panels("quit", cx);
                     this.save_browser_tabs(cx);
                     this.flush_scratchpad("quit", cx);
@@ -1153,6 +1169,7 @@ impl Workspace {
             sessions_generation: 0,
             _sessions_task: None,
             _sessions_poll: None,
+            _wake_clock: None,
             _bootstrap_task: task,
             _attach_task: None,
             companion: CompanionController::new(),
@@ -2863,6 +2880,85 @@ impl Workspace {
         for connection in added {
             self.connect_machine(&connection, window, cx);
         }
+        if !self.machines.is_empty() {
+            self.start_wake_clock(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Une minuterie de `WAKE_TICK` compare l'horloge murale : un saut de plus de `tick + 10 s` est un réveil du Mac
+    /// (`is_wake_jump`), et toutes les machines se reconnectent tout de suite (spec ssh-tmux §3.2).
+    fn start_wake_clock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._wake_clock.is_some() {
+            return;
+        }
+        let mut last = SystemTime::now();
+        self._wake_clock = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WAKE_TICK).await;
+                let now = SystemTime::now();
+                let woke = is_wake_jump(last, now, WAKE_TICK);
+                last = now;
+                let alive = this.update_in(cx, |this, window, cx| {
+                    if woke {
+                        this.on_wake(window, cx);
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Le Mac sort de veille : ses connexions ssh sont mortes sans qu'aucun client ne l'ait vu.
+    fn on_wake(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        hud::log_event("wake detected");
+        let connections: Vec<String> = self
+            .machines
+            .iter()
+            .map(|machine| machine.entry.connection.clone())
+            .collect();
+        for connection in connections {
+            self.recycle_machine(&connection, window, cx);
+        }
+    }
+
+    /// Ferme les maîtres ssh de la machine (`ssh -O exit`, hors du fil d'interface), puis la reconnecte tout de suite. Les
+    /// vues gardent leurs entrées : la reconnexion les rattache (`resume_machine_views`). Le compte des essais repart de 0.
+    fn recycle_machine(&mut self, connection: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let machine = &mut self.machines[index];
+        let masters = machine
+            .pool
+            .as_ref()
+            .map(SlotPool::master_specs)
+            .unwrap_or_default();
+        let was_connected = machine.status == MachineStatus::Connected;
+        machine.status = MachineStatus::Connecting;
+        machine.poll = None;
+        machine.retry = None;
+        machine.attempt = 0;
+        machine.refresh_failures = 0;
+        if was_connected {
+            self.set_machine_link(connection, true, cx);
+        }
+        // Un maître d'avant la veille ne répond plus : la nouvelle sonde passerait par lui. Il est fermé d'abord.
+        let closing = cx.background_spawn(async move {
+            for spec in &masters {
+                close_master(spec);
+            }
+        });
+        let target = connection.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            closing.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.connect_machine(&target, window, cx);
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -2882,6 +2978,14 @@ impl Workspace {
         let uid = unsafe { libc::geteuid() };
         // Le même dossier de contrôle que « Tester » des réglages : ils partagent le maître `%C-0`.
         let spec = probe_spec(connection, &self.dir, uid, |name| std::env::var(name).ok());
+        // La session de cette machine que cette instance affiche : son épingle de taille n'est pas périmée.
+        let displayed = match self.selected_name().map(route) {
+            Some(Route::Remote {
+                connection: shown,
+                tmux,
+            }) if shown == connection => Some(tmux),
+            _ => None,
+        };
         let work = cx.background_spawn(async move {
             ensure_control_dir(&spec.control_dir).map_err(|error| {
                 hud::log_event(&format!(
@@ -2890,7 +2994,17 @@ impl Workspace {
                 ));
                 RemoteFailure::ControlDir
             })?;
-            probe(&spec).map(|facts| (spec, facts))
+            let facts = probe(&spec)?;
+            // Les deux options de serveur permises, et les épingles de taille qu'un IdemA tombé a laissées.
+            settle_server(
+                &TmuxServer::remote(RemoteSpec {
+                    home: facts.home.clone(),
+                    shell: facts.shell.clone(),
+                    ..spec.clone()
+                }),
+                displayed.as_deref(),
+            );
+            Ok((spec, facts))
         });
         let connection = connection.to_owned();
         cx.spawn_in(window, async move |this, cx| {
@@ -3096,8 +3210,34 @@ impl Workspace {
         machine.status = MachineStatus::Connecting;
         machine.poll = None;
         machine.refresh_failures = 0;
+        // Plus rien n'arrive à la machine : un client ssh peut rester vivant 30 s après une vraie coupure, la saisie ne doit
+        // pas s'y accumuler (`SessionView::set_link_down`).
+        self.set_machine_link(connection, true, cx);
         cx.notify();
         self.connect_machine(connection, window, cx);
+    }
+
+    /// Sortie propre d'IdemA : chaque session distante qu'il affichait rend sa taille à tmux (spec ssh-tmux §3.3). Un
+    /// plantage ne passe pas ici : l'épingle reste, et la connexion suivante de la machine la retire (`settle_server`).
+    fn release_size_pins(&self, cx: &mut Context<Self>) {
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| entry.summary.machine.is_some())
+        {
+            if let Some(view) = &entry.view {
+                view.update(cx, |view, _| view.release_size_pin());
+            }
+        }
+    }
+
+    /// Lève ou baisse le drapeau « lien tombé » de toutes les vues de la machine.
+    fn set_machine_link(&self, connection: &str, down: bool, cx: &mut Context<Self>) {
+        for key in self.machine_entry_keys(connection) {
+            if let Some(view) = self.entry_view(&key) {
+                view.update(cx, |view, cx| view.set_link_down(down, cx));
+            }
+        }
     }
 
     /// La machine vient de se (re)connecter : les entrées sans vue s'attachent, celles dont le client est tombé se
@@ -3115,6 +3255,9 @@ impl Workspace {
             };
             if needs {
                 self.reattach_later(&key, window, cx);
+            } else if let Some(view) = self.entry_view(&key) {
+                // Un client resté vivant pendant un sondage raté : la machine répond, la saisie repart.
+                view.update(cx, |view, cx| view.set_link_down(false, cx));
             }
         }
     }
@@ -5234,7 +5377,8 @@ impl Workspace {
             return;
         }
         // `has-session` est un appel ponctuel (un process, ou un canal bref ssh) : hors du fil d'interface. En local, toute
-        // erreur vaut « absente » ; sur une machine, une erreur de ssh n'est pas une absence (`has_session_checked`).
+        // erreur vaut « absente » ; sur une machine, une erreur de ssh n'est pas une absence (`has_session_checked`) :
+        // `after_remote_close` en fait une machine perdue, pas une session disparue.
         let Some(check) = self.spawn_for(name, cx, |server, tmux| {
             if server.is_remote() {
                 server.has_session_checked(tmux)
@@ -5252,19 +5396,26 @@ impl Workspace {
                 let Some(index) = this.entry_index(&name) else {
                     return;
                 };
-                let exists = match exists {
-                    Ok(exists) => exists,
-                    // Ni présente ni absente : la machine ne répond plus. L'entrée reste, la machine se reconnecte.
-                    Err(error) => {
-                        hud::log_event(&format!(
-                            "session check failed session={}: {error}",
-                            key_label(&name)
-                        ));
-                        this.lose_machine(machine_of(&name), &error.to_string(), window, cx);
-                        return;
-                    }
-                };
-                match after_close(exists, this.entries[index].attempts, alive_for) {
+                let after =
+                    match after_remote_close(&exists, this.entries[index].attempts, alive_for) {
+                        RemoteAfterClose::Close(after) => after,
+                        // Ni présente ni absente : la machine ne répond plus. L'entrée et sa vue restent, la machine se
+                        // reconnecte et `resume_machine_views` rattache la vue.
+                        RemoteAfterClose::MachineLost => {
+                            let reason = exists
+                                .err()
+                                .map(|error| error.to_string())
+                                .unwrap_or_default();
+                            hud::log_event(&format!(
+                                "session check failed session={}: {}",
+                                key_label(&name),
+                                log_safe(&reason)
+                            ));
+                            this.lose_machine(machine_of(&name), &reason, window, cx);
+                            return;
+                        }
+                    };
+                match after {
                     AfterClose::Remove => this.remove_entry(&name, window, cx),
                     AfterClose::Retry { attempt } => {
                         this.entries[index].attempts = attempt;
@@ -6093,6 +6244,15 @@ impl Workspace {
             self.new_ideation_session(window, cx);
             return;
         }
+        // Une session distante visée (le dernier geste n'est pas un projet) : `⌘T` crée sur sa machine.
+        if !self.project_wins
+            && let Some(connection) = self
+                .selected_entry()
+                .and_then(|entry| entry.summary.machine.clone())
+        {
+            self.new_remote_session_default(&connection, window, cx);
+            return;
+        }
         match self.context_project() {
             Some(project) => self.create_session(project, self.default_choice(), window, cx),
             None => self.open_project_dialog(window, cx),
@@ -6195,8 +6355,193 @@ impl Workspace {
             agent: choice.label().to_owned(),
             command,
             remote_name: None,
+            machine: None,
         };
         self.spawn_session(server, request, window, cx);
+    }
+
+    /// L'agent par défaut d'une machine, d'après la dernière lecture de son `~/.idnma.yml` : celui que l'agent par défaut local
+    /// désigne si la machine l'a, sinon son premier. `None` : le shell seul.
+    fn remote_default_agent(&self, connection: &str) -> Option<IdnmaAgentInfo> {
+        let machine = &self.machines[self.machine_index(connection)?];
+        let agents = machine.facts.as_ref()?.agents.as_deref()?;
+        default_remote_agent(self.config.default_agent(), agents).cloned()
+    }
+
+    /// Clic sur le « + » d'une machine : l'agent par défaut de la machine, sinon le shell seul.
+    pub(crate) fn new_remote_session_default(
+        &mut self,
+        connection: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let agent = self.remote_default_agent(connection);
+        self.new_remote_session(connection, agent, window, cx);
+    }
+
+    /// Crée une session sur la machine `connection` (spec ssh-tmux §3.6) : `new-session` dans le home de l'utilisateur
+    /// distant, à la taille de la zone centrale, sur le canal bref de la machine, hors du fil d'interface. La commande
+    /// `idnma run <clé>` est tapée quand le pane est prêt (`LaunchGate`), jamais à l'aveugle. `None` : le shell seul.
+    pub(crate) fn new_remote_session(
+        &mut self,
+        connection: &str,
+        agent: Option<IdnmaAgentInfo>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let machine = &self.machines[index];
+        if machine.status != MachineStatus::Connected {
+            return;
+        }
+        let Some(pool) = machine.pool.as_ref() else {
+            return;
+        };
+        let server = pool.brief();
+        let command = agent
+            .as_ref()
+            .and_then(|agent| idnma_run_command(&agent.key));
+        if agent.is_some() && command.is_none() {
+            hud::log_event(&format!(
+                "remote session create skipped machine={connection}: agent key is not a plain word"
+            ));
+            return;
+        }
+        let label = agent.as_ref().map_or_else(
+            || SHELL_SESSION_NAME.to_owned(),
+            |agent| agent.label.clone().unwrap_or_else(|| agent.key.clone()),
+        );
+        // Les noms déjà pris parmi les sessions de la machine, ceux d'une création en vol compris (leur projet est vide).
+        let taken: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.summary.machine.as_deref() == Some(connection))
+            .map(|entry| entry.summary.display_name.clone())
+            .chain(
+                self.pending_names
+                    .iter()
+                    .filter(|(project, _)| project.as_os_str().is_empty())
+                    .map(|(_, name)| name.clone()),
+            )
+            .collect();
+        let taken: Vec<&str> = taken.iter().map(String::as_str).collect();
+        let request = SessionRequest {
+            // Une session distante n'a pas de projet du Mac : le dossier de départ est le home de la machine
+            // (`spawn_session`).
+            project: PathBuf::new(),
+            display_name: default_session_name(&label, &taken),
+            agent: agent.map_or_else(|| SHELL_SESSION_NAME.to_owned(), |agent| agent.key),
+            command,
+            remote_name: None,
+            machine: Some(connection.to_owned()),
+        };
+        self.spawn_session(server, request, window, cx);
+    }
+
+    /// Clic droit sur le « + » d'une machine : ses agents (relus de son `~/.idnma.yml`, le menu s'ouvre sur la dernière
+    /// lecture), puis « Shell seul ».
+    pub(crate) fn open_remote_launcher_menu(
+        &mut self,
+        connection: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let agents: Option<Vec<IdnmaAgentInfo>> = self.machines[index]
+            .facts
+            .as_ref()
+            .and_then(|facts| facts.agents.clone());
+        let default_key = self.remote_default_agent(connection).map(|agent| agent.key);
+        let mut entries = Vec::new();
+        for line in remote_menu_lines(agents.as_deref(), default_key.as_deref()) {
+            entries.push(match line {
+                RemoteMenuLine::Agent { key, text, default } => {
+                    let agent = agents
+                        .as_deref()
+                        .and_then(|agents| agents.iter().find(|agent| agent.key == key))
+                        .cloned();
+                    let logo = agent.as_ref().and_then(remote_agent_logo);
+                    let target = connection.to_owned();
+                    let mut item = MenuItemSpec::new(text, move |this, window, cx| {
+                        this.new_remote_session(&target, agent.clone(), window, cx);
+                    })
+                    .logo(logo)
+                    .checked(default);
+                    if default {
+                        item = item.shortcut("⌘T");
+                    }
+                    MenuEntry::Item(item)
+                }
+                RemoteMenuLine::Note(text) => MenuEntry::Note(text.into()),
+                RemoteMenuLine::Separator => MenuEntry::Separator,
+                RemoteMenuLine::Shell { default } => {
+                    let target = connection.to_owned();
+                    let mut item = MenuItemSpec::new(SHELL_ENTRY, move |this, window, cx| {
+                        this.new_remote_session(&target, None, window, cx);
+                    })
+                    .checked(default);
+                    if default {
+                        item = item.shortcut("⌘T");
+                    }
+                    MenuEntry::Item(item)
+                }
+            });
+        }
+        let spec = MenuSpec {
+            title: Some("Nouvelle session d'agent".into()),
+            entries,
+        };
+        self.open_menu(position, spec, window, cx);
+        self.reread_machine_agents(connection, cx);
+    }
+
+    /// Relit le `~/.idnma.yml` de la machine (`cat` sur son canal bref) pour la prochaine ouverture du menu. Une relecture
+    /// qui échoue laisse la dernière lecture. Le contenu n'est jamais journalisé.
+    fn reread_machine_agents(&mut self, connection: &str, cx: &mut Context<Self>) {
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let machine = &self.machines[index];
+        if machine.status != MachineStatus::Connected {
+            return;
+        }
+        let Some(spec) = machine
+            .pool
+            .as_ref()
+            .and_then(|pool| pool.brief().remote_spec().cloned())
+        else {
+            return;
+        };
+        let turn = Arc::clone(&machine.adhoc);
+        let read = cx.background_spawn(async move {
+            let _held = turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            read_agents(&spec)
+        });
+        let target = connection.to_owned();
+        cx.spawn(async move |this, cx| {
+            let Some(agents) = read.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                let Some(index) = this.machine_index(&target) else {
+                    return;
+                };
+                if let Some(facts) = this.machines[index].facts.as_mut()
+                    && facts.agents != agents
+                {
+                    facts.agents = agents;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// `+` de la section « Bouillon de neurones » et `⌘T` sur un bouillon : une session dans le dossier de la section
@@ -6244,6 +6589,7 @@ impl Workspace {
             agent: config.label.clone(),
             command: Some(ideation_command(&config, &remote_name)),
             remote_name: Some(remote_name),
+            machine: None,
         };
         self.spawn_session(server, request, window, cx);
     }
@@ -6265,21 +6611,40 @@ impl Workspace {
         let grid = self.central_grid(window, Preset::Single.column_gaps());
         let columns = u16::try_from(grid.columns).unwrap_or(u16::MAX).max(1);
         let lines = u16::try_from(grid.lines).unwrap_or(u16::MAX).max(1);
-        let (project, display_name, agent, remote_name) = (
-            request.project.clone(),
+        // Une session distante démarre dans le home de l'utilisateur de la machine (`request.project` est vide).
+        let project = match server.remote_spec() {
+            Some(spec) if request.project.as_os_str().is_empty() => PathBuf::from(&spec.home),
+            _ => request.project.clone(),
+        };
+        let (display_name, agent, remote_name) = (
             request.display_name.clone(),
             request.agent.clone(),
             request.remote_name.clone(),
         );
+        // Sur une machine, la création passe par le canal bref comme les autres appels ponctuels, et pose les deux options de
+        // serveur permises : le serveur existe désormais, même si la session est la première de la machine.
+        let turn = request
+            .machine
+            .as_deref()
+            .and_then(|connection| self.machine_index(connection))
+            .map(|index| Arc::clone(&self.machines[index].adhoc));
         let created = cx.background_spawn(async move {
-            server.create_session(&NewTmuxSession {
+            let _held = turn.as_ref().map(|turn| {
+                turn.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            let created = server.create_session(&NewTmuxSession {
                 project: &project,
                 display_name: &display_name,
                 agent: &agent,
                 columns,
                 lines,
                 remote_name: remote_name.as_deref(),
-            })
+            });
+            if created.is_ok() && server.is_remote() {
+                set_extended_keys(&server);
+            }
+            created
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = created.await;
@@ -6315,6 +6680,7 @@ impl Workspace {
             agent,
             command,
             remote_name,
+            machine,
         } = request;
         let ideation = remote_name.is_some();
         let created = match result {
@@ -6337,15 +6703,20 @@ impl Workspace {
                 return;
             }
         };
+        // Sur une machine, la clé de la session porte sa connexion ; le dossier du projet n'est pas un projet du Mac.
+        let key = match &machine {
+            Some(connection) => remote_session_key(connection, &created.name),
+            None => created.name.clone(),
+        };
         self.entries.push(SessionEntry {
             summary: SessionSummary {
-                name: created.name.clone(),
+                name: key.clone(),
                 project: project.clone(),
                 display_name,
                 created: created.created,
                 state: ActivityState::Idle,
                 ideation,
-                machine: None,
+                machine: machine.clone(),
             },
             agent,
             remote_name: remote_name.unwrap_or_default(),
@@ -6370,20 +6741,25 @@ impl Workspace {
             })
             .into_iter()
             .collect();
-        if let Err(error) = self.attach(&created.name, size, launches, window, cx) {
-            hud::log_event(&format!("attach failed session={}: {error}", created.name));
+        if let Err(error) = self.attach(&key, size, launches, window, cx) {
+            hud::log_event(&format!(
+                "attach failed session={}: {error}",
+                key_label(&key)
+            ));
             // Mêmes essais qu'au lancement (écart E34), puis « Session injoignable » : pas d'écran vide. La commande
             // d'agent n'est pas rejouée au nouvel essai (`reattach_later` attache sans commande) : le pane ouvre un shell.
-            self.on_attach_lost(&created.name, error.to_string(), None, window, cx);
+            self.on_attach_lost(&key, error.to_string(), None, window, cx);
         }
-        // La session choisie doit se voir : son projet se déplie, ou la section pour un bouillon (`select` écrit
-        // `state.json`).
-        if ideation {
+        // La session choisie doit se voir : sa machine ou son projet se déplie, ou la section pour un bouillon (`select`
+        // écrit `state.json`).
+        if let Some(connection) = &machine {
+            self.state_mut().set_machine_collapsed(connection, false);
+        } else if ideation {
             self.state_mut().ui.ideation_collapsed = false;
         } else {
             self.state_mut().set_expanded(&project, true);
         }
-        self.select(&created.name, window, cx);
+        self.select(&key, window, cx);
     }
 
     /// Les entrées « Renommer » et « Fermer la session » d'un menu de session.

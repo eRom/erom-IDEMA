@@ -3,6 +3,7 @@
 
 pub mod idnma;
 pub mod key;
+pub mod lifecycle;
 pub mod probe;
 pub mod registry;
 pub mod sessions;

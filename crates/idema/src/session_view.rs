@@ -20,7 +20,7 @@ use idema_term::pane_session::size_watch_pane;
 use idema_tmux::client::ControlClient;
 use idema_tmux::command::{BORDER_WATCH, PaneWatch, border_reset, border_subscription};
 use idema_tmux::layout::{Direction, PaneRect, Preset, WindowLayout, neighbor, preset_cell};
-use idema_tmux::protocol::{ControlEvent, PaneId};
+use idema_tmux::protocol::{ControlEvent, PaneId, WindowId};
 use idema_tmux::server::{ServerError, TmuxServer};
 use idema_tmux::windows::{
     LayoutRepair, PaneRoster, QueryStep, SessionWindows, UNZOOM_SETTLE, WindowsQuery, layout_repair,
@@ -30,6 +30,7 @@ use crate::config::SHELL_SESSION_NAME;
 use crate::file_open::PathTarget;
 use crate::gutter::{Frame, pane_frame, separator_frame, session_columns};
 use crate::hud;
+use crate::machines::lifecycle::{control_line, pin_commands, unpin_commands};
 use crate::machines::registry::Lease;
 use crate::pane_view::{LaunchRequest, PaneEvent, PaneView, RESIZE_SETTLE, SessionRef};
 use crate::signpost;
@@ -54,6 +55,10 @@ const SIZE_REQUEST_DELAY: Duration = Duration::from_millis(50);
 // être plus long que le délai de la demande, sans quoi la relecture capturerait l'ancienne taille.
 const _: () = assert!(RESIZE_SETTLE.as_millis() > SIZE_REQUEST_DELAY.as_millis());
 
+/// Délai après le dernier changement de la zone centrale avant d'épingler la taille de la fenêtre distante : l'épingle
+/// suit la demande de taille (`SIZE_REQUEST_DELAY`) sans la précéder (spec ssh-tmux §3.3).
+const PIN_DELAY: Duration = Duration::from_millis(100);
+
 /// Silence des notifications de layout avant que la session ne se répare (spec §4.4, écart E28).
 const LAYOUT_SETTLE: Duration = Duration::from_millis(300);
 
@@ -74,6 +79,11 @@ const NO_PANE: u32 = u32::MAX;
 /// `refresh-client -C` : la taille de la zone centrale, demandée à tmux pour la session affichée (spec §3.3).
 fn client_size_command(grid: GridSize) -> String {
     format!("refresh-client -C {}x{}", grid.columns, grid.lines)
+}
+
+/// La cible tmux d'une fenêtre : `@3`.
+fn window_target(window: WindowId) -> String {
+    format!("@{}", window.0)
 }
 
 /// La commande d'agent d'un pane, et le délai avant lequel elle ne part pas : une restauration étale ses lancements.
@@ -502,6 +512,13 @@ pub struct SessionView {
     /// Vrai depuis le `Exit` du client courant jusqu'à la reconnexion : un `%exit` sans raison laisse `exit_reason`
     /// vide, mais le client est mort et rien de ce qu'on lui écrit n'arrive.
     client_exited: bool,
+    /// Le lien vers la machine est tombé (client sorti, ou machine qui ne répond plus) : les panes n'écrivent plus rien
+    /// sur l'entrée de ssh. Posé par l'espace de travail ; levé à la reconnexion. Toujours faux en local.
+    link_down: bool,
+    /// La fenêtre dont IdemA a épinglé la taille (session distante affichée), pour la libérer. `None` : rien d'épinglé.
+    pinned_window: Option<WindowId>,
+    /// Compteur qui annule les épingles dépassées par un nouveau changement de la zone.
+    pin_generation: u64,
     /// L'entrée du canal d'événements, gardée pour le client d'une reconnexion.
     sender: UnboundedSender<Incoming>,
     /// Identifiant du pane actif, lu par le rappel du client pour le repère `echo` (`NO_PANE` sans pane actif).
@@ -639,6 +656,9 @@ impl SessionView {
                 connected_at: Instant::now(),
                 exit_reason: None,
                 client_exited: false,
+                link_down: false,
+                pinned_window: None,
+                pin_generation: 0,
                 sender,
                 echo_pane,
                 slots: Vec::new(),
@@ -836,8 +856,88 @@ impl SessionView {
         self.apply_flags(window, cx);
         if displayed {
             self.sync_size(window, cx);
+            self.schedule_pin(window, cx);
+        } else {
+            // IdemA ne mène plus la taille : la fenêtre retombe sous la règle de tmux et de Ghostty.
+            self.unpin();
         }
         cx.notify();
+    }
+
+    /// Le lien vers la machine tombe ou revient. Tant qu'il est tombé, ses panes n'écrivent rien sur l'entrée de ssh.
+    /// Sans effet en local, où une écriture qui échoue ne coûte rien.
+    pub fn set_link_down(&mut self, link_down: bool, cx: &mut Context<Self>) {
+        if !self.remote || self.link_down == link_down {
+            return;
+        }
+        self.link_down = link_down;
+        for slot in &self.slots {
+            slot.view
+                .update(cx, |pane, _| pane.set_link_down(link_down));
+        }
+    }
+
+    /// Épingle la taille de la fenêtre visible d'une session distante affichée, 100 ms après le dernier changement : la
+    /// ligne part par le client de contrôle de la vue, jamais par un processus ssh de plus.
+    fn schedule_pin(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.remote || !self.displayed {
+            return;
+        }
+        self.pin_generation += 1;
+        let generation = self.pin_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(PIN_DELAY).await;
+            let _ = this.update(cx, |view, _| {
+                if view.pin_generation == generation {
+                    view.send_pin();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Écrit l'épingle : la taille demandée à tmux, sur la fenêtre visible (jamais la cachée). Sans lien, rien n'est
+    /// écrit : la reconnexion la repose.
+    fn send_pin(&mut self) {
+        if self.link_down || self.client_exited || !self.displayed {
+            return;
+        }
+        let (Some(window), Some(grid)) =
+            (self.windows.visible().map(|state| state.id), self.requested)
+        else {
+            return;
+        };
+        // La fenêtre épinglée change (la visible n'est plus la même) : l'ancienne est libérée d'abord.
+        if self.pinned_window.is_some_and(|pinned| pinned != window) {
+            self.unpin();
+        }
+        let columns = u16::try_from(grid.columns).unwrap_or(u16::MAX).max(1);
+        let lines = u16::try_from(grid.lines).unwrap_or(u16::MAX).max(1);
+        let line = control_line(&pin_commands(&window_target(window), columns, lines));
+        if self.client.send(&line).is_ok() {
+            self.pinned_window = Some(window);
+        }
+    }
+
+    /// Retire l'épingle posée par cette vue, s'il y en a une. Un client mort ne peut rien écrire : l'épingle reste
+    /// (exception acceptée, spec §3.3) et la connexion suivante de la machine la retire.
+    fn unpin(&mut self) {
+        // Une épingle en attente de son délai ne doit pas se poser après.
+        self.pin_generation += 1;
+        let Some(window) = self.pinned_window.take() else {
+            return;
+        };
+        if self.link_down || self.client_exited {
+            return;
+        }
+        let _ = self
+            .client
+            .send(&control_line(&unpin_commands(&window_target(window))));
+    }
+
+    /// Libère l'épingle avant que la vue ne parte : sortie propre d'IdemA, session retirée de la barre.
+    pub fn release_size_pin(&mut self) {
+        self.unpin();
     }
 
     /// Le clavier est de nouveau du côté de la session, ou l'a quittée pour le volet Terminal : ses panes l'apprennent
@@ -1020,6 +1120,7 @@ impl SessionView {
                     let _ = view.client.send(&client_size_command(grid));
                     view.reapply_preset = true;
                     view.schedule_repair(window, cx);
+                    view.schedule_pin(window, cx);
                 }
             });
         })
@@ -1067,6 +1168,8 @@ impl SessionView {
                     self.exit_reason.clone_from(reason);
                 }
                 self.client_exited = true;
+                // Le client est mort : ce qu'on taperait n'arriverait pas. La machine le confirmera, ou le reconnectera.
+                self.set_link_down(true, cx);
                 cx.emit(SessionEvent::Closed);
             }
             Route::Pane(id) => {
@@ -1156,6 +1259,13 @@ impl SessionView {
         }
         // Le layout a pu changer de nombre de colonnes : la taille demandée suit ses gouttières.
         self.sync_size(window, cx);
+        // La fenêtre visible n'est plus celle qui porte l'épingle (une fenêtre ouverte depuis Ghostty) : elle la reçoit.
+        if self.remote
+            && self.displayed
+            && self.windows.visible().map(|state| state.id) != self.pinned_window
+        {
+            self.schedule_pin(window, cx);
+        }
         self.sync_panes(window, cx);
         self.schedule_repair(window, cx);
         cx.notify();
@@ -1227,6 +1337,8 @@ impl SessionView {
                 remote: self.remote,
             };
             let view = cx.new(|cx| PaneView::new(writer, added, size, launch, session, window, cx));
+            let link_down = self.link_down;
+            view.update(cx, |pane, _| pane.set_link_down(link_down));
             let subscription = cx.subscribe_in(&view, window, Self::on_pane_event);
             self.slots.push(PaneSlot {
                 id: added,
@@ -1542,7 +1654,7 @@ impl SessionView {
     pub fn reconnect(
         &mut self,
         lease: Lease,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), ServerError> {
         let generation = self.client_generation + 1;
@@ -1575,6 +1687,10 @@ impl SessionView {
         self.connected_at = Instant::now();
         self.exit_reason = None;
         self.client_exited = false;
+        self.set_link_down(false, cx);
+        // Le nouveau client repose l'épingle : l'ancienne vit dans tmux, mais la taille a pu changer pendant la coupure.
+        self.pinned_window = None;
+        self.schedule_pin(window, cx);
         cx.notify();
         Ok(())
     }
@@ -1598,6 +1714,13 @@ impl SessionView {
 }
 
 impl EventEmitter<SessionEvent> for SessionView {}
+
+impl Drop for SessionView {
+    /// Une session retirée de la barre rend sa taille à tmux avant que son client ne se détache.
+    fn drop(&mut self) {
+        self.unpin();
+    }
+}
 
 impl Focusable for SessionView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

@@ -83,6 +83,19 @@ pub fn control_exit_arguments(spec: &RemoteSpec) -> Vec<String> {
     ]
 }
 
+/// La commande qui ferme le maître ssh d'une connexion (`ssh -O exit`), avec l'environnement remplacé de la machine. Au
+/// réveil du Mac, les maîtres d'avant la veille ne répondent plus : on les ferme avant de se reconnecter.
+pub fn control_exit_command(spec: &RemoteSpec) -> Command {
+    let mut command = Command::new(SSH_BINARY);
+    command.args(control_exit_arguments(spec)).env_clear().envs(
+        spec.ssh_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+    reset_signal_state(&mut command);
+    command
+}
+
 /// `ssh <options> -- <destination> <script>` : `script` est lu tel quel par le shell distant.
 pub fn remote_command(spec: &RemoteSpec, script: &str, tty: bool) -> Command {
     let mut command = Command::new(SSH_BINARY);
@@ -293,6 +306,21 @@ mod tests {
                 "caserne-claude"
             ]
         );
+    }
+
+    #[test]
+    fn control_exit_command_runs_the_system_ssh_with_the_replaced_environment() {
+        let mut with_env = spec();
+        with_env.ssh_env = vec![("HOME".into(), "/Users/r".into())];
+        let command = control_exit_command(&with_env);
+        assert_eq!(command.get_program(), "/usr/bin/ssh");
+        let arguments: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(arguments, control_exit_arguments(&with_env));
+        let envs: Vec<_> = command.get_envs().collect();
+        assert_eq!(envs.len(), 1);
     }
 
     #[test]
