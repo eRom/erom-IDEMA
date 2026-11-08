@@ -14,6 +14,9 @@ use super::idnma::{IdnmaAgentInfo, parse_idnma_agent_list};
 /// La version minimale de tmux distant.
 const MIN_TMUX: (u32, u32) = (3, 8);
 
+/// Longueur maximale du texte de `tmux -V` repris dans un message d'interface.
+const MAX_SHOWN_VERSION: usize = 40;
+
 /// Pourquoi une machine distante n'est pas utilisable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RemoteFailure {
@@ -110,7 +113,11 @@ pub fn parse_probe(output: &str) -> Result<MachineFacts, RemoteFailure> {
     }
     let tmux_version = match parse_tmux_version(tmux_line) {
         Some(version) if version >= MIN_TMUX => version,
-        _ => return Err(RemoteFailure::TmuxTooOld(tmux_line.trim().to_string())),
+        // Une version illisible (`tmux master`) est traitée comme trop ancienne ; le texte affiché est borné.
+        _ => {
+            let shown: String = tmux_line.trim().chars().take(MAX_SHOWN_VERSION).collect();
+            return Err(RemoteFailure::TmuxTooOld(shown));
+        }
     };
     let home = lines.next().ok_or(RemoteFailure::Unreachable)?.to_string();
     let shell = lines.next().ok_or(RemoteFailure::Unreachable)?.to_string();
@@ -138,7 +145,14 @@ pub fn probe(spec: &RemoteSpec) -> Result<MachineFacts, RemoteFailure> {
         .map_err(|_| RemoteFailure::Unreachable)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(classify_failure(output.status.code(), &stderr));
+        let exit = output.status.code();
+        // Le stderr brut va au journal seulement, jamais à l'interface. Jamais le stdout : il porte `~/.idnma.yml`.
+        let one_line = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+        crate::hud::log_event(&format!(
+            "ssh probe failed destination={} exit={exit:?}: {one_line}",
+            spec.destination
+        ));
+        return Err(classify_failure(exit, &stderr));
     }
     parse_probe(&String::from_utf8_lossy(&output.stdout))
 }
@@ -177,21 +191,19 @@ pub fn ensure_control_dir(dir: &Path) -> io::Result<()> {
     // `symlink_metadata` : un lien symbolique posé par un tiers n'est jamais suivi.
     let metadata = std::fs::symlink_metadata(dir)?;
     if !metadata.is_dir() {
-        return Err(io::Error::other(
-            "le dossier de contrôle n'est pas un dossier",
-        ));
+        return Err(io::Error::other("control dir is not a directory"));
     }
     // SAFETY: `geteuid` n'a aucune précondition.
     if metadata.uid() != unsafe { libc::geteuid() } {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "le dossier de contrôle appartient à un autre utilisateur",
+            "control dir is owned by another user",
         ));
     }
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "le dossier de contrôle est ouvert au groupe ou aux autres",
+            "control dir is open to group or others",
         ));
     }
     Ok(())
@@ -305,6 +317,17 @@ mod tests {
             probe_with("tmux master"),
             Err(RemoteFailure::TmuxTooOld("tmux master".into()))
         );
+    }
+
+    #[test]
+    fn parse_probe_truncates_a_long_version_text() {
+        let long = format!("tmux {}", "x".repeat(100));
+        let Err(RemoteFailure::TmuxTooOld(shown)) =
+            parse_probe(&format!("idema-probe-v1\n{long}\n/h\n/s\nNO_IDNMA\n"))
+        else {
+            panic!("expected TmuxTooOld");
+        };
+        assert_eq!(shown.chars().count(), 40);
     }
 
     #[test]
