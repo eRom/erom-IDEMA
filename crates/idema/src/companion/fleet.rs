@@ -157,9 +157,11 @@ pub fn fleet_agents(names: &[String], launchers: &[AgentEntry]) -> Vec<FleetAgen
 /// Les agents `names` d'une session distante (`@idema_agent`, sinon `@idnma_agent` : la clé de l'agent dans le
 /// `~/.idnma.yml` de sa machine), dans leur ordre : le `label` de l'agent dans ce fichier, sinon son nom ; le logo de son
 /// `avatar`, sinon celui de son nom en minuscules (la règle de la barre, `remote_agent_marks`), sinon aucun. Dédoublonné
-/// comme `fleet_agents`.
+/// comme la barre : par logo, et à défaut par nom (la clé), jamais par label.
 pub fn remote_fleet_agents(names: &[String], declared: &[IdnmaAgentInfo]) -> Vec<FleetAgent> {
     let mut agents: Vec<FleetAgent> = Vec::new();
+    // La marque que la barre montrerait : le logo, à défaut le nom.
+    let mut marks: Vec<(bool, String)> = Vec::new();
     for name in names {
         let info = declared.iter().find(|agent| &agent.key == name);
         let logo = info
@@ -170,12 +172,12 @@ pub fn remote_fleet_agents(names: &[String], declared: &[IdnmaAgentInfo]) -> Vec
         let label = info
             .and_then(|agent| agent.label.clone())
             .unwrap_or_else(|| name.clone());
-        let shown = agents.iter().any(|agent| match (&agent.logo, &logo) {
-            (Some(held), Some(wanted)) => held == wanted,
-            (None, None) => agent.label == label,
-            _ => false,
-        });
-        if !shown {
+        let mark = match &logo {
+            Some(logo) => (true, logo.clone()),
+            None => (false, name.clone()),
+        };
+        if !marks.contains(&mark) {
+            marks.push(mark);
             agents.push(FleetAgent { label, logo });
         }
     }
@@ -196,7 +198,7 @@ pub struct SessionInput {
 
 /// Le pseudo-projet d'une machine distante dans l'instantané : ses sessions s'y rangent comme dans un projet, sous le
 /// label de la machine. La page de l'iPhone ne change pas.
-fn machine_project(connection: &str) -> String {
+pub fn machine_project(connection: &str) -> String {
     format!("ssh://{connection}")
 }
 
@@ -394,6 +396,35 @@ mod tests {
             ],
             "the avatar picks the logo, the label the text; `claude` shares the logo of `sonnet`: one mark"
         );
+    }
+
+    #[test]
+    fn remote_agents_dedupe_like_the_sidebar_marks() {
+        let declared = |key: &str, label: &str, avatar: Option<&str>| IdnmaAgentInfo {
+            key: key.into(),
+            label: Some(label.into()),
+            avatar: avatar.map(str::to_owned),
+        };
+        let declared = [
+            declared("alpha", "Meme", None),
+            declared("beta", "Meme", None),
+            declared("sonnet", "Sonnet 5.5", Some("Claude")),
+            declared("opus", "Opus 5.5", Some("claude")),
+        ];
+        // Deux clés sans logo qui partagent un label restent deux marques ; deux avatars du même logo n'en font qu'une.
+        for names in [
+            vec!["alpha", "beta"],
+            vec!["sonnet", "opus", "alpha"],
+            vec!["alpha", "alpha", "beta", "sonnet", "claude"],
+            vec![],
+        ] {
+            let names: Vec<String> = names.into_iter().map(String::from).collect();
+            assert_eq!(
+                remote_fleet_agents(&names, &declared).len(),
+                crate::sidebar::remote_agent_marks(&names, &declared).len(),
+                "{names:?}"
+            );
+        }
     }
 
     fn input(name: &str, project: &str, ideation: bool, state: ActivityState) -> SessionInput {

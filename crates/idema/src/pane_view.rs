@@ -41,7 +41,7 @@ use idema_tmux::remote::{SSH_BINARY, shell_quote, ssh_arguments};
 use url::Url;
 
 use crate::browser::address::{self, is_local_document};
-use crate::companion::input::{RemoteKey, accepts_input, encode_remote_key};
+use crate::companion::input::{RemoteKey, accepts_remote_input, encode_remote_key};
 use crate::file_open::{self, PathTarget};
 use crate::hud::{self, DumpGrid, HudStats, ModeWatch, ToggleHud};
 use crate::machines::registry::Lease;
@@ -1337,9 +1337,15 @@ impl PaneView {
     }
 
     /// Le pane prend-il une saisie venue du téléphone ? Fermé par défaut : hors lecture seule, et seulement si une
-    /// commande tourne (au prompt du shell, ou tant qu'IdemA ne sait pas ce qui tourne, non).
+    /// commande tourne (au prompt du shell, ou tant qu'IdemA ne sait pas ce qui tourne, non), et si le lien de sa machine
+    /// répond (`link_down` jetterait la saisie sans le dire).
     pub fn accepts_remote_input(&self) -> bool {
-        accepts_input(self.read_only, self.command_running())
+        accepts_remote_input(self.read_only, self.command_running(), self.link_down)
+    }
+
+    /// Le lien de la machine du pane est-il tombé ? Toujours faux pour un pane local.
+    pub fn link_is_down(&self) -> bool {
+        self.link_down
     }
 
     /// Une commande tourne-t-elle dans le pane (entre OSC 133;C et D ; sans marqueur, un programme que l'on sait n'être

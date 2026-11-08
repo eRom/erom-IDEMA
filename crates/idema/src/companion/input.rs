@@ -203,20 +203,28 @@ pub fn accepts_input(read_only: bool, command_running: bool) -> bool {
     !read_only && command_running
 }
 
+/// Le pane prend-il une saisie du téléphone ? `accepts_input`, et le lien de sa machine doit répondre : sur un lien
+/// tombé (`link_down`), le pane jetterait les octets sans le dire.
+pub fn accepts_remote_input(read_only: bool, command_running: bool, link_down: bool) -> bool {
+    !link_down && accepts_input(read_only, command_running)
+}
+
 /// Ce que le fil d'interface sait d'une saisie une fois la session et le pane trouvés.
 #[derive(Debug, Clone, Copy)]
 pub struct Gate {
     pub client_exited: bool,
+    /// Le lien de la machine est tombé (session distante) : la saisie serait jetée par le pane.
+    pub link_down: bool,
     pub expired: bool,
     pub duplicate: bool,
     pub read_only: bool,
     pub command_running: bool,
 }
 
-/// Le premier refus, dans l'ordre : client de contrôle sorti, commande périmée, doublon, lecture seule, rien ne
+/// Le premier refus, dans l'ordre : client de contrôle sorti ou lien tombé, commande périmée, doublon, lecture seule, rien ne
 /// tourne. `None` : la saisie peut partir.
 pub fn gate(facts: Gate) -> Option<InputOutcome> {
-    if facts.client_exited {
+    if facts.client_exited || facts.link_down {
         Some(InputOutcome::Disconnected)
     } else if facts.expired {
         Some(InputOutcome::Expired)
@@ -448,9 +456,18 @@ mod tests {
         assert!(accepts_input(false, true));
     }
 
+    #[test]
+    fn a_down_link_never_accepts_phone_input() {
+        assert!(accepts_remote_input(false, true, false));
+        assert!(!accepts_remote_input(false, true, true));
+        assert!(!accepts_remote_input(false, false, false));
+        assert!(!accepts_remote_input(true, true, false));
+    }
+
     fn facts() -> Gate {
         Gate {
             client_exited: false,
+            link_down: false,
             expired: false,
             duplicate: false,
             read_only: false,
@@ -463,6 +480,7 @@ mod tests {
         assert_eq!(gate(facts()), None);
         let everything = Gate {
             client_exited: true,
+            link_down: true,
             expired: true,
             duplicate: true,
             read_only: true,
@@ -474,13 +492,29 @@ mod tests {
             f(&mut next);
             gate(next)
         };
+        // Le lien tombé refuse comme un client sorti : explicitement, sans retenir la commande.
         assert_eq!(
             without(|g| g.client_exited = false),
+            Some(InputOutcome::Disconnected)
+        );
+        assert_eq!(
+            gate(Gate {
+                link_down: true,
+                ..facts()
+            }),
+            Some(InputOutcome::Disconnected)
+        );
+        assert_eq!(
+            without(|g| {
+                g.client_exited = false;
+                g.link_down = false;
+            }),
             Some(InputOutcome::Expired)
         );
         assert_eq!(
             without(|g| {
                 g.client_exited = false;
+                g.link_down = false;
                 g.expired = false;
             }),
             Some(InputOutcome::Duplicate)
@@ -488,6 +522,7 @@ mod tests {
         assert_eq!(
             without(|g| {
                 g.client_exited = false;
+                g.link_down = false;
                 g.expired = false;
                 g.duplicate = false;
             }),
@@ -496,6 +531,7 @@ mod tests {
         assert_eq!(
             without(|g| {
                 g.client_exited = false;
+                g.link_down = false;
                 g.expired = false;
                 g.duplicate = false;
                 g.read_only = false;

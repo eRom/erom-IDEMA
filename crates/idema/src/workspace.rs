@@ -95,7 +95,7 @@ use crate::machines::probe::{
 use crate::machines::registry::{Lease, MachineStatus, RemoteMachine, SlotPool};
 use crate::machines::sessions::{
     Route, SessionServers, machine_keys, no_servers, pane_agent_names, qualify_listing, route,
-    should_reselect,
+    should_reselect, wanted_servers,
 };
 use crate::pane_view::{PaneEvent, PaneView};
 use crate::popover::{
@@ -2551,12 +2551,17 @@ impl Workspace {
                 None => (InputOutcome::NoPane, None),
                 Some(pane_view) => {
                     let client_exited = view.read(cx).control_client_exited();
-                    let (read_only, command_running) = {
+                    let (read_only, command_running, link_down) = {
                         let pane = pane_view.read(cx);
-                        (pane.is_read_only(), pane.command_running())
+                        (
+                            pane.is_read_only(),
+                            pane.command_running(),
+                            pane.link_is_down(),
+                        )
                     };
                     let refused = gate(Gate {
                         client_exited,
+                        link_down,
                         expired: is_expired(received_at, started),
                         duplicate: self.companion.command_typed_recently(&command_id, started),
                         read_only,
@@ -2869,17 +2874,7 @@ impl Workspace {
     /// lit alors rien de ses sessions plutôt que de tomber sur un autre serveur. Rien n'est écrit quand la table est déjà
     /// la bonne.
     fn sync_session_servers(&self) {
-        let mut wanted: HashMap<String, Arc<TmuxServer>> = HashMap::new();
-        if let Some(server) = &self.server {
-            wanted.insert(LOCAL_MACHINE.to_owned(), Arc::clone(server));
-        }
-        for machine in &self.machines {
-            if machine.status == MachineStatus::Connected
-                && let Some(pool) = &machine.pool
-            {
-                wanted.insert(machine.entry.connection.clone(), pool.brief());
-            }
-        }
+        let wanted = wanted_servers(self.server.as_ref(), &self.machines);
         let mut table = self
             .session_servers
             .write()

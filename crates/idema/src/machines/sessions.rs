@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use idema_tmux::server::{ListedPane, ListedSession, TmuxServer};
 
 use super::key::{LOCAL_MACHINE, SessionTarget, machine_of, remote_session_key, split_session_key};
-use super::registry::adhoc_gate;
+use super::registry::{MachineStatus, RemoteMachine, adhoc_gate};
 
 /// Qualifie le listage d'une machine distante : les noms de ses sessions (et ceux que ses panes référencent) deviennent
 /// des clés `remote_session_key`, et `project` est vidé (le dossier d'une session distante n'est pas un projet du Mac).
@@ -96,6 +96,27 @@ pub fn local_servers(local: Arc<TmuxServer>) -> SessionServers {
         LOCAL_MACHINE.to_owned(),
         local,
     )])))
+}
+
+/// La table des serveurs que le compagnon doit voir : le tmux du Mac s'il est prêt, et le serveur bref de chaque machine
+/// connectée dont le pool existe. Une machine en connexion, en échec ou retirée n'y figure pas : le compagnon ne lit alors
+/// rien de ses sessions plutôt que de tomber sur un autre serveur.
+pub fn wanted_servers(
+    local: Option<&Arc<TmuxServer>>,
+    machines: &[RemoteMachine],
+) -> HashMap<String, Arc<TmuxServer>> {
+    let mut wanted = HashMap::new();
+    if let Some(local) = local {
+        wanted.insert(LOCAL_MACHINE.to_owned(), Arc::clone(local));
+    }
+    for machine in machines {
+        if machine.status == MachineStatus::Connected
+            && let Some(pool) = &machine.pool
+        {
+            wanted.insert(machine.entry.connection.clone(), pool.brief());
+        }
+    }
+    wanted
 }
 
 /// Le serveur de la session `session_key` et son nom tmux. Un pane (`%N`) ne se cherche jamais ailleurs que sur ce
@@ -332,6 +353,47 @@ mod tests {
             with_session_server(&servers, &remote_session_key("absente", "x"), |_, _| 7),
             None
         );
+    }
+
+    fn machine(connection: &str, status: MachineStatus, with_pool: bool) -> RemoteMachine {
+        let mut machine = RemoteMachine::new(crate::config::RemoteMachineEntry {
+            label: connection.to_owned(),
+            connection: connection.to_owned(),
+        });
+        machine.status = status;
+        if with_pool {
+            machine.pool = Some(crate::machines::registry::SlotPool::new(
+                idema_tmux::remote::RemoteSpec {
+                    destination: connection.to_owned(),
+                    control_dir: std::path::PathBuf::from("/tmp/idema-501-00000000"),
+                    slot: 0,
+                    ssh_env: Vec::new(),
+                    home: "/home/llm".into(),
+                    shell: "/bin/bash".into(),
+                },
+            ));
+        }
+        machine
+    }
+
+    #[test]
+    fn only_connected_machines_have_a_server_for_the_companion() {
+        let local = fake_server("idema-test-wanted-local");
+        let dell = machine("dell-lan", MachineStatus::Connected, true);
+        let caserne = machine("caserne-claude", MachineStatus::Connecting, true);
+        let failed = machine("vieille", MachineStatus::Connecting, false);
+        let machines = [dell, caserne, failed];
+        let wanted = wanted_servers(Some(&local), &machines);
+        let mut keys: Vec<&str> = wanted.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["dell-lan", LOCAL_MACHINE]);
+        assert!(Arc::ptr_eq(&wanted[LOCAL_MACHINE], &local));
+        let brief = machines[0].pool.as_ref().unwrap().brief();
+        assert!(Arc::ptr_eq(&wanted["dell-lan"], &brief));
+        // La machine retirée de la config n'a plus de serveur ; le Mac pas prêt non plus.
+        let removed = wanted_servers(Some(&local), &machines[1..]);
+        assert_eq!(removed.keys().collect::<Vec<_>>(), [LOCAL_MACHINE]);
+        assert!(wanted_servers(None, &[]).is_empty());
     }
 
     #[test]

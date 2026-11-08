@@ -29,13 +29,14 @@ use super::input::{self, HTTP_WAIT};
 use super::notify::Message;
 use super::push_send::{Delivery, PushSender, endpoint_allowed};
 use super::scratchpad::{self, AppendError};
-use super::screen;
+use super::screen::{self, CaptureError};
 use super::sse::{self, COALESCE};
 use super::timeline::Timeline;
 use super::web_assets;
 use super::webpush::UaKeys;
 use super::{AckOrigin, InputOutcome, PaneCommand, PaneProbe, ServiceEvent};
 use crate::hud;
+use crate::machines::key::{LOCAL_MACHINE, machine_of};
 use crate::machines::sessions::SessionServers;
 
 /// L'intervalle du commentaire de maintien du flux : il garde la connexion ouverte à travers les relais.
@@ -459,7 +460,7 @@ fn render_screen(
     probe: PaneProbe,
     if_none_match: Option<&str>,
     gzip: bool,
-) -> Result<(Rendered, String, u64), String> {
+) -> Result<(Rendered, String, u64), CaptureError> {
     let screen = screen::capture_for(servers, session, pane, history)?;
     // L'état et la prise en compte de la saisie figurent dans la réponse : ils changent l'`ETag` comme le texte.
     let etag = format!(
@@ -479,7 +480,7 @@ fn render_screen(
         "state": probe.state,
         "took_ms": screen.took_ms,
     }))
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| CaptureError::Failed(error.to_string()))?;
     let rendered = if gzip {
         use std::io::Write as _;
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -487,7 +488,7 @@ fn render_screen(
             .write_all(&json)
             .and_then(|()| encoder.finish())
             .map(|json| Rendered::Body { json, gzip: true })
-            .map_err(|error| error.to_string())?
+            .map_err(|error| CaptureError::Failed(error.to_string()))?
     } else {
         Rendered::Body { json, gzip: false }
     };
@@ -544,8 +545,7 @@ async fn screen(
     });
     let rendered = match tokio::time::timeout(HTTP_WAIT, work).await {
         Ok(Ok(Ok(rendered))) => rendered,
-        // tmux n'a pas pu capturer un pane que l'espace de travail vient de nommer : il a disparu entre-temps.
-        Ok(Ok(Err(_))) => return error_reply(StatusCode::NOT_FOUND, "not_found"),
+        Ok(Ok(Err(error))) => return capture_failure_reply(&session, &error),
         Ok(Err(_)) => return error_reply(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         Err(_) => return error_reply(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
     };
@@ -606,6 +606,19 @@ async fn input(
     match outcome {
         Ok(outcome) => input_reply(outcome),
         Err(why) => unanswered_reply(why),
+    }
+}
+
+/// La réponse quand l'écran d'un pane que l'espace de travail vient de nommer n'a pas pu être lu. Sur le Mac, tmux n'a pas
+/// trouvé le pane : il a disparu entre-temps (404, la page ferme la session). Sur une machine, une machine sans serveur
+/// (déconnectée) ou un échec ssh passager ne disent pas que la session est finie : 503, la page garde l'écran et le
+/// signale périmé (une session réellement disparue quitte la flotte à la relecture suivante).
+fn capture_failure_reply(session: &str, error: &CaptureError) -> Response {
+    let remote = machine_of(session) != LOCAL_MACHINE;
+    if remote || *error == CaptureError::NoServer {
+        error_reply(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+    } else {
+        error_reply(StatusCode::NOT_FOUND, "not_found")
     }
 }
 
@@ -1953,7 +1966,7 @@ mod tests {
         let (remote, remote_log) = fake_tmux(&remote_dir.0, b"REMOTE\n");
         let servers: crate::machines::sessions::SessionServers = Arc::new(std::sync::RwLock::new(
             [
-                ("local".to_owned(), local),
+                (LOCAL_MACHINE.to_owned(), local),
                 ("caserne-claude".to_owned(), remote),
             ]
             .into_iter()
@@ -1981,10 +1994,55 @@ mod tests {
         assert_eq!(reply.status, 200, "{}", reply.text());
         assert_eq!(reply.json()["text"], "LOCAL\n");
 
-        // Une machine qui n'a plus de serveur (déconnectée) ne se lit pas sur le serveur local.
+        // Une machine qui n'a plus de serveur (déconnectée) ne se lit pas sur le serveur local, et ne ferme pas la session
+        // sur le téléphone (404) : 503, la page garde l'écran et le dit périmé.
         let lost = "/idema-api/sessions/dell-lan%1Ftestvpc/panes/5/screen";
+        let before = calls(&local_log);
         let reply = service.request("GET", lost, &[("Cookie", &cookie)], None);
-        assert_eq!(reply.status, 404, "{}", reply.text());
+        assert_eq!(reply.status, 503, "{}", reply.text());
+        assert_eq!(reply.json()["error"], "unavailable");
+        assert_eq!(calls(&local_log), before, "still never the local server");
+    }
+
+    #[test]
+    fn a_failed_capture_closes_a_local_session_but_only_stales_a_remote_one() {
+        let dir = TempDir::new("failed-capture");
+        let broken = |socket: &str| {
+            Arc::new(idema_tmux::server::TmuxServer::new(
+                "/nonexistent/tmux".into(),
+                socket,
+                "/nonexistent/tmux.conf".into(),
+                Vec::new(),
+            ))
+        };
+        let servers: crate::machines::sessions::SessionServers = Arc::new(std::sync::RwLock::new(
+            [
+                (LOCAL_MACHINE.to_owned(), broken("idema-test-broken-local")),
+                (
+                    "caserne-claude".to_owned(),
+                    broken("idema-test-broken-remote"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let mut service = Harness::start_with_servers(dir, servers);
+        serve_commands(&mut service, move |command| {
+            if let PaneCommand::Probe { reply, .. } = command {
+                let _ = reply.send(Some(PaneProbe {
+                    accepts_input: true,
+                    state: "idle",
+                }));
+            }
+        });
+        let cookie = service.pair(IPHONE);
+        let get = |path: &str| service.request("GET", path, &[("Cookie", &cookie)], None);
+        // Le pane a disparu du tmux du Mac : la session est finie pour la page.
+        assert_eq!(get(SCREEN).status, 404);
+        // Même échec par ssh : transitoire, le téléphone ne ferme rien.
+        let remote = get("/idema-api/sessions/caserne-claude%1Ftestvpc/panes/5/screen");
+        assert_eq!(remote.status, 503, "{}", remote.text());
+        assert_eq!(remote.json()["error"], "unavailable");
     }
 
     #[test]

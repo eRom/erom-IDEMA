@@ -15,7 +15,7 @@ use tokio::sync::{oneshot, watch};
 use super::access::Access;
 use super::devices::Subscription;
 use super::episodes::{Due, EpisodeKind, Episodes, OpenOutcome, Policy};
-use super::fleet::Fleet;
+use super::fleet::{Fleet, machine_project};
 use super::notify_text::{payload, title, useful_lines};
 use super::push_send::{Delivery, PushSender};
 use super::screen;
@@ -326,12 +326,20 @@ async fn forget_subscription(
 /// distante).
 pub fn title_of(fleet: &Fleet, session: &str, kind: EpisodeKind) -> String {
     let Some(entry) = fleet.sessions.iter().find(|entry| entry.name == session) else {
-        // Jamais la clé qualifiée d'une session distante : son nom tmux.
-        let name = match split_session_key(session) {
-            SessionTarget::Local(name) => name,
-            SessionTarget::Remote { tmux, .. } => tmux,
+        // Jamais la clé qualifiée d'une session distante : son nom tmux, sous le label de sa machine quand la flotte le
+        // connaît.
+        return match split_session_key(session) {
+            SessionTarget::Local(name) => title(kind, None, name, ""),
+            SessionTarget::Remote { connection, tmux } => {
+                let path = machine_project(connection);
+                let label = fleet
+                    .projects
+                    .iter()
+                    .find(|project| project.path == path)
+                    .map_or("", |project| project.name.as_str());
+                title(kind, None, tmux, label)
+            }
         };
-        return title(kind, None, name, "");
     };
     let project = if entry.ideation {
         fleet.ideation_label.clone().unwrap_or_default()
@@ -955,5 +963,11 @@ mod tests {
         // Une session qui n'est plus dans la flotte : son nom tmux, jamais la clé qualifiée.
         let lost = title_of(&Fleet::default(), &key, EpisodeKind::Waiting);
         assert_eq!(lost, "testvpc attend");
+        // La machine est connue de la flotte par une autre session : son label suit la clé, pas la clé elle-même.
+        let gone = remote_session_key("caserne-claude", "fermee");
+        assert_eq!(
+            title_of(&fleet, &gone, EpisodeKind::Waiting),
+            "fermee attend · VPS Hostinger"
+        );
     }
 }
