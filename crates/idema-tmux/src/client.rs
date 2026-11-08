@@ -2,6 +2,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -13,20 +14,63 @@ use crate::server::{ServerError, TmuxServer, exact};
 /// abonnements et sa saisie. Une ligne part d'un bloc, sous le verrou.
 #[derive(Clone)]
 pub struct ClientWriter {
-    stdin: Arc<Mutex<ChildStdin>>,
+    sink: Sink,
+}
+
+/// Où part une ligne : directement dans le tuyau du client (tmux du Mac), ou dans la file d'un fil d'écriture (ssh).
+#[derive(Clone)]
+enum Sink {
+    Direct(Arc<Mutex<ChildStdin>>),
+    Queued(Sender<String>),
 }
 
 impl ClientWriter {
-    /// Envoie une ligne de commandes, sans `\n`.
+    /// Écrit dans le tuyau du client, sous verrou : le tmux du Mac le vide toujours.
+    fn direct(stdin: ChildStdin) -> Self {
+        Self {
+            sink: Sink::Direct(Arc::new(Mutex::new(stdin))),
+        }
+    }
+
+    /// Écrit par un fil dédié. Sur une machine distante, un lien figé ne vide plus le tuyau de ssh : une écriture directe
+    /// bloquerait l'appelant (le fil d'interface) dès que le tuyau est plein, 64 Kio, soit un collage de 21 Kio (mesuré le
+    /// 08/11 sur un maître ssh arrêté). Le fil prend la file, bloque seul, et s'arrête à la première écriture qui échoue
+    /// (ssh mort) ou quand plus personne ne tient d'`Sender`.
+    fn queued(mut stdin: ChildStdin, name: String) -> std::io::Result<Self> {
+        let (sender, receiver) = mpsc::channel::<String>();
+        std::thread::Builder::new().name(name).spawn(move || {
+            while let Ok(line) = receiver.recv() {
+                let written = stdin
+                    .write_all(line.as_bytes())
+                    .and_then(|()| stdin.write_all(b"\n"))
+                    .and_then(|()| stdin.flush());
+                if written.is_err() {
+                    break;
+                }
+            }
+        })?;
+        Ok(Self {
+            sink: Sink::Queued(sender),
+        })
+    }
+
+    /// Envoie une ligne de commandes, sans `\n`. Sur une machine, la ligne part dans la file et l'appel ne bloque jamais ;
+    /// une erreur dit que le fil d'écriture s'est arrêté, c'est-à-dire que le client est mort.
     pub fn send(&self, line: &str) -> std::io::Result<()> {
         debug_assert!(!line.contains('\n'), "a command must fit on one line");
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| std::io::Error::other("control client stdin lock poisoned"))?;
-        stdin.write_all(line.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()
+        match &self.sink {
+            Sink::Direct(stdin) => {
+                let mut stdin = stdin
+                    .lock()
+                    .map_err(|_| std::io::Error::other("control client stdin lock poisoned"))?;
+                stdin.write_all(line.as_bytes())?;
+                stdin.write_all(b"\n")?;
+                stdin.flush()
+            }
+            Sink::Queued(sender) => sender
+                .send(line.to_owned())
+                .map_err(|_| std::io::Error::other("control client writer stopped")),
+        }
     }
 }
 
@@ -60,15 +104,18 @@ impl ControlClient {
             .stderr(Stdio::null())
             .spawn()?;
         let stdin = child.stdin.take().expect("control client stdin");
+        let writer = if server.is_remote() {
+            ClientWriter::queued(stdin, format!("tmux-control-write-{session}"))?
+        } else {
+            ClientWriter::direct(stdin)
+        };
         let stdout = child.stdout.take().expect("control client stdout");
         let reader = std::thread::Builder::new()
             .name(format!("tmux-control-{session}"))
             .spawn(move || read_events(stdout, on_event))?;
         Ok(Self {
             child,
-            writer: ClientWriter {
-                stdin: Arc::new(Mutex::new(stdin)),
-            },
+            writer,
             reader: Some(reader),
         })
     }
@@ -156,6 +203,63 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Un client dont le tuyau n'est jamais vidé (ssh derrière un lien figé), figé ici par un `sleep` qui ne lit rien.
+    fn undrained_child() -> (Child, ChildStdin) {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("sleep starts");
+        let stdin = child.stdin.take().expect("piped stdin");
+        (child, stdin)
+    }
+
+    #[test]
+    fn a_remote_writer_never_blocks_its_caller_on_a_pipe_nobody_drains() {
+        let (mut child, stdin) = undrained_child();
+        let writer = ClientWriter::queued(stdin, "test-writer".into()).expect("thread starts");
+        let started = std::time::Instant::now();
+        // 1 Mio de lignes, seize fois ce que le tuyau tient : une écriture directe resterait bloquée.
+        let line = "send-keys -t %1 -H ".to_owned() + &"61 ".repeat(100);
+        for _ in 0..3_500 {
+            writer.send(&line).expect("the queue accepts the line");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sending blocked for {:?}",
+            started.elapsed()
+        );
+        // Le client meurt : le fil d'écriture s'arrête sur l'écriture qui échoue, et l'appelant l'apprend.
+        child.kill().expect("sleep killed");
+        child.wait().expect("sleep reaped");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while writer.send("x").is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never reported the dead client"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_remote_writer_keeps_lines_in_order() {
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat starts");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let writer = ClientWriter::queued(stdin, "test-writer".into()).expect("thread starts");
+        for number in 0..200 {
+            writer.send(&format!("line {number}")).unwrap();
+        }
+        drop(writer);
+        let output = child.wait_with_output().expect("cat ends");
+        let expected: String = (0..200).map(|number| format!("line {number}\n")).collect();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     }
 
     #[test]
