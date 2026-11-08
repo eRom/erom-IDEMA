@@ -8,7 +8,8 @@ use crate::server::reset_signal_state;
 /// Le client ssh du système : jamais celui du `PATH`.
 const SSH_BINARY: &str = "/usr/bin/ssh";
 
-/// Cite un argument pour un shell POSIX : entre apostrophes, une apostrophe interne devient `'\''`.
+/// Cite un argument pour un shell POSIX : entre apostrophes, une apostrophe interne devient `'\''`. Suppose que
+/// le shell de connexion distant est de la famille POSIX (sh, bash, zsh) : fish ou csh liraient la ligne autrement.
 pub fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
@@ -101,30 +102,59 @@ pub fn remote_command(spec: &RemoteSpec, script: &str, tty: bool) -> Command {
 /// Découpe `args` en commandes tmux. tmux sépare sur un argument `;` et sur un argument qui se termine par un
 /// `;` non échappé (`\;` reste un `;` littéral).
 fn split_commands<'a>(args: &[&'a str]) -> Vec<Vec<&'a str>> {
-    let mut commands = vec![Vec::new()];
+    let mut commands = Vec::new();
+    let mut current = Vec::new();
     for &arg in args {
         let (word, ends_command) = match arg.strip_suffix(';') {
             Some(_) if arg.ends_with("\\;") => (arg, false),
             Some(word) => (word, true),
             None => (arg, false),
         };
-        if !word.is_empty()
-            && let Some(current) = commands.last_mut()
-        {
+        if !word.is_empty() {
             current.push(word);
         }
-        if ends_command {
-            commands.push(Vec::new());
+        if ends_command && !current.is_empty() {
+            commands.push(std::mem::take(&mut current));
         }
     }
-    commands.retain(|command| !command.is_empty());
+    if !current.is_empty() {
+        commands.push(current);
+    }
     commands
+}
+
+/// Lit les drapeaux d'une commande `set-*` comme le `getopt` de tmux : jusqu'au premier mot sans tiret ou
+/// jusqu'à `--`. Seul `-t` prend une valeur (`set-option [-aFgopqsuUw] [-t cible]`, `set-environment [-Fhgru]
+/// [-t cible]`, tmux 3.8) : collée au drapeau (`-tcible`) ou, en fin de groupe, le mot suivant, qui n'est donc pas
+/// le premier mot sans tiret. Rend les lettres de drapeaux lues et le nombre de mots consommés.
+fn read_flags(words: &[&str]) -> (String, usize) {
+    let mut letters = String::new();
+    let mut consumed = 0;
+    while let Some(word) = words.get(consumed) {
+        if word.len() < 2 || !word.starts_with('-') || *word == "--" {
+            break;
+        }
+        consumed += 1;
+        for (index, letter) in word[1..].char_indices() {
+            letters.push(letter);
+            if letter == 't' {
+                // Le reste du groupe est la valeur ; en fin de groupe, c'est le mot suivant.
+                if index + 2 == word.len() {
+                    consumed += 1;
+                }
+                break;
+            }
+        }
+    }
+    (letters, consumed.min(words.len()))
 }
 
 /// Pourquoi tmux ne doit pas recevoir ces arguments sur une machine distante, ou `None` s'ils passent.
 ///
 /// IdemA est l'invité de ce serveur : jamais d'arrêt, de rechargement de configuration ni d'option globale ou
-/// serveur. Les drapeaux d'une commande se lisent avant son premier mot sans tiret, ou avant `--`.
+/// serveur. C'est un filet contre les appels d'IdemA lui-même, pas une barrière contre un adversaire : les
+/// chaînes de commandes imbriquées (`if-shell`, `run-shell`, `bind-key`…) et les préfixes uniques de noms de
+/// commandes (`kill-ser`) ne sont pas analysés.
 pub fn forbidden_on_remote(args: &[&str]) -> Option<String> {
     for command in split_commands(args) {
         let name = command[0];
@@ -133,21 +163,16 @@ pub fn forbidden_on_remote(args: &[&str]) -> Option<String> {
             "source-file" | "source" => return Some(format!("{name} reads a remote file")),
             "set-option" | "set" | "setw" | "set-window-option" | "set-environment" | "setenv" => {
                 let rest = &command[1..];
-                let flags: Vec<&str> = rest
-                    .iter()
-                    .take_while(|word| word.len() > 1 && word.starts_with('-') && **word != "--")
-                    .copied()
-                    .collect();
-                let bundle: String = flags.iter().map(|flag| &flag[1..]).collect();
-                if !bundle.contains(['g', 's']) {
+                let (letters, consumed) = read_flags(rest);
+                if !letters.contains(['g', 's']) {
                     continue;
                 }
-                if is_extended_keys_exception(name, &flags, &rest[flags.len()..]) {
+                if is_extended_keys_exception(name, &letters, &rest[consumed..]) {
                     continue;
                 }
                 return Some(format!(
                     "{name} {} changes global tmux state",
-                    flags.join(" ")
+                    rest[..consumed].join(" ")
                 ));
             }
             _ => {}
@@ -158,9 +183,9 @@ pub fn forbidden_on_remote(args: &[&str]) -> Option<String> {
 
 /// Seule écriture serveur permise : sans `extended-keys`, tmux 3.8 laisse `#{pane_key_mode}` à `VT10x` et
 /// Maj+Entrée se perd (mesuré le 08/11) ; Ghostty ne le laisse pas voir.
-fn is_extended_keys_exception(name: &str, flags: &[&str], words: &[&str]) -> bool {
+fn is_extended_keys_exception(name: &str, letters: &str, words: &[&str]) -> bool {
     matches!(name, "set-option" | "set")
-        && flags == ["-s"]
+        && letters == "s"
         && matches!(
             words,
             ["extended-keys", "on"] | ["extended-keys-format", "csi-u"]
@@ -297,6 +322,9 @@ mod tests {
             &["setw", "-g", "x", "y"],
             &["set-option", "-s", "history-limit", "9"],
             &["list-sessions", ";", "set", "-g", "a", "b"],
+            &["set-option", "-t", "probe", "-g", "status", "off"],
+            &["set", "-t", "x", "-s", "history-limit", "9"],
+            &["set-option", "-tprobe", "-g", "status", "off"],
         ];
         for args in refused {
             assert!(forbidden_on_remote(args).is_some(), "{args:?}");

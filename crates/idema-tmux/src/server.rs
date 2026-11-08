@@ -942,7 +942,9 @@ impl TmuxServer {
         &self.env
     }
 
-    /// Commande `tmux -L <socket> -f <config> <args…>`, environnement remplacé par la liste blanche.
+    /// Commande `tmux -L <socket> -f <config> <args…>`, environnement remplacé par la liste blanche. Sur un
+    /// serveur distant : `ssh … -- <destination> "tmux -u '<arg>'…"`, le tmux du `PATH` de la machine, sans `-L`
+    /// ni `-f`, environnement remplacé par celui de ssh.
     pub fn command(&self, args: &[&str]) -> Command {
         let (binary, socket, config) = match &self.transport {
             Transport::Local {
@@ -976,13 +978,20 @@ impl TmuxServer {
         command
     }
 
-    /// Lance une commande ponctuelle et renvoie sa sortie, sans le saut de ligne final.
-    pub fn run(&self, args: &[&str]) -> Result<String, ServerError> {
+    /// Sur un serveur distant, refuse avant tout processus une commande qui toucherait à l'état global de tmux.
+    fn guard_remote(&self, args: &[&str]) -> Result<(), ServerError> {
         if self.is_remote()
             && let Some(reason) = forbidden_on_remote(args)
         {
             return Err(ServerError::RemoteForbidden(reason));
         }
+        Ok(())
+    }
+
+    /// Lance une commande ponctuelle et renvoie sa sortie, sans le saut de ligne final. Refusée d'abord si elle
+    /// toucherait à l'état global d'un tmux distant.
+    pub fn run(&self, args: &[&str]) -> Result<String, ServerError> {
+        self.guard_remote(args)?;
         let output = self.command(args).stdin(Stdio::null()).output()?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout)
@@ -996,7 +1005,8 @@ impl TmuxServer {
         }
     }
 
-    /// Vérifie que tmux est en 3.8 au moins.
+    /// Vérifie que tmux est en 3.8 au moins (le tmux du `PATH` de la machine, pour un serveur distant). Un
+    /// processus qui échoue (ssh injoignable, tmux absent) est une erreur `Tmux`, pas une version non supportée.
     pub fn check_version(&self) -> Result<(u32, u32), ServerError> {
         let output = match &self.transport {
             Transport::Local { binary, .. } => {
@@ -1004,6 +1014,12 @@ impl TmuxServer {
             }
             Transport::Remote(spec) => remote_command(spec, "tmux -V", false).output()?,
         };
+        if !output.status.success() {
+            return Err(ServerError::Tmux {
+                args: "-V".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         match parse_version(&text) {
             Some(version) if is_supported(version) => Ok(version),
@@ -1015,7 +1031,8 @@ impl TmuxServer {
         self.run(&["list-sessions"]).is_ok()
     }
 
-    /// Écrit la configuration, et la recharge si le serveur tourne déjà.
+    /// Écrit la configuration, et la recharge si le serveur tourne déjà. Refusé sur un serveur distant : IdemA n'écrit
+    /// jamais la configuration de la machine.
     pub fn write_config(&self) -> Result<(), ServerError> {
         let Transport::Local { config, .. } = &self.transport else {
             return Err(ServerError::RemoteForbidden("write-config".into()));
@@ -1381,10 +1398,8 @@ impl TmuxServer {
     pub fn has_session_checked(&self, session: &str) -> Result<bool, ServerError> {
         match self.run(&["has-session", "-t", &exact(session)]) {
             Ok(_) => Ok(true),
-            Err(ServerError::Tmux { stderr, .. })
-                if stderr.contains("can't find session")
-                    || stderr.contains("no server running") =>
-            {
+            Err(error) if is_no_server(&error) => Ok(false),
+            Err(ServerError::Tmux { stderr, .. }) if stderr.contains("can't find session") => {
                 Ok(false)
             }
             Err(error) => Err(error),
@@ -1505,6 +1520,7 @@ impl TmuxServer {
         args: &[&str],
         new_agent: &str,
     ) -> Result<Vec<PaneId>, ServerError> {
+        self.guard_remote(args)?;
         let output = self.command(args).stdin(Stdio::null()).output()?;
         let created: Vec<PaneId> = String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -2151,6 +2167,30 @@ split-window -d -P -F #{pane_id} -t %3 -c /p/a##b ; select-layout -t @0 tiled ; 
         assert!(matches!(
             server.run(&["set-option", "-g", "status", "off"]),
             Err(ServerError::RemoteForbidden(_))
+        ));
+    }
+
+    #[test]
+    fn run_creating_shells_is_guarded_on_a_remote_server() {
+        assert!(matches!(
+            remote_server().run_creating_shells(&["set-option", "-g", "x", "y"], "glm"),
+            Err(ServerError::RemoteForbidden(_))
+        ));
+    }
+
+    #[test]
+    fn a_remote_check_version_that_cannot_reach_the_host_is_a_tmux_error() {
+        let server = TmuxServer::remote(RemoteSpec {
+            destination: "nonexistent-host-idema.invalid".into(),
+            control_dir: std::env::temp_dir().join("idema-no-control"),
+            slot: 0,
+            ssh_env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+            home: "/home/claude".into(),
+            shell: "/bin/bash".into(),
+        });
+        assert!(matches!(
+            server.check_version(),
+            Err(ServerError::Tmux { .. })
         ));
     }
 
