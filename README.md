@@ -39,6 +39,8 @@ Quand on n'écrit presque plus de code soi-même, la journée ressemble à ceci 
 
 **La configuration des agents, par projet.** Le volet Projet édite `AGENTS.md`, ajoute ou retire des skills et des serveurs MCP pour cinq harnais à la fois (Claude Code, Codex, Grok, OpenCode, Antigravity), et signale les fichiers qui ont divergé.
 
+**Vos serveurs, comme des sessions locales.** Déclarez une machine accessible en ssh (un VPS, un portable) et ses sessions tmux apparaissent dans sa propre section de la barre latérale, repliable, avec le même état, la même sonnerie et le même lanceur d'agents qu'en local. Une coupure réseau ne tue rien : les vues se rattachent seules au retour, historique compris.
+
 **Et le reste.** Un bloc-notes Markdown unique toujours à portée (⌘J). Une fenêtre Personnaliser pour les réglages d'IdemA et ceux de Claude Code (serveurs MCP, plugins, marketplaces, skills). La commande `idema <dossier>` et l'action Finder « Ouvrir dans IdemA ».
 
 ![Interface IdemA](assets/screenshots/idema-main.png)
@@ -154,6 +156,16 @@ Le dépôt est un workspace de trois crates :
 | `idema-tmux` | le client tmux en mode contrôle : serveur dédié, sessions, panes, dispositions |
 
 La version vit à un seul endroit, `version` de `[workspace.package]` dans `Cargo.toml`. Un tag `v<version>` poussé sur GitHub construit le DMG et l'attache à une release brouillon (`.github/workflows/release.yml`).
+
+## Machines distantes
+
+IdemA pilote aussi le tmux d'autres machines, par ssh. Les sessions d'une machine distante s'affichent sous son nom dans la barre latérale, à côté de Localhost : toutes ses sessions, y compris celles ouvertes à la main depuis un autre terminal.
+
+1. Sur la machine distante : tmux 3.8 ou plus récent dans le `PATH`, et, pour le lanceur d'agents, un `~/.idnma.yml` propre à cette machine.
+2. Sur le Mac : `ssh <connexion>` doit marcher sans mot de passe ni question (clé dans l'agent ssh ou dans `~/.ssh/config`). Connectez-vous une fois à la main pour accepter la clé d'hôte : IdemA n'en accepte jamais une inconnue.
+3. Dans **Personnaliser › Machines**, ajoutez la machine : un libellé libre et la connexion (un alias de `~/.ssh/config` ou `utilisateur@hôte`), validée par Entrée.
+
+Sur une session distante, le volet Terminal ouvre un shell sur la machine, dans le dossier du pane actif, et le Scratchpad reste le même qu'en local ; Fichiers, Changes, Navigateur et Projet ne sont pas encore disponibles. IdemA fixe la taille des fenêtres qu'il affiche : un autre client tmux attaché à la même session voit la taille d'IdemA tant qu'il est ouvert. Une machine injoignable affiche sa cause (injoignable, authentification refusée, clé d'hôte inconnue, tmux trop ancien) et se reconnecte seule, tout de suite au retour du réseau. Le compagnon iPhone voit aussi les sessions distantes.
 
 ## Compagnon iPhone
 
