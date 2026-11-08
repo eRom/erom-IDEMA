@@ -220,6 +220,9 @@ pub fn connection_problem(connection: &str, others: &[&str]) -> Option<&'static 
     } else if connection.starts_with('-') {
         // `ssh` la lirait comme une option.
         Some("La connexion ne peut pas commencer par un tiret.")
+    } else if connection == crate::machines::key::LOCAL_MACHINE {
+        // La clé de Localhost : `machine_of` ne saurait plus distinguer les deux.
+        Some("Ce nom est réservé à la machine locale.")
     } else if others.contains(&connection) {
         Some("Cette connexion est déjà celle d'une autre machine.")
     } else {
@@ -1403,6 +1406,11 @@ connection = "dell-lan"
             Some("La connexion ne peut pas commencer par un tiret.")
         );
         assert_eq!(
+            connection_problem("local", &[]),
+            Some("Ce nom est réservé à la machine locale.")
+        );
+        assert_eq!(connection_problem("locale", &[]), None);
+        assert_eq!(
             connection_problem("dell-lan", &["dell-lan"]),
             Some("Cette connexion est déjà celle d'une autre machine.")
         );
@@ -1422,6 +1430,8 @@ connection = "dell-lan"
         assert!(error.message.contains("déjà celle d'une autre machine"));
         let dashed = "[[machines.remote]]\nlabel = \"A\"\nconnection = \"-oX\"\n";
         assert_eq!(parse_config(dashed).unwrap_err().line, Some(3));
+        let reserved = "[[machines.remote]]\nlabel = \"A\"\nconnection = \"local\"\n";
+        assert_eq!(parse_config(reserved).unwrap_err().line, Some(3));
         let unlabeled = "[[machines.remote]]\nlabel = \" \"\nconnection = \"ok\"\n";
         assert_eq!(parse_config(unlabeled).unwrap_err().line, Some(2));
     }
