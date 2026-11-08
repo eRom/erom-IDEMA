@@ -269,6 +269,17 @@ fn link_destination(uri: &str) -> LinkDestination {
     }
 }
 
+/// `link_destination` pour un pane qui est (`remote`) ou non celui d'une machine distante : le Finder et Mail ne sont
+/// jamais ouverts depuis un pane distant, un chemin de la machine n'existant pas sur ce Mac.
+fn routed_destination(remote: bool, uri: &str) -> LinkDestination {
+    match link_destination(uri) {
+        LinkDestination::Reveal(_) | LinkDestination::System(_) if remote => {
+            LinkDestination::Refused
+        }
+        destination => destination,
+    }
+}
+
 /// L'adresse `file://` d'un lien, sans `localhost` ni majuscules au schéma : la forme que le navigateur garde.
 fn file_address(uri: &str) -> String {
     let rest = uri.get("file://".len()..).unwrap_or_default();
@@ -2342,7 +2353,7 @@ impl PaneView {
             self.open_path_at(at, cx);
             return;
         };
-        match link_destination(&link.uri) {
+        match routed_destination(self.remote, &link.uri) {
             LinkDestination::Browser(url) => self.open_in_browser(url, cx),
             LinkDestination::System(uri) => {
                 hud::log_event(&format!("link opened uri={}", address::log_link(&uri)));
@@ -2883,6 +2894,32 @@ mod tests {
             LinkDestination::Reveal("/tmp/a.zip".into())
         );
         assert_eq!(link_destination("ftp://x"), LinkDestination::Refused);
+    }
+
+    #[test]
+    fn a_remote_pane_link_never_reaches_the_finder_or_mail() {
+        // Un chemin ou une adresse de la machine distante ne désigne rien sur ce Mac (spec §3.5), comme un chemin tapé.
+        for uri in ["file:///tmp/a.zip", "mailto:x@example.com"] {
+            assert_eq!(
+                routed_destination(true, uri),
+                LinkDestination::Refused,
+                "{uri}"
+            );
+        }
+        // Le web passe encore (`link_route` le dirige vers le navigateur du système).
+        assert_eq!(
+            routed_destination(true, "https://claude.ai/x"),
+            LinkDestination::Browser("https://claude.ai/x".into())
+        );
+        // Un pane local garde toutes ses destinations.
+        assert_eq!(
+            routed_destination(false, "file:///tmp/a.zip"),
+            LinkDestination::Reveal("/tmp/a.zip".into())
+        );
+        assert_eq!(
+            routed_destination(false, "mailto:x@example.com"),
+            LinkDestination::System("mailto:x@example.com".into())
+        );
     }
 
     #[test]
