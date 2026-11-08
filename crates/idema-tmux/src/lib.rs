@@ -5,6 +5,7 @@ pub mod command;
 pub mod env;
 pub mod layout;
 pub mod protocol;
+pub mod remote;
 pub mod server;
 pub mod shell;
 pub mod sync;

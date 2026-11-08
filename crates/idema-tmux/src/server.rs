@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::command::{is_supported, parse_version, tmux_arg};
 use crate::layout::{Preset, plan_preset, preset_layout};
 use crate::protocol::{PaneId, WindowId};
+use crate::remote::{RemoteSpec, forbidden_on_remote, remote_command, remote_tmux_line};
 
 /// Contenu de `~/.config/idema/tmux.conf`, réécrit à chaque lancement (spec §3.5).
 ///
@@ -50,6 +51,8 @@ pub enum ServerError {
     },
     /// Le dossier du projet a disparu : refusé avant tmux, qui ouvrirait le shell dans `$HOME` sans rien dire.
     ProjectGone(PathBuf),
+    /// Une commande qui toucherait à l'état global d'un tmux distant : refusée avant tout processus.
+    RemoteForbidden(String),
 }
 
 impl fmt::Display for ServerError {
@@ -60,6 +63,7 @@ impl fmt::Display for ServerError {
             Self::Io(error) => write!(f, "{error}"),
             Self::Tmux { args, stderr } => write!(f, "tmux {args} : {stderr}"),
             Self::ProjectGone(path) => write!(f, "no such directory: {}", path.display()),
+            Self::RemoteForbidden(reason) => write!(f, "remote tmux refused: {reason}"),
         }
     }
 }
@@ -116,6 +120,45 @@ pub struct ListedSession {
 
 /// Format de `list-sessions -F` lu par `parse_sessions`. Le nom affiché vient en dernier : il est libre.
 pub const SESSIONS_FORMAT: &str = "#{session_name}\t#{@idema_project}\t#{@idema_created}\t#{@idema_layout}\t#{@idema_kind}\t#{@idema_remote_name}\t#{@idema_name}";
+
+/// Format de `list-sessions -F` d'un serveur distant, lu par `parse_remote_sessions`. Le nom affiché vient en
+/// dernier : il est libre.
+pub const REMOTE_SESSIONS_FORMAT: &str = "#{session_name}\t#{@idema_project}\t#{@idema_created}\t#{session_created}\t#{@idema_layout}\t#{@idema_kind}\t#{@idema_remote_name}\t#{@idema_name}";
+
+/// Lit la sortie de `list-sessions -F REMOTE_SESSIONS_FORMAT`. Aucune session n'est écartée : celles qui n'ont pas
+/// été créées par Idema ont un `project` vide. `created` vient de `@idema_created`, sinon de `session_created`
+/// (secondes) en millisecondes. Une session distante n'est jamais un bouillon de neurones.
+pub fn parse_remote_sessions(listing: &str) -> Vec<ListedSession> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(8, '\t');
+            let name = fields.next().filter(|name| !name.is_empty())?.to_string();
+            let project = fields.next().unwrap_or_default().to_string();
+            let idema_created: Option<u128> = fields.next().and_then(|value| value.parse().ok());
+            let tmux_created: Option<u128> = fields.next().and_then(|value| value.parse().ok());
+            let created = idema_created
+                .or(tmux_created.map(|seconds| seconds * 1000))
+                .unwrap_or(0);
+            let layout = fields.next().unwrap_or_default().to_string();
+            let _kind = fields.next();
+            let remote_name = fields.next().unwrap_or_default().to_string();
+            let display_name = match fields.next() {
+                Some(value) if !value.is_empty() => value.to_string(),
+                _ => name.clone(),
+            };
+            Some(ListedSession {
+                name,
+                project,
+                created,
+                layout,
+                ideation: false,
+                remote_name,
+                display_name,
+            })
+        })
+        .collect()
+}
 
 /// Lit la sortie de `list-sessions -F SESSIONS_FORMAT`.
 /// Une session sans `@idema_project`, créée hors d'Idema, est écartée (spec §3.4).
@@ -838,10 +881,18 @@ fn is_no_server_or_no_pane(error: &ServerError) -> bool {
 
 /// Le serveur tmux d'Idema : `tmux -L <socket> -f <config>` (`-S` pour un chemin absolu), lancé avec l'environnement filtré.
 pub struct TmuxServer {
-    binary: PathBuf,
-    socket: String,
-    config: PathBuf,
+    transport: Transport,
     env: Vec<(String, String)>,
+}
+
+/// Où tourne tmux : en local sur le serveur dédié d'Idema, ou sur une machine distante par ssh.
+enum Transport {
+    Local {
+        binary: PathBuf,
+        socket: String,
+        config: PathBuf,
+    },
+    Remote(RemoteSpec),
 }
 
 impl TmuxServer {
@@ -852,10 +903,36 @@ impl TmuxServer {
         env: Vec<(String, String)>,
     ) -> Self {
         Self {
-            binary,
-            socket: socket.into(),
-            config,
+            transport: Transport::Local {
+                binary,
+                socket: socket.into(),
+                config,
+            },
             env,
+        }
+    }
+
+    /// Un serveur tmux distant : le tmux du `PATH` de la machine, serveur par défaut, lancé par ssh. Son
+    /// environnement est celui du shell distant.
+    pub fn remote(spec: RemoteSpec) -> Self {
+        let env = vec![
+            ("HOME".to_string(), spec.home.clone()),
+            ("SHELL".to_string(), spec.shell.clone()),
+        ];
+        Self {
+            transport: Transport::Remote(spec),
+            env,
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self.transport, Transport::Remote(_))
+    }
+
+    pub fn remote_spec(&self) -> Option<&RemoteSpec> {
+        match &self.transport {
+            Transport::Remote(spec) => Some(spec),
+            Transport::Local { .. } => None,
         }
     }
 
@@ -867,19 +944,27 @@ impl TmuxServer {
 
     /// Commande `tmux -L <socket> -f <config> <args…>`, environnement remplacé par la liste blanche.
     pub fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(&self.binary);
+        let (binary, socket, config) = match &self.transport {
+            Transport::Local {
+                binary,
+                socket,
+                config,
+            } => (binary, socket, config),
+            Transport::Remote(spec) => return remote_command(spec, &remote_tmux_line(args), false),
+        };
+        let mut command = Command::new(binary);
         // Un chemin absolu désigne le fichier socket lui-même (`-S`) : les tests le posent dans leur dossier jetable,
         // que le nettoyage retire. Un nom court passe par `-L` et laisse son fichier dans le dossier de tmux.
-        let flag = if Path::new(&self.socket).is_absolute() {
+        let flag = if Path::new(socket).is_absolute() {
             "-S"
         } else {
             "-L"
         };
         command
             .arg(flag)
-            .arg(&self.socket)
+            .arg(socket)
             .arg("-f")
-            .arg(&self.config)
+            .arg(config)
             .args(args)
             .env_clear()
             .envs(
@@ -893,6 +978,11 @@ impl TmuxServer {
 
     /// Lance une commande ponctuelle et renvoie sa sortie, sans le saut de ligne final.
     pub fn run(&self, args: &[&str]) -> Result<String, ServerError> {
+        if self.is_remote()
+            && let Some(reason) = forbidden_on_remote(args)
+        {
+            return Err(ServerError::RemoteForbidden(reason));
+        }
         let output = self.command(args).stdin(Stdio::null()).output()?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout)
@@ -908,7 +998,12 @@ impl TmuxServer {
 
     /// Vérifie que tmux est en 3.8 au moins.
     pub fn check_version(&self) -> Result<(u32, u32), ServerError> {
-        let output = Command::new(&self.binary).arg("-V").env_clear().output()?;
+        let output = match &self.transport {
+            Transport::Local { binary, .. } => {
+                Command::new(binary).arg("-V").env_clear().output()?
+            }
+            Transport::Remote(spec) => remote_command(spec, "tmux -V", false).output()?,
+        };
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         match parse_version(&text) {
             Some(version) if is_supported(version) => Ok(version),
@@ -922,12 +1017,15 @@ impl TmuxServer {
 
     /// Écrit la configuration, et la recharge si le serveur tourne déjà.
     pub fn write_config(&self) -> Result<(), ServerError> {
-        if let Some(dir) = self.config.parent() {
+        let Transport::Local { config, .. } = &self.transport else {
+            return Err(ServerError::RemoteForbidden("write-config".into()));
+        };
+        if let Some(dir) = config.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&self.config, TMUX_CONF)?;
+        std::fs::write(config, TMUX_CONF)?;
         if self.is_running() {
-            self.run(&["source-file", &self.config.to_string_lossy()])?;
+            self.run(&["source-file", &config.to_string_lossy()])?;
         }
         Ok(())
     }
@@ -945,7 +1043,8 @@ impl TmuxServer {
     /// sans `@idema_project`, que la barre lit pour la reconnaître.
     pub fn create_session(&self, request: &NewSession) -> Result<CreatedSession, ServerError> {
         // tmux 3.8 ouvre le shell dans `$HOME` quand `-c` pointe un dossier absent (sonde du 16/10) : on refuse avant.
-        if !request.project.is_dir() {
+        // Le dossier d'un projet distant n'existe pas sur ce Mac : la vérification ne vaut qu'en local.
+        if !self.is_remote() && !request.project.is_dir() {
             return Err(ServerError::ProjectGone(request.project.to_path_buf()));
         }
         let project = request.project.to_string_lossy().to_string();
@@ -1275,6 +1374,30 @@ impl TmuxServer {
 
     pub fn has_session(&self, session: &str) -> bool {
         self.run(&["has-session", "-t", &exact(session)]).is_ok()
+    }
+
+    /// Comme `has_session`, mais une erreur autre que « session absente » (ssh injoignable, refus) n'est pas
+    /// prise pour une absence : l'appelant ne doit pas croire qu'une session a disparu parce que le réseau a coupé.
+    pub fn has_session_checked(&self, session: &str) -> Result<bool, ServerError> {
+        match self.run(&["has-session", "-t", &exact(session)]) {
+            Ok(_) => Ok(true),
+            Err(ServerError::Tmux { stderr, .. })
+                if stderr.contains("can't find session")
+                    || stderr.contains("no server running") =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sessions d'un serveur distant, étrangères comprises. Sans serveur, la liste est vide.
+    pub fn remote_sessions(&self) -> Result<Vec<ListedSession>, ServerError> {
+        match self.run(&["list-sessions", "-F", REMOTE_SESSIONS_FORMAT]) {
+            Ok(listing) => Ok(parse_remote_sessions(&listing)),
+            Err(error) if is_no_server(&error) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn kill_session(&self, session: &str) -> Result<(), ServerError> {
@@ -1958,5 +2081,93 @@ split-window -d -P -F #{pane_id} -t %3 -c /p/a##b ; select-layout -t @0 tiled ; 
             locate_tmux(Some(Path::new("/nonexistent/tmux")), None),
             Err(ServerError::NotFound)
         ));
+    }
+
+    #[test]
+    fn parse_remote_sessions_keeps_foreign_sessions() {
+        let foreign = ListedSession {
+            name: "testvpc".into(),
+            project: String::new(),
+            created: 1_794_130_101_000,
+            layout: String::new(),
+            ideation: false,
+            remote_name: String::new(),
+            display_name: "testvpc".into(),
+        };
+        assert_eq!(
+            parse_remote_sessions("testvpc\t\t\t1794130101\t\t\t\t"),
+            vec![foreign.clone()]
+        );
+        // Dernière ligne tronquée par `run()` : les champs manquants sont vides.
+        assert_eq!(
+            parse_remote_sessions("testvpc\t\t\t1794130101"),
+            vec![foreign]
+        );
+        let listing = "idema-0a1b2c3d\t/home/claude\t1794130000123\t1794130000\tsingle\t\t\tAudit\nx\tideation-like\t\t5\t\tideation\t\t";
+        let sessions = parse_remote_sessions(listing);
+        assert_eq!(
+            sessions[0],
+            ListedSession {
+                name: "idema-0a1b2c3d".into(),
+                project: "/home/claude".into(),
+                created: 1_794_130_000_123,
+                layout: "single".into(),
+                ideation: false,
+                remote_name: String::new(),
+                display_name: "Audit".into(),
+            }
+        );
+        assert!(!sessions[1].ideation);
+        assert_eq!(sessions[1].created, 5000);
+        assert_eq!(sessions[1].display_name, "x");
+    }
+
+    fn remote_server() -> TmuxServer {
+        TmuxServer::remote(RemoteSpec {
+            destination: "idema-no-such-host.invalid".into(),
+            control_dir: PathBuf::from("/nonexistent/idema-control"),
+            slot: 0,
+            ssh_env: Vec::new(),
+            home: "/home/claude".into(),
+            shell: "/bin/bash".into(),
+        })
+    }
+
+    #[test]
+    fn a_remote_server_refuses_kill_server_and_config_writes() {
+        let server = remote_server();
+        assert!(matches!(
+            server.kill(),
+            Err(ServerError::RemoteForbidden(_))
+        ));
+        assert!(matches!(
+            server.write_config(),
+            Err(ServerError::RemoteForbidden(_))
+        ));
+        assert!(matches!(
+            server.set_global_environment("A", "b"),
+            Err(ServerError::RemoteForbidden(_))
+        ));
+        assert!(matches!(
+            server.run(&["set-option", "-g", "status", "off"]),
+            Err(ServerError::RemoteForbidden(_))
+        ));
+    }
+
+    #[test]
+    fn a_remote_server_environment_is_the_remote_shell() {
+        let server = remote_server();
+        assert!(server.is_remote());
+        assert_eq!(
+            server.environment(),
+            [
+                ("HOME".to_string(), "/home/claude".to_string()),
+                ("SHELL".to_string(), "/bin/bash".to_string())
+            ]
+        );
+        assert_eq!(
+            server.remote_spec().map(|spec| spec.destination.as_str()),
+            Some("idema-no-such-host.invalid")
+        );
     }
 }

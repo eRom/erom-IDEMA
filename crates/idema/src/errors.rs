@@ -98,7 +98,8 @@ pub(crate) fn explain_server(error: &ServerError) -> Explained {
         }
         ServerError::ProjectGone(_) => Some(sentence("le dossier du projet n'existe plus")),
         ServerError::Tmux { stderr, .. } => tmux_text(stderr),
-        ServerError::Io(_) => None,
+        // Refus interne d'une commande sur un tmux distant : le brut va en détail.
+        ServerError::Io(_) | ServerError::RemoteForbidden(_) => None,
     };
     Explained {
         text: text.unwrap_or_else(|| UNEXPECTED.to_string()),
