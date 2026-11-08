@@ -3454,7 +3454,7 @@ impl Workspace {
     }
 
     /// Sortie propre d'IdemA : chaque session distante qu'il affichait rend sa taille à tmux (spec ssh-tmux §3.3). Un
-    /// plantage ne passe pas ici : l'épingle reste, et la connexion suivante de la machine la retire (`settle_server`).
+    /// plantage ne passe pas ici : l'épingle reste, et la connexion suivante de la machine la retire (`release_stale_pins`).
     fn release_size_pins(&self, cx: &mut Context<Self>) {
         for entry in self
             .entries
