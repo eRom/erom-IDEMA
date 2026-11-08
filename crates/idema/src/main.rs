@@ -22,6 +22,9 @@ mod idnma;
 mod instance;
 mod integrations;
 mod lifecycle;
+// Lu par les tâches suivantes (barre, réglages, transport) : rien ne l'appelle encore hors des tests.
+#[allow(dead_code)]
+mod machines;
 mod mcp_widgets;
 mod menus;
 mod pane_view;

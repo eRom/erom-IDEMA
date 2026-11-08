@@ -179,6 +179,57 @@ pub struct Config {
     /// Section `[companion]` : le compagnon iPhone. Absente, il n'existe pas (ni prise, ni fil).
     #[serde(default)]
     pub companion: Option<CompanionConfig>,
+    /// Section `[machines]` : le nom de Localhost et les machines distantes. Absente, Localhost seul.
+    #[serde(default)]
+    pub machines: Option<MachinesConfig>,
+}
+
+/// Section `[machines]` : Localhost est toujours là, les machines distantes viennent de `[[machines.remote]]`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachinesConfig {
+    /// Le nom de Localhost dans l'interface.
+    #[serde(default)]
+    pub local_label: Option<String>,
+    /// Les machines distantes, dans l'ordre du fichier.
+    #[serde(default)]
+    pub remote: Vec<RemoteMachineEntry>,
+}
+
+/// Une machine distante : un nom libre et ce que Romain tape après `ssh`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteMachineEntry {
+    pub label: String,
+    /// Alias de `~/.ssh/config` ou `utilisateur@hôte` ; c'est l'identité de la machine.
+    pub connection: String,
+}
+
+#[allow(dead_code)] // Lu par les tâches suivantes.
+const DEFAULT_LOCAL_LABEL: &str = "Localhost";
+
+/// Pourquoi une connexion est refusée, `None` si elle convient. `others` : les connexions des autres machines.
+pub fn connection_problem(connection: &str, others: &[&str]) -> Option<&'static str> {
+    if connection.trim().is_empty() {
+        Some("La connexion est vide.")
+    } else if connection
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        Some("La connexion ne peut contenir ni espace ni caractère de contrôle.")
+    } else if connection.starts_with('-') {
+        // `ssh` la lirait comme une option.
+        Some("La connexion ne peut pas commencer par un tiret.")
+    } else if others.contains(&connection) {
+        Some("Cette connexion est déjà celle d'une autre machine.")
+    } else {
+        None
+    }
+}
+
+/// Pourquoi un label est refusé, `None` s'il convient.
+pub fn label_problem(label: &str) -> Option<&'static str> {
+    label.trim().is_empty().then_some("Le label est vide.")
 }
 
 /// Section `[companion]` : le service local que la page installée sur l'iPhone interroge.
@@ -350,6 +401,23 @@ impl Config {
             .find(|agent| agent.default)
             .or_else(|| self.agents.first())
     }
+
+    /// Le nom de Localhost : `local_label`, sinon « Localhost ».
+    #[allow(dead_code)] // Lu par les tâches suivantes.
+    pub fn local_machine_label(&self) -> &str {
+        self.machines
+            .as_ref()
+            .and_then(|machines| machines.local_label.as_deref())
+            .unwrap_or(DEFAULT_LOCAL_LABEL)
+    }
+
+    /// Les machines distantes, dans l'ordre du fichier.
+    #[allow(dead_code)] // Lu par les tâches suivantes.
+    pub fn remote_machines(&self) -> &[RemoteMachineEntry] {
+        self.machines
+            .as_ref()
+            .map_or(&[], |machines| machines.remote.as_slice())
+    }
 }
 
 /// Ce qu'une config rechargée oblige à refaire : l'échelle de l'interface, la police du terminal.
@@ -432,6 +500,42 @@ fn favorite_line(text: &str, index: usize) -> Option<usize> {
         .filter(|(_, line)| is_favorite_header(line))
         .nth(index)
         .map(|(position, _)| position + 1)
+}
+
+/// La ligne de la clé `key` de la `index`-ième `[[machines.remote]]` (ou de `[machines]` quand `index` est `None`), pour
+/// situer une machine refusée. Repli sur l'en-tête de l'entrée ; `None` si elle n'est pas écrite sous cette forme.
+fn machine_line(text: &str, index: Option<usize>, key: &str) -> Option<usize> {
+    let squeeze = |line: &str| -> String {
+        let code = line.split('#').next().unwrap_or("");
+        code.chars().filter(|c| !c.is_whitespace()).collect()
+    };
+    let mut seen_remote = 0;
+    let mut inside = false;
+    let mut header = None;
+    for (position, line) in text.lines().enumerate() {
+        let squeezed = squeeze(line);
+        if squeezed.starts_with('[') {
+            inside = match index {
+                Some(wanted) if squeezed == "[[machines.remote]]" => {
+                    seen_remote += 1;
+                    let hit = seen_remote == wanted + 1;
+                    if hit {
+                        header = Some(position + 1);
+                    }
+                    hit
+                }
+                None => squeezed == "[machines]",
+                _ => false,
+            };
+        } else if inside
+            && squeezed
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.starts_with('='))
+        {
+            return Some(position + 1);
+        }
+    }
+    header
 }
 
 /// Masque dans `message` ce qui pourrait être la clé d'API : `toml` recopie parfois la valeur fautive dans son message
@@ -581,6 +685,33 @@ fn validate(config: &Config, text: &str) -> Result<(), ConfigError> {
                 line: favorite_line(text, index),
                 ..invalid(message)
             });
+        }
+    }
+    if let Some(machines) = &config.machines {
+        if let Some(problem) = machines.local_label.as_deref().and_then(label_problem) {
+            return Err(ConfigError {
+                line: machine_line(text, None, "local_label"),
+                ..invalid(format!("[machines] local_label : {problem}"))
+            });
+        }
+        for (index, machine) in machines.remote.iter().enumerate() {
+            // Une connexion répétée est refusée sur l'entrée qui la répète, pas sur la première.
+            let earlier: Vec<&str> = machines.remote[..index]
+                .iter()
+                .map(|other| other.connection.as_str())
+                .collect();
+            let refusal = if let Some(problem) = label_problem(&machine.label) {
+                Some(("label", problem))
+            } else {
+                connection_problem(&machine.connection, &earlier)
+                    .map(|problem| ("connection", problem))
+            };
+            if let Some((key, problem)) = refusal {
+                return Err(ConfigError {
+                    line: machine_line(text, Some(index), key),
+                    ..invalid(format!("machine n° {} : {problem}", index + 1))
+                });
+            }
         }
     }
     Ok(())
@@ -1211,5 +1342,87 @@ mod tests {
                 terminal_font: false
             }
         );
+    }
+
+    const MACHINES_EXAMPLE: &str = r#"[machines]
+local_label = "Localhost"
+
+[[machines.remote]]
+label = "VPS Hostinger"
+connection = "caserne-claude"
+
+[[machines.remote]]
+label = "Dell"
+connection = "dell-lan"
+"#;
+
+    #[test]
+    fn machines_section_reads_the_spec_example() {
+        let config = parse_config(MACHINES_EXAMPLE).unwrap();
+        let machines = config.machines.as_ref().unwrap();
+        assert_eq!(machines.local_label.as_deref(), Some("Localhost"));
+        assert_eq!(
+            config.remote_machines(),
+            [
+                RemoteMachineEntry {
+                    label: "VPS Hostinger".into(),
+                    connection: "caserne-claude".into()
+                },
+                RemoteMachineEntry {
+                    label: "Dell".into(),
+                    connection: "dell-lan".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_absent_machines_section_means_localhost_alone() {
+        let config = parse_config("").unwrap();
+        assert_eq!(config.local_machine_label(), "Localhost");
+        assert!(config.remote_machines().is_empty());
+        let renamed = parse_config("[machines]\nlocal_label = \"Mon Mac\"\n").unwrap();
+        assert_eq!(renamed.local_machine_label(), "Mon Mac");
+    }
+
+    #[test]
+    fn an_unknown_machine_key_is_refused() {
+        let entry = "[[machines.remote]]\nlabel = \"Dell\"\nconnection = \"dell-lan\"\nport = 22\n";
+        assert!(parse_config(entry).is_err());
+        assert!(parse_config("[machines]\nport = 22\n").is_err());
+    }
+
+    #[test]
+    fn connection_problems_are_named() {
+        assert_eq!(connection_problem("", &[]), Some("La connexion est vide."));
+        let blank = Some("La connexion ne peut contenir ni espace ni caractère de contrôle.");
+        assert_eq!(connection_problem("a b", &[]), blank);
+        assert_eq!(connection_problem("a\tb", &[]), blank);
+        assert_eq!(
+            connection_problem("-oProxyCommand=x", &[]),
+            Some("La connexion ne peut pas commencer par un tiret.")
+        );
+        assert_eq!(
+            connection_problem("dell-lan", &["dell-lan"]),
+            Some("Cette connexion est déjà celle d'une autre machine.")
+        );
+        for fine in ["caserne-claude", "llm@192.168.1.20", "ssh://u@h:2222"] {
+            assert_eq!(connection_problem(fine, &["dell-lan"]), None, "{fine}");
+        }
+        assert_eq!(label_problem("  "), Some("Le label est vide."));
+        assert_eq!(label_problem("Dell"), None);
+    }
+
+    #[test]
+    fn a_refused_machine_is_located_on_its_own_line() {
+        let text = "[machines]\n\n[[machines.remote]]\nlabel = \"A\"\nconnection = \"same\"\n\n[[machines.remote]]\nlabel = \"B\"\nconnection = \"same\"\n";
+        let error = parse_config(text).unwrap_err();
+        assert_eq!(error.kind, ConfigErrorKind::Invalid);
+        assert_eq!(error.line, Some(9));
+        assert!(error.message.contains("déjà celle d'une autre machine"));
+        let dashed = "[[machines.remote]]\nlabel = \"A\"\nconnection = \"-oX\"\n";
+        assert_eq!(parse_config(dashed).unwrap_err().line, Some(3));
+        let unlabeled = "[[machines.remote]]\nlabel = \" \"\nconnection = \"ok\"\n";
+        assert_eq!(parse_config(unlabeled).unwrap_err().line, Some(2));
     }
 }
