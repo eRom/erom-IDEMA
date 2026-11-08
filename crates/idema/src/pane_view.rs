@@ -36,6 +36,7 @@ use idema_term::signals::SignalDetector;
 use idema_tmux::client::ClientWriter;
 use idema_tmux::command::{PaneWatch, color_report, unset_pane_option};
 use idema_tmux::protocol::{ControlEvent, PaneId};
+use idema_tmux::remote::{SSH_BINARY, shell_quote, ssh_arguments};
 
 use url::Url;
 
@@ -43,6 +44,7 @@ use crate::browser::address::{self, is_local_document};
 use crate::companion::input::{RemoteKey, accepts_input, encode_remote_key};
 use crate::file_open::{self, PathTarget};
 use crate::hud::{self, DumpGrid, HudStats, ModeWatch, ToggleHud};
+use crate::machines::registry::Lease;
 use crate::menus::{self, Paste};
 use crate::restore::plan::LAUNCH_STAGGER;
 use crate::search_bar::{
@@ -632,6 +634,12 @@ fn shell_program(env: &[(String, String)]) -> PathBuf {
         .map_or_else(|| PathBuf::from("/bin/zsh"), PathBuf::from)
 }
 
+/// Ce que le shell distant du volet Terminal lit : entrer dans `cwd` (cité, un dossier disparu ne gêne pas), puis
+/// remplacer le shell de commande par le shell de login de la machine.
+pub fn remote_shell_script(cwd: &str) -> String {
+    format!("cd {} 2>/dev/null; exec \"$SHELL\" -l", shell_quote(cwd))
+}
+
 /// La commande d'agent d'un pane, avec ce qui règle son envoi.
 pub struct LaunchRequest {
     pub command: String,
@@ -743,6 +751,8 @@ pub struct PaneView {
     _subscriptions: Vec<Subscription>,
     /// La tâche qui vide les événements du PTY local, ou les octets du fichier suivi, dans la vue ; elle meurt avec elle.
     _pty_task: Option<Task<()>>,
+    /// Le bail du canal ssh d'un shell distant du volet Terminal : tenu tant que la vue vit, sa chute libère le canal.
+    _lease: Option<Lease>,
     /// Le suivi du fichier d'un journal (`PaneBackend::Tail`) ; lâché avec la vue, il arrête son fil.
     _tail: Option<FileTail>,
     /// La minuterie rapide d'un lancement de restauration en attente.
@@ -788,9 +798,8 @@ impl PaneView {
         window: &mut Window,
         cx: &mut App,
     ) -> io::Result<Entity<Self>> {
-        let (sender, mut receiver) = mpsc::unbounded();
         let program = shell_program(env);
-        let pty = LocalPty::spawn(
+        Self::spawn_pty_view(
             &PtyCommand {
                 program: &program,
                 args: &["-l"],
@@ -798,13 +807,71 @@ impl PaneView {
                 env,
                 size,
             },
+            &crate::project::display_name(project),
+            project,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    /// Le shell d'une machine distante dans le volet Terminal (spec ssh-tmux §3.7) : un PTY local qui lance
+    /// `/usr/bin/ssh -t …` sur le maître du bail, puis `remote_shell_script(cwd)`. La vue garde le bail tant que le
+    /// shell vit : sa chute libère le canal. Les chemins du pane sont ceux de la machine (`remote`) : ⌘-clic et dépôt du
+    /// Finder n'y font rien. `Err` quand ssh ne peut pas démarrer.
+    pub fn spawn_remote_shell(
+        lease: Lease,
+        cwd: &str,
+        size: GridSize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> io::Result<Entity<Self>> {
+        let spec = lease
+            .server
+            .remote_spec()
+            .ok_or_else(|| io::Error::other("the lease does not belong to a remote machine"))?;
+        let mut arguments = ssh_arguments(spec, true);
+        arguments.push(remote_shell_script(cwd));
+        // ssh tourne dans le dossier personnel de ce Mac : le dossier distant est celui du script.
+        let directory = spec
+            .ssh_env
+            .iter()
+            .find(|(key, _)| key == "HOME")
+            .map_or_else(|| PathBuf::from("/"), |(_, home)| PathBuf::from(home));
+        let env = spec.ssh_env.clone();
+        let name = spec.destination.clone();
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let command = PtyCommand {
+            program: Path::new(SSH_BINARY),
+            args: &arguments,
+            directory: &directory,
+            env: &env,
+            size,
+        };
+        Self::spawn_pty_view(&command, &name, Path::new(cwd), Some(lease), window, cx)
+    }
+
+    /// Lance le PTY de `command` et en fait la vue d'un volet : l'émulateur, la tâche qui vide les événements du PTY, le
+    /// suivi du focus. `lease` est le bail d'un shell distant, gardé avec la vue.
+    fn spawn_pty_view(
+        command: &PtyCommand<'_>,
+        name: &str,
+        project: &Path,
+        lease: Option<Lease>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> io::Result<Entity<Self>> {
+        let (sender, mut receiver) = mpsc::unbounded();
+        let size = command.size;
+        let pty = LocalPty::spawn(
+            command,
             // Une erreur d'envoi veut dire que la vue est fermée.
             move |event| {
                 let _ = sender.unbounded_send(event);
             },
         )?;
         let emulator = PaneEmulator::new(size, EMULATOR_HISTORY, Source::LocalPty);
-        let name = crate::project::display_name(project);
+        let remote = lease.is_some();
         Ok(cx.new(|cx: &mut Context<Self>| {
             let task = cx.spawn_in(window, async move |this, cx| {
                 while let Some(first) = receiver.next().await {
@@ -830,13 +897,15 @@ impl PaneView {
                 PaneBackend::Local { pty, emulator },
                 theme::PANEL,
                 None,
-                &name,
+                name,
                 project,
                 window,
                 cx,
             );
             // Un pane local est toujours l'actif : un appui sur lui est le sien, sans passer par une session.
             view.active = true;
+            view.remote = remote;
+            view._lease = lease;
             view._pty_task = Some(task);
             view._subscriptions
                 .push(cx.observe_window_activation(window, |view, window, cx| {
@@ -946,6 +1015,7 @@ impl PaneView {
             dropped_input: false,
             _subscriptions: subscriptions,
             _pty_task: None,
+            _lease: None,
             _tail: None,
             _launch_task: launch_task,
         }
@@ -3191,6 +3261,30 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn remote_shell_script_quotes_the_folder() {
+        use std::process::Command;
+        assert_eq!(
+            remote_shell_script("/home/claude/mon projet"),
+            "cd '/home/claude/mon projet' 2>/dev/null; exec \"$SHELL\" -l"
+        );
+        // Une apostrophe, un dollar ou un point-virgule dans le dossier ne sortent pas de la citation, et le shell
+        // distant (de la famille POSIX) lit le script jusqu'au bout.
+        for folder in [
+            "/home/claude/mon projet",
+            "/srv/o'neil",
+            "/tmp/$HOME;ls",
+            "",
+        ] {
+            let script = remote_shell_script(folder);
+            let status = Command::new("/bin/sh")
+                .args(["-n", "-c", &script])
+                .status()
+                .expect("sh starts");
+            assert!(status.success(), "{script}");
+        }
     }
 
     #[test]

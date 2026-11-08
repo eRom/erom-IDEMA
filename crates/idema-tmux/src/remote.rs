@@ -6,7 +6,7 @@ use std::process::Command;
 use crate::server::reset_signal_state;
 
 /// Le client ssh du système : jamais celui du `PATH`.
-const SSH_BINARY: &str = "/usr/bin/ssh";
+pub const SSH_BINARY: &str = "/usr/bin/ssh";
 
 /// Cite un argument pour un shell POSIX : entre apostrophes, une apostrophe interne devient `'\''`. Suppose que
 /// le shell de connexion distant est de la famille POSIX (sh, bash, zsh) : fish ou csh liraient la ligne autrement.

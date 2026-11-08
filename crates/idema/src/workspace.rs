@@ -84,6 +84,10 @@ use crate::machines::lifecycle::{
     idnma_run_command, is_wake_jump, link_stalled, list_pinned_windows, release_windows,
     remote_menu_lines, set_extended_keys, windows_to_unpin,
 };
+use crate::machines::panels::{
+    MachineTerminalPin, OPENING_TERMINAL, UNAVAILABLE_ON_REMOTE, offers_local_tools,
+    remote_start_folder, terminal_target, unavailable_open_panel,
+};
 use crate::machines::probe::{
     MachineFacts, RemoteFailure, ensure_control_dir, probe, probe_spec, retry_delay,
 };
@@ -137,7 +141,9 @@ use crate::sidebar_model::{
 };
 use crate::state::{State, StateNotice, StateStore, UiState, rfc3339};
 use crate::terminal_element::{MARGIN_SIDES, TerminalFont, cell_metrics, content_bounds};
-use crate::terminal_panel::{TerminalPanel, initial_grid, render_panel};
+use crate::terminal_panel::{
+    TerminalKey, TerminalPanel, initial_grid, panel_header, panel_shell, render_panel,
+};
 use crate::theme::{
     BUTTON_HOVER, CONTROL, HOVER, HOVER_STRONG, RUNNING, TEXT_DISABLED, TEXT_FULL, TEXT_HOVER,
     TEXT_MIN, TEXT_PRIMARY, TEXT_PROJECT, Theme, UI_FONT, WINDOW, black, color, white,
@@ -259,6 +265,25 @@ fn next_right_panel(current: Option<RightPanel>, toggled: RightPanel) -> Option<
         None
     } else {
         Some(toggled)
+    }
+}
+
+/// Où en est le shell que le volet Terminal doit montrer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalReady {
+    /// Le shell existe (ou vient d'être créé) : le volet le montre.
+    Ready,
+    /// Le shell d'une machine s'ouvre : le volet reste ouvert sur son texte d'attente.
+    Opening,
+    /// Le shell ne peut pas démarrer : le volet ne s'ouvre pas (ou se ferme).
+    Failed,
+}
+
+/// Ce que le journal dit d'un shell du volet : son projet ou sa machine.
+fn terminal_label(key: &TerminalKey) -> String {
+    match key {
+        TerminalKey::Project(project) => format!("project={}", project.display()),
+        TerminalKey::Machine(connection) => format!("machine={connection}"),
     }
 }
 
@@ -934,6 +959,12 @@ pub struct Workspace {
     right_panel: Option<RightPanel>,
     /// Le volet Terminal : l'état « agrandi » du volet affiché et un shell local par projet.
     terminal: TerminalPanel,
+    /// Les machines dont le shell du volet Terminal est en cours d'ouverture (recherche du dossier du pane, puis ssh) : au
+    /// plus une ouverture par machine.
+    pending_terminals: HashSet<String>,
+    /// « Ouvrir un terminal » d'un en-tête de machine : le volet montre le shell de cette machine tant que le contexte est
+    /// celui de la demande.
+    machine_terminal: Option<MachineTerminalPin>,
     /// Un volet Fichiers par projet, créé à la première ouverture pour ce projet (spec P2, §4.5). La clé est le
     /// chemin tel que `state.json` le garde ; le volet canonise sa propre racine.
     files_panels: HashMap<PathBuf, Entity<FilesPanel>>,
@@ -1181,6 +1212,8 @@ impl Workspace {
             _branch_task: None,
             right_panel: None,
             terminal: TerminalPanel::default(),
+            pending_terminals: HashSet::new(),
+            machine_terminal: None,
             files_panels: HashMap::new(),
             _files_subscriptions: Vec::new(),
             changes_panels: HashMap::new(),
@@ -2023,10 +2056,21 @@ impl Workspace {
             .is_some_and(|entry| entry.summary.ideation)
     }
 
+    /// La session sélectionnée vit-elle sur une machine distante ?
+    pub(crate) fn selected_is_remote(&self) -> bool {
+        self.selected_machine().is_some()
+    }
+
+    /// La connexion de la machine de la session sélectionnée, quand elle est distante.
+    fn selected_machine(&self) -> Option<&str> {
+        self.selected_entry()?.summary.machine.as_deref()
+    }
+
     /// Le projet que lisent la barre d'outils, la branche, les volets Terminal, Fichiers et Changes et le Browser :
-    /// aucun quand un bouillon est sélectionné (il n'a ni dépôt ni projet), sinon `context_project`.
+    /// aucun quand un bouillon est sélectionné (il n'a ni dépôt ni projet) ni quand la session est sur une machine
+    /// distante (ses dossiers ne sont pas ceux de ce Mac), sinon `context_project`.
     pub(crate) fn panel_project(&self) -> Option<PathBuf> {
-        if self.selected_is_ideation() {
+        if self.selected_is_ideation() || self.selected_is_remote() {
             None
         } else {
             self.context_project()
@@ -2874,6 +2918,9 @@ impl Workspace {
             for key in self.machine_entry_keys(&connection) {
                 self.remove_entry(&key, window, cx);
             }
+            // Son shell du volet Terminal part avec elle : la vue lâchée ferme le PTY et rend le bail.
+            self.terminal.remove_machine(&connection);
+            self.pending_terminals.remove(&connection);
             // Les tâches de la machine (relecture, essai) tombent avec elle ; ses vues, déjà retirées, lâchent leurs
             // clients hors du fil d'interface.
             drop(gone);
@@ -2881,6 +2928,8 @@ impl Workspace {
         for connection in added {
             self.connect_machine(&connection, window, cx);
         }
+        // Le volet Terminal ouvert sur le shell d'une machine retirée retombe sur le projet, ou se ferme.
+        self.sync_right_panel(window, cx);
         if !self.machines.is_empty() {
             self.start_wake_clock(window, cx);
         }
@@ -3489,14 +3538,55 @@ impl Workspace {
         self.right_panel == Some(RightPanel::Files)
     }
 
-    /// Le shell que le volet montre : celui du projet de contexte, volet ouvert.
-    fn shown_terminal(&self) -> Option<(PathBuf, Entity<PaneView>)> {
+    /// La clé du shell que le volet montre : celui de la machine d'une session distante sélectionnée, celui qu'« Ouvrir
+    /// un terminal » a demandé tant que son contexte dure, sinon celui du projet de contexte.
+    fn terminal_key(&self) -> Option<TerminalKey> {
+        let project = self.context_project();
+        let pinned = self.machine_terminal.as_ref().and_then(|pin| {
+            pin.machine(
+                self.selected_name(),
+                project.as_ref(),
+                self.machine_index(&pin.connection).is_some(),
+            )
+        });
+        terminal_target(self.selected_machine(), pinned, self.panel_project())
+    }
+
+    /// Le nom que l'en-tête du volet Terminal affiche à côté de « Terminal » : le projet, ou le libellé de la machine.
+    fn terminal_title(&self, key: &TerminalKey) -> String {
+        match key {
+            TerminalKey::Project(project) => project::display_name(project),
+            TerminalKey::Machine(connection) => self.machine_index(connection).map_or_else(
+                || connection.clone(),
+                |index| self.machines[index].entry.label.clone(),
+            ),
+        }
+    }
+
+    /// Le shell que le volet montre : celui de `terminal_key`, volet ouvert.
+    fn shown_terminal(&self) -> Option<(TerminalKey, Entity<PaneView>)> {
         if !self.terminal_open() {
             return None;
         }
-        let project = self.panel_project()?;
-        let view = self.terminal.view_of(&project)?;
-        Some((project, view))
+        let key = self.terminal_key()?;
+        let view = self.terminal.view_of(&key)?;
+        Some((key, view))
+    }
+
+    /// Le texte qui remplace le corps d'un volet droit ouvert : « Pas encore disponible » pour un volet de dossier sur
+    /// une session distante, « Ouverture… » le temps que le shell d'une machine s'ouvre.
+    fn right_panel_notice(&self) -> Option<(RightPanel, &'static str)> {
+        if let Some(panel) = unavailable_open_panel(self.selected_is_remote(), self.right_panel) {
+            return Some((panel, UNAVAILABLE_ON_REMOTE));
+        }
+        match self.terminal_open().then(|| self.terminal_key()).flatten() {
+            Some(TerminalKey::Machine(connection))
+                if self.pending_terminals.contains(&connection) =>
+            {
+                Some((RightPanel::Terminal, OPENING_TERMINAL))
+            }
+            _ => None,
+        }
     }
 
     /// Donne le focus au shell du volet, quand il est affiché.
@@ -3517,10 +3607,10 @@ impl Workspace {
     }
 
     fn open_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(project) = self.panel_project() else {
+        let Some(key) = self.terminal_key() else {
             return;
         };
-        if !self.ensure_terminal(&project, window, cx) {
+        if self.ensure_terminal(&key, window, cx) == TerminalReady::Failed {
             return;
         }
         self.menu = None;
@@ -3537,7 +3627,7 @@ impl Workspace {
         self.sync_files_shown(window, cx);
         self.sync_changes_shown(window, cx);
         self.sync_browser_shown(window, cx);
-        hud::log_event(&format!("terminal opened project={}", project.display()));
+        hud::log_event(&format!("terminal opened {}", terminal_label(&key)));
         self.focus_terminal(window, cx);
         self.sync_keyboard(window, cx);
         self.update_seen(window, cx);
@@ -3554,6 +3644,38 @@ impl Workspace {
         self.restore_focus(window, cx);
         self.sync_keyboard(window, cx);
         self.update_seen(window, cx);
+        cx.notify();
+    }
+
+    /// Ferme le volet droit qui montre un texte à la place de son corps (`right_panel_notice`), et rend le focus à la
+    /// session affichée. Le volet fermé ne reprend sa place qu'à la prochaine ouverture.
+    pub(crate) fn close_notice_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.right_panel else {
+            return;
+        };
+        self.menu = None;
+        self.set_right_panel(None);
+        self.sync_browser_shown(window, cx);
+        hud::log_event(match panel {
+            RightPanel::Terminal => "terminal closed",
+            RightPanel::Files => "files closed",
+            RightPanel::Changes => "changes closed",
+            RightPanel::Browser => "browser closed",
+            RightPanel::Project => "project closed",
+            RightPanel::Scratchpad => "scratchpad closed",
+        });
+        self.restore_focus(window, cx);
+        self.sync_keyboard(window, cx);
+        self.update_seen(window, cx);
+        cx.notify();
+    }
+
+    /// Agrandit le volet qui montre un texte, ou lui rend sa largeur.
+    pub(crate) fn toggle_notice_maximized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal.state.toggle_maximized(self.right_panel);
+        self.menu = None;
+        self.update_seen(window, cx);
+        self.sync_keyboard(window, cx);
         cx.notify();
     }
 
@@ -3576,23 +3698,30 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Le shell de `project` existe, sinon il est créé. Faux quand il ne peut pas démarrer (dossier du projet
-    /// disparu, pas de serveur tmux) : le volet ne s'ouvre pas et le journal le dit.
+    /// Le shell de `key` existe, sinon il est créé. Un projet : tout de suite, ou `Failed` quand il ne peut pas démarrer
+    /// (dossier du projet disparu, pas de serveur tmux). Une machine : l'ouverture passe par un canal bref (le dossier du
+    /// pane actif) puis ssh, elle est `Opening` et `finish_machine_terminal` la conclut. Le journal dit chaque échec.
     fn ensure_terminal(
         &mut self,
-        project: &Path,
+        key: &TerminalKey,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
-        if self.terminal.view_of(project).is_some() {
-            return true;
+    ) -> TerminalReady {
+        if self.terminal.view_of(key).is_some() {
+            return TerminalReady::Ready;
         }
+        let project = match key {
+            TerminalKey::Project(project) => project,
+            TerminalKey::Machine(connection) => {
+                return self.start_machine_terminal(connection, window, cx);
+            }
+        };
         let Some(server) = self.server.clone() else {
             hud::log_event(&format!(
                 "terminal spawn failed project={}: no tmux server",
                 project.display()
             ));
-            return false;
+            return TerminalReady::Failed;
         };
         let theme = *cx.global::<Theme>();
         let panel_width = theme.px(self.edge_widths_with(window, true).1);
@@ -3600,27 +3729,171 @@ impl Workspace {
         match PaneView::spawn_local(project, server.environment(), size, window, cx) {
             Ok(view) => {
                 let subscription = cx.subscribe_in(&view, window, Self::on_terminal_event);
-                self.terminal.insert(project.to_owned(), view, subscription);
-                true
+                self.terminal.insert(key.clone(), view, subscription);
+                TerminalReady::Ready
             }
             Err(error) => {
                 hud::log_event(&format!(
                     "terminal spawn failed project={}: {error}",
                     project.display()
                 ));
-                false
+                TerminalReady::Failed
             }
         }
     }
 
+    /// Ouvre le shell de la machine `connection`. Le dossier de départ est celui du pane actif quand la session
+    /// sélectionnée est de cette machine (`#{pane_current_path}`, lu sur un canal bref hors du fil d'interface), sinon le
+    /// `$HOME` de la machine.
+    fn start_machine_terminal(
+        &mut self,
+        connection: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TerminalReady {
+        if self.pending_terminals.contains(connection) {
+            return TerminalReady::Opening;
+        }
+        let lookup = self
+            .selected_entry()
+            .filter(|entry| entry.summary.machine.as_deref() == Some(connection))
+            .and_then(|entry| {
+                let pane = entry.view.as_ref()?.read(cx).active_pane()?;
+                Some((entry.summary.name.clone(), pane))
+            });
+        let Some((session, pane)) = lookup else {
+            return self.create_machine_terminal(connection, None, window, cx);
+        };
+        let target = format!("%{}", pane.0);
+        let Some(task) = self.spawn_for(&session, cx, move |server, _| {
+            server
+                .run(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &target,
+                    "#{pane_current_path}",
+                ])
+                .ok()
+        }) else {
+            return self.create_machine_terminal(connection, None, window, cx);
+        };
+        self.pending_terminals.insert(connection.to_owned());
+        let connection = connection.to_owned();
+        cx.spawn_in(window, async move |this, cx| {
+            let folder = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.pending_terminals.remove(&connection);
+                this.finish_machine_terminal(&connection, folder.as_deref(), window, cx);
+            });
+        })
+        .detach();
+        TerminalReady::Opening
+    }
+
+    /// Le dossier du pane est connu (ou pas) : le shell de la machine naît, et le volet qui l'attendait le montre ou se
+    /// ferme si la machine ne l'a pas donné.
+    fn finish_machine_terminal(
+        &mut self,
+        connection: &str,
+        folder: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ready = self.create_machine_terminal(connection, folder, window, cx);
+        let wanted = self.terminal_open()
+            && self.terminal_key() == Some(TerminalKey::Machine(connection.to_owned()));
+        if !wanted {
+            cx.notify();
+        } else if ready == TerminalReady::Ready {
+            self.focus_terminal(window, cx);
+            self.sync_keyboard(window, cx);
+            cx.notify();
+        } else {
+            self.close_terminal(window, cx);
+        }
+    }
+
+    /// Crée le shell ssh de la machine `connection` dans `folder` (ou son `$HOME`), sur un canal long de son pool : le
+    /// bail reste à la vue tant que le shell vit.
+    fn create_machine_terminal(
+        &mut self,
+        connection: &str,
+        folder: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TerminalReady {
+        let fail = |reason: &str| {
+            hud::log_event(&format!(
+                "terminal spawn failed machine={connection}: {reason}"
+            ));
+            TerminalReady::Failed
+        };
+        let Some(index) = self.machine_index(connection) else {
+            return fail("unknown machine");
+        };
+        let machine = &mut self.machines[index];
+        if machine.status != MachineStatus::Connected {
+            return fail("machine not connected");
+        }
+        let Some(pool) = machine.pool.as_mut() else {
+            return fail("no ssh pool");
+        };
+        let lease = pool.long_lived();
+        let Some(home) = lease.server.remote_spec().map(|spec| spec.home.clone()) else {
+            return fail("not a remote server");
+        };
+        let cwd = remote_start_folder(folder, &home);
+        let theme = *cx.global::<Theme>();
+        let panel_width = theme.px(self.edge_widths_with(window, true).1);
+        let size = initial_grid(window.viewport_size(), panel_width, window, &theme, cx);
+        match PaneView::spawn_remote_shell(lease, &cwd, size, window, cx) {
+            Ok(view) => {
+                let subscription = cx.subscribe_in(&view, window, Self::on_terminal_event);
+                self.terminal.insert(
+                    TerminalKey::Machine(connection.to_owned()),
+                    view,
+                    subscription,
+                );
+                hud::log_event(&format!("terminal spawned machine={connection}"));
+                TerminalReady::Ready
+            }
+            Err(error) => fail(&log_safe(&error.to_string())),
+        }
+    }
+
+    /// « Ouvrir un terminal » de l'en-tête d'une machine : le volet Terminal s'ouvre sur le shell de cette machine, sans
+    /// changer de session. Tant que la session et le projet de contexte restent ceux de la demande, le volet garde ce
+    /// shell ; un changement de contexte le rend au projet.
+    pub(crate) fn open_machine_terminal(
+        &mut self,
+        connection: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.machine_index(connection).is_none() {
+            return;
+        }
+        self.machine_terminal = Some(MachineTerminalPin {
+            connection: connection.to_owned(),
+            selected: self.selected_name().map(str::to_owned),
+            project: self.context_project(),
+        });
+        self.open_terminal(window, cx);
+    }
+
     /// Le projet de contexte a peut-être changé : le volet ouvert montre (ou crée) le shell du nouveau, et se ferme
-    /// s'il n'y en a plus ou que son shell ne démarre pas.
+    /// s'il n'y en a plus ou que son shell ne démarre pas. Un shell de machine encore en ouverture garde le volet ouvert.
     fn sync_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.terminal_open() {
             return;
         }
-        match self.panel_project() {
-            Some(project) if self.ensure_terminal(&project, window, cx) => {
+        let Some(key) = self.terminal_key() else {
+            self.close_terminal(window, cx);
+            return;
+        };
+        match self.ensure_terminal(&key, window, cx) {
+            TerminalReady::Ready => {
                 // Agrandi, ou le clavier dans le volet, le shell du nouveau projet prend le focus que `show_selected`
                 // n'a pu lui donner avant sa création (l'ancien shell n'est plus à l'écran).
                 if self.panel_maximized() || self.panel_keyboard {
@@ -3628,7 +3901,8 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            _ => self.close_terminal(window, cx),
+            TerminalReady::Opening => cx.notify(),
+            TerminalReady::Failed => self.close_terminal(window, cx),
         }
     }
 
@@ -4056,7 +4330,8 @@ impl Workspace {
 
     /// Le volet Browser que l'écran montre : le volet ouvert. Il ne dépend pas du projet de contexte (P4-5).
     pub(crate) fn shown_browser(&self) -> Option<Entity<BrowserPanel>> {
-        if self.browser_open() {
+        // Sur une session distante, le volet reste ouvert mais montre « Pas encore disponible » : sa page native est cachée.
+        if self.browser_open() && !self.selected_is_remote() {
             self.browser.clone()
         } else {
             None
@@ -4065,7 +4340,7 @@ impl Workspace {
 
     /// Dit au volet Browser s'il est celui que l'écran montre : caché, il cache la vue native de ses pages.
     fn sync_browser_shown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let shown = self.browser_open();
+        let shown = self.shown_browser().is_some();
         if let Some(panel) = &self.browser {
             panel.update(cx, |panel, cx| panel.set_shown(shown, window, cx));
         }
@@ -4076,7 +4351,7 @@ impl Workspace {
     /// volet apparaît ou disparaît, et à chaque image pour les gestes qui retirent le menu sans passer par
     /// `close_menu`. Le signal part par `defer` : la sonde a paniqué (ré-entrance) en l'envoyant pendant un `update`.
     fn sync_page_cover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let covered = page_covered(self.menu.is_some(), self.browser_open());
+        let covered = page_covered(self.menu.is_some(), self.shown_browser().is_some());
         if covered == self.page_covered {
             return;
         }
@@ -4118,6 +4393,11 @@ impl Workspace {
     fn open_browser_with(&mut self, take_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         // Pas de volet derrière l'écran d'échec du démarrage : sa page native resterait peinte par-dessus.
         if self.startup_error.is_some() || self.browser_open() {
+            return;
+        }
+        // Le Navigateur n'existe pas sur une session distante (grisé) : ni le bouton, ni ⌘⇧B, ni un lien ne l'ouvrent.
+        if self.selected_is_remote() {
+            hud::log_event("browser open ignored remote=true");
             return;
         }
         let started = Instant::now();
@@ -4776,13 +5056,26 @@ impl Workspace {
     /// sélectionné n'a pas de projet de volet (`panel_project`) : Terminal, Fichiers, Changes et Projet se ferment, le
     /// Scratchpad et le Browser restent.
     fn sync_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Sur une session distante, Fichiers, Changes, Browser et Projet ne se ferment pas : ils montrent « Pas encore
+        // disponible » et se taisent (plus de surveillance du disque, page native cachée). Leur contenu revient au retour
+        // sur une session locale, par les branches ci-dessous.
+        if unavailable_open_panel(self.selected_is_remote(), self.right_panel).is_some() {
+            self.sync_files_shown(window, cx);
+            self.sync_changes_shown(window, cx);
+            self.sync_browser_shown(window, cx);
+            self.sync_keyboard(window, cx);
+            cx.notify();
+            return;
+        }
         match self.right_panel {
             Some(RightPanel::Terminal) => self.sync_terminal(window, cx),
             Some(RightPanel::Files) => self.sync_files(window, cx),
             Some(RightPanel::Changes) => self.sync_changes(window, cx),
             Some(RightPanel::Project) => self.sync_project(window, cx),
             // Le navigateur ne suit pas le projet de contexte (P4-5), ni le Scratchpad : sa note est globale (AC-8).
-            Some(RightPanel::Browser | RightPanel::Scratchpad) | None => {}
+            // Il se remontre au retour d'une session distante, où sa page native était cachée.
+            Some(RightPanel::Browser) => self.sync_browser_shown(window, cx),
+            Some(RightPanel::Scratchpad) | None => {}
         }
     }
 
@@ -4928,7 +5221,7 @@ impl Workspace {
         }
     }
 
-    /// Le shell d'un projet est parti (écart E26) : son PTY est retiré, le prochain `` ⌃` `` en lance un neuf. S'il
+    /// Le shell d'un projet ou d'une machine est parti (écart E26) : son PTY est retiré, le prochain `` ⌃` `` en lance un neuf. S'il
     /// était affiché, le volet se ferme et le focus revient à la session.
     fn on_terminal_closed(
         &mut self,
@@ -4937,10 +5230,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let shown = self.shown_terminal().map(|(_, shown)| shown);
-        let Some(project) = self.terminal.remove(view) else {
+        let Some(key) = self.terminal.remove(view) else {
             return;
         };
-        hud::log_event(&format!("terminal exited project={}", project.display()));
+        hud::log_event(&format!("terminal exited {}", terminal_label(&key)));
         if shown.as_ref() == Some(view) {
             self.close_terminal(window, cx);
         } else {
@@ -6918,6 +7211,10 @@ impl Workspace {
     /// Vide sans session. La racine du projet du pane vient du dernier balayage ; une session créée depuis le dernier
     /// tour n'y est pas encore, le projet lui-même fait alors office de racine.
     fn reclaim_entries(&self, session: &str, project: &Path, at_prompt: bool) -> Vec<MenuEntry> {
+        // Les processus que « Ramener » arrête sont ceux de ce Mac : rien à proposer sur une session distante.
+        if !offers_local_tools(session) {
+            return Vec::new();
+        }
         let current_root = self
             .reclaim
             .roots
@@ -7041,7 +7338,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         // « Ramener » ne propose rien sur une session distante : les processus qu'il arrête sont ceux du Mac.
-        if machine_of(&session) != LOCAL_MACHINE {
+        if !offers_local_tools(&session) {
             return;
         }
         let Some(view) = self
@@ -7554,7 +7851,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Le menu « ··· » de l'en-tête d'une machine distante. « Ouvrir un terminal » viendra avec le volet Terminal distant.
+    /// Le menu « ··· » de l'en-tête d'une machine distante : réessayer, ouvrir un terminal (machine connectée seulement) et
+    /// ses réglages.
     pub(crate) fn open_machine_menu(
         &mut self,
         connection: String,
@@ -7563,12 +7861,22 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let retry = connection.clone();
+        let terminal = connection.clone();
+        let connected = self
+            .machine_index(&connection)
+            .is_some_and(|index| self.machines[index].status == MachineStatus::Connected);
         let spec = MenuSpec {
             title: None,
             entries: vec![
                 MenuEntry::Item(MenuItemSpec::new("Réessayer", move |this, window, cx| {
                     this.retry_machine(&retry, window, cx);
                 })),
+                MenuEntry::Item(
+                    MenuItemSpec::new("Ouvrir un terminal", move |this, window, cx| {
+                        this.open_machine_terminal(&terminal, window, cx);
+                    })
+                    .enabled(connected),
+                ),
                 MenuEntry::Item(MenuItemSpec::new(
                     "Réglages de la machine",
                     |this, window, cx| this.open_settings_on(Some(Section::Machines), window, cx),
@@ -7750,6 +8058,7 @@ impl Workspace {
             |this, window, cx| this.toggle_files(window, cx),
             cx,
         )
+        .when(self.selected_is_remote(), unavailable_tooltip)
     }
 
     /// Le bouton Changes de la barre d'outils, après Terminal : même gabarit et mêmes états. Sans projet de
@@ -7764,6 +8073,7 @@ impl Workspace {
             |this, window, cx| this.toggle_changes(window, cx),
             cx,
         )
+        .when(self.selected_is_remote(), unavailable_tooltip)
     }
 
     /// Le bouton Projet de la barre d'outils, le dernier des boutons de volet, après Fichiers : même gabarit et mêmes états.
@@ -7778,7 +8088,11 @@ impl Workspace {
             |this, window, cx| this.toggle_project_panel(window, cx),
             cx,
         )
-        .tooltip(|_, cx| cx.new(|_| HelpBubble::new(PROJECT_HELP)).into())
+        .tooltip(if self.selected_is_remote() {
+            |_: &mut Window, cx: &mut App| cx.new(|_| HelpBubble::new(UNAVAILABLE_ON_REMOTE)).into()
+        } else {
+            |_: &mut Window, cx: &mut App| cx.new(|_| HelpBubble::new(PROJECT_HELP)).into()
+        })
     }
 
     /// Le bouton Scratchpad de la barre d'outils, le premier, avant Terminal : même gabarit et mêmes états. La note est
@@ -7806,10 +8120,11 @@ impl Workspace {
             "browser-toggle",
             Icon::Language,
             self.browser_open(),
-            true,
+            !self.selected_is_remote(),
             |this, window, cx| this.toggle_browser(window, cx),
             cx,
         )
+        .when(self.selected_is_remote(), unavailable_tooltip)
         .relative()
         .children(badge.map(|count| servers_badge(count, theme)))
     }
@@ -8154,6 +8469,11 @@ fn toolbar_toggle_button(
         )
 }
 
+/// L'infobulle d'un bouton de volet grisé sur une session distante.
+fn unavailable_tooltip(button: Stateful<Div>) -> Stateful<Div> {
+    button.tooltip(|_, cx| cx.new(|_| HelpBubble::new(UNAVAILABLE_ON_REMOTE)).into())
+}
+
 /// La pastille du bouton Browser (spec §4.1) : 14 de haut (14 au moins de large, un second chiffre l'élargit), fond
 /// `#30D158`, chiffre 10/700 en noir, ancrée en haut à droite du bouton.
 fn servers_badge(count: usize, theme: &Theme) -> Div {
@@ -8320,6 +8640,7 @@ impl Render for Workspace {
         let shown_browser = self.shown_browser();
         let shown_scratchpad = self.shown_scratchpad();
         let shown_project = self.shown_project();
+        let notice = self.right_panel_notice();
         if self.right_panel.is_some()
             && shown_terminal.is_none()
             && shown_files.is_none()
@@ -8327,6 +8648,7 @@ impl Render for Workspace {
             && shown_browser.is_none()
             && shown_scratchpad.is_none()
             && shown_project.is_none()
+            && notice.is_none()
         {
             let workspace = cx.entity();
             window.defer(cx, move |window, cx| {
@@ -8338,7 +8660,8 @@ impl Render for Workspace {
             || shown_changes.is_some()
             || shown_browser.is_some()
             || shown_scratchpad.is_some()
-            || shown_project.is_some())
+            || shown_project.is_some()
+            || notice.is_some())
             && self.panel_maximized();
         let sidebar_visible = self.state().ui.sidebar_visible;
         let inset = if sidebar_visible {
@@ -8356,7 +8679,8 @@ impl Render for Workspace {
         } else {
             toolbar_items(
                 self.selected_is_ideation(),
-                self.panel_project().is_some(),
+                // Le Terminal a un shell sur une machine distante, sans projet de ce Mac.
+                self.panel_project().is_some() || self.selected_is_remote(),
                 self.selected_entry().is_some(),
             )
             .into_iter()
@@ -8463,7 +8787,8 @@ impl Render for Workspace {
             || shown_changes.is_some()
             || shown_browser.is_some()
             || shown_scratchpad.is_some()
-            || shown_project.is_some();
+            || shown_project.is_some()
+            || notice.is_some();
         let panel = match (
             shown_terminal,
             shown_files,
@@ -8472,9 +8797,9 @@ impl Render for Workspace {
             shown_scratchpad,
             shown_project,
         ) {
-            (Some((project, view)), _, _, _, _, _) => Some(
+            (Some((key, view)), _, _, _, _, _) => Some(
                 render_panel(
-                    project::display_name(&project),
+                    self.terminal_title(&key),
                     view,
                     maximized,
                     panel_inset,
@@ -8542,7 +8867,10 @@ impl Render for Workspace {
                 )
                 .into_any_element(),
             ),
-            (None, None, None, None, None, None) => None,
+            (None, None, None, None, None, None) => notice.map(|(panel, text)| {
+                render_notice_panel(panel, text, maximized, panel_inset, panel_width, &theme, cx)
+                    .into_any_element()
+            }),
         };
         let sidebar = sidebar_visible.then(|| render_sidebar(self, &theme, sidebar_width, cx));
         // Les poignées : pas de poignée à la barre masquée ni au volet agrandi.
@@ -8561,6 +8889,54 @@ impl Render for Workspace {
             .child(self.sidebar_toggle(sidebar_visible, cx))
             .children(pointer_menu)
     }
+}
+
+/// Le volet droit `panel` dont le corps est remplacé par `text`, au centre : « Pas encore disponible » pour un volet de
+/// dossier sur une session distante, « Ouverture… » le temps que le shell d'une machine s'ouvre. Même en-tête que le volet
+/// qu'il remplace (pastille, agrandir, fermer).
+fn render_notice_panel(
+    panel: RightPanel,
+    text: &'static str,
+    maximized: bool,
+    header_inset: Pixels,
+    width: Pixels,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let (icon, label) = match panel {
+        RightPanel::Terminal => (Icon::Terminal, "Terminal"),
+        RightPanel::Files => (Icon::Folder, "Fichiers"),
+        RightPanel::Changes => (Icon::Difference, "Changes"),
+        RightPanel::Browser => (Icon::Language, "Browser"),
+        RightPanel::Project => (Icon::Settings, "Projet"),
+        RightPanel::Scratchpad => (Icon::StickyNote, "Scratchpad"),
+    };
+    let header = panel_header(
+        theme,
+        icon,
+        label,
+        String::new(),
+        ("notice-maximize", "notice-close"),
+        maximized,
+        header_inset,
+        |_, _, _| {},
+        |this, window, cx| this.toggle_notice_maximized(window, cx),
+        |this, window, cx| this.close_notice_panel(window, cx),
+        cx,
+    );
+    let body = div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(theme.px(24.))
+        .text_size(theme.text(13.))
+        .text_color(white(TEXT_MIN))
+        .child(text);
+    panel_shell("notice-panel", maximized, width)
+        .child(header)
+        .child(body)
 }
 
 /// Le détail de l'alerte de fermeture, accordé au nombre de programmes (« Il sera arrêté. » au singulier).

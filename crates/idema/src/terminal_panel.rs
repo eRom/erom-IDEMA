@@ -3,7 +3,7 @@
 //! contexte. Les cotes sont celles de la maquette (`IDEWindow.dc.html`, lignes 173 à 196).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use gpui::{
     App, Context, Entity, MouseButton, MouseDownEvent, Pixels, Point, Subscription, Window, canvas,
@@ -55,30 +55,50 @@ impl PanelState {
     }
 }
 
-/// Le shell d'un projet, avec l'abonnement qui apprend sa fin.
+/// À quoi un shell du volet appartient : un projet de ce Mac, ou une machine distante (un shell ssh par machine, sa
+/// connexion pour clé).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TerminalKey {
+    Project(PathBuf),
+    Machine(String),
+}
+
+/// Le shell d'un projet ou d'une machine, avec l'abonnement qui apprend sa fin.
 struct LocalTerminal {
     view: Entity<PaneView>,
     _subscription: Subscription,
 }
 
-/// L'état du volet et les shells locaux : un par projet, créé à la première ouverture pour ce projet, gardé tant
-/// qu'Idema vit (ou que son shell ne sort pas).
+/// Les shells locaux : pour chaque clé de projet, le PID de son shell. Les shells d'une machine n'y sont jamais : leur
+/// processus est un client ssh, pas un shell de ce Mac sous lequel les serveurs repérés se reconnaissent.
+fn project_shell_pids(shells: impl IntoIterator<Item = (TerminalKey, i32)>) -> Vec<(PathBuf, i32)> {
+    shells
+        .into_iter()
+        .filter_map(|(key, pid)| match key {
+            TerminalKey::Project(project) => Some((project, pid)),
+            TerminalKey::Machine(_) => None,
+        })
+        .collect()
+}
+
+/// L'état du volet et ses shells : un par projet (local) ou par machine (ssh), créé à la première ouverture, gardé
+/// tant qu'Idema vit (ou que son shell ne sort pas).
 #[derive(Default)]
 pub struct TerminalPanel {
     pub state: PanelState,
-    terminals: HashMap<PathBuf, LocalTerminal>,
+    terminals: HashMap<TerminalKey, LocalTerminal>,
 }
 
 impl TerminalPanel {
-    pub fn view_of(&self, project: &Path) -> Option<Entity<PaneView>> {
+    pub fn view_of(&self, key: &TerminalKey) -> Option<Entity<PaneView>> {
         self.terminals
-            .get(project)
+            .get(key)
             .map(|terminal| terminal.view.clone())
     }
 
-    pub fn insert(&mut self, project: PathBuf, view: Entity<PaneView>, subscription: Subscription) {
+    pub fn insert(&mut self, key: TerminalKey, view: Entity<PaneView>, subscription: Subscription) {
         self.terminals.insert(
-            project,
+            key,
             LocalTerminal {
                 view,
                 _subscription: subscription,
@@ -86,26 +106,31 @@ impl TerminalPanel {
         );
     }
 
-    /// Retire le shell `view` (il est parti) et rend le projet auquel il appartenait. Le PTY est lâché avec la vue.
-    pub fn remove(&mut self, view: &Entity<PaneView>) -> Option<PathBuf> {
-        let project = self
+    /// Retire le shell `view` (il est parti) et rend la clé à laquelle il appartenait. Le PTY est lâché avec la vue.
+    pub fn remove(&mut self, view: &Entity<PaneView>) -> Option<TerminalKey> {
+        let key = self
             .terminals
             .iter()
             .find(|(_, terminal)| &terminal.view == view)
-            .map(|(project, _)| project.clone())?;
-        self.terminals.remove(&project);
-        Some(project)
+            .map(|(key, _)| key.clone())?;
+        self.terminals.remove(&key);
+        Some(key)
+    }
+
+    /// Retire le shell de la machine `connection` (elle n'est plus déclarée) : sa vue lâchée ferme le PTY et rend le bail.
+    pub fn remove_machine(&mut self, connection: &str) -> Option<Entity<PaneView>> {
+        let terminal = self
+            .terminals
+            .remove(&TerminalKey::Machine(connection.to_owned()))?;
+        Some(terminal.view)
     }
 
     /// Le shell de chaque projet, avec son PID : les racines que les serveurs repérés reconnaissent.
     pub fn shell_pids(&self, cx: &App) -> Vec<(PathBuf, i32)> {
-        self.terminals
-            .iter()
-            .filter_map(|(project, terminal)| {
-                let pid = terminal.view.read(cx).local_shell_pid()?;
-                Some((project.clone(), pid))
-            })
-            .collect()
+        project_shell_pids(self.terminals.iter().filter_map(|(key, terminal)| {
+            let pid = terminal.view.read(cx).local_shell_pid()?;
+            Some((key.clone(), pid))
+        }))
     }
 
     pub fn views(&self) -> Vec<Entity<PaneView>> {
@@ -393,6 +418,26 @@ mod tests {
     fn show(state: &mut PanelState, shown: &mut Option<RightPanel>, next: Option<RightPanel>) {
         state.switch(*shown, next);
         *shown = next;
+    }
+
+    #[test]
+    fn terminal_keys_keep_projects_and_machines_apart() {
+        let project = TerminalKey::Project(PathBuf::from("/p"));
+        let machine = TerminalKey::Machine("caserne-claude".into());
+        assert_ne!(project, machine);
+        // Une machine nommée comme un chemin n'est pas le projet de ce chemin.
+        assert_ne!(
+            TerminalKey::Machine("/p".into()),
+            TerminalKey::Project(PathBuf::from("/p"))
+        );
+        let mut shells = HashMap::new();
+        shells.insert(project.clone(), 101);
+        shells.insert(machine.clone(), 202);
+        assert_eq!(shells.len(), 2);
+        assert_eq!(shells[&project], 101);
+        assert_eq!(shells[&machine], 202);
+        // Seul le shell du projet est un shell de ce Mac.
+        assert_eq!(project_shell_pids(shells), vec![(PathBuf::from("/p"), 101)]);
     }
 
     #[test]
