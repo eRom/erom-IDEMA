@@ -85,6 +85,7 @@ use crate::machines::lifecycle::{
     idnma_run_command, is_wake_jump, link_stalled, list_pinned_windows, master_pid,
     release_windows, remote_menu_lines, set_extended_keys, windows_to_unpin,
 };
+use crate::machines::network::NetworkMonitor;
 use crate::machines::panels::{
     LinkRoute, MachineTerminalPin, OPENING_TERMINAL, UNAVAILABLE_ON_REMOTE, link_route,
     offers_local_tools, remote_start_folder, terminal_target, unavailable_open_panel,
@@ -951,6 +952,8 @@ pub struct Workspace {
     _sessions_poll: Option<Task<()>>,
     /// La minuterie du réveil du Mac (`start_wake_clock`) : elle vit autant que la fenêtre.
     _wake_clock: Option<Task<()>>,
+    /// L'observateur du chemin réseau et la tâche qui reçoit ses retours (`start_network_watch`) : la chute arrête les deux.
+    _network_watch: Option<(NetworkMonitor, Task<()>)>,
     _bootstrap_task: Option<Task<()>>,
     /// L'attache différée des sessions listées au démarrage.
     _attach_task: Option<Task<()>>,
@@ -1221,6 +1224,7 @@ impl Workspace {
             _sessions_task: None,
             _sessions_poll: None,
             _wake_clock: None,
+            _network_watch: None,
             _bootstrap_task: task,
             _attach_task: None,
             companion: CompanionController::new(),
@@ -2978,8 +2982,45 @@ impl Workspace {
         self.sync_right_panel(window, cx);
         if !self.machines.is_empty() {
             self.start_wake_clock(window, cx);
+            self.start_network_watch(window, cx);
         }
         cx.notify();
+    }
+
+    /// L'observateur du chemin réseau du Mac (spec ssh-tmux §3.2) : au retour du réseau, chaque machine non connectée se
+    /// reconnecte tout de suite, comme avec « Réessayer ». L'observateur tourne sur sa file `dispatch` ; seul le message
+    /// de retour atteint le fil d'interface.
+    fn start_network_watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._network_watch.is_some() {
+            return;
+        }
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<()>();
+        let monitor = NetworkMonitor::start(sender);
+        let task = cx.spawn_in(window, async move |this, cx| {
+            while receiver.next().await.is_some() {
+                let alive = this.update_in(cx, |this, window, cx| {
+                    this.on_network_back(window, cx);
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        });
+        self._network_watch = Some((monitor, task));
+    }
+
+    /// Le réseau est revenu : les machines qui ne sont pas connectées réessaient sans attendre leur délai.
+    fn on_network_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        hud::log_event("network path satisfied");
+        let offline: Vec<String> = self
+            .machines
+            .iter()
+            .filter(|machine| machine.status != MachineStatus::Connected)
+            .map(|machine| machine.entry.connection.clone())
+            .collect();
+        for connection in offline {
+            self.retry_machine(&connection, window, cx);
+        }
     }
 
     /// Une minuterie de `WAKE_TICK` compare l'horloge murale à l'horloge monotone : une murale en avance de plus de 10 s sur

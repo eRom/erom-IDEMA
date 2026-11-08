@@ -4,6 +4,7 @@
 pub mod idnma;
 pub mod key;
 pub mod lifecycle;
+pub mod network;
 pub mod panels;
 pub mod probe;
 pub mod registry;
