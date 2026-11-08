@@ -642,6 +642,14 @@ fn session_entries(sessions: &[ListedSession], panes: &[ListedPane]) -> Vec<Sess
         .collect()
 }
 
+/// Les entrées que le compagnon voit : celles du Mac. Les panes d'une session distante ont les identifiants de son tmux,
+/// que le compagnon irait capturer sur le tmux du Mac (la Tâche 9 l'aiguillera).
+fn fleet_entries(entries: &[SessionEntry]) -> impl Iterator<Item = &SessionEntry> {
+    entries
+        .iter()
+        .filter(|entry| entry.summary.machine.is_none())
+}
+
 /// Une clé de session telle qu'elle figure au journal : le nom tmux en local, `<connexion>:<nom tmux>` sur une machine.
 fn key_label(key: &str) -> String {
     match split_session_key(key) {
@@ -1257,7 +1265,15 @@ impl Workspace {
                 self.refresh_missing(cx);
                 self.server = Some(Arc::clone(&server));
                 self.sync_companion(window, cx);
+                // Les machines distantes ont pu se connecter avant la fin de l'amorçage : leurs entrées (et leurs vues) restent.
+                let remote: Vec<SessionEntry> = std::mem::take(&mut self.entries)
+                    .into_iter()
+                    .filter(|entry| entry.summary.machine.is_some())
+                    .collect();
                 self.entries = session_entries(&sessions, &panes);
+                self.entries.extend(remote);
+                self.entries
+                    .sort_by(|a, b| session_order(&a.summary, &b.summary));
                 self.publish_fleet(cx);
                 self.drop_hidden_selection();
                 self.bootstrapped = true;
@@ -1989,6 +2005,15 @@ impl Workspace {
             .position(|entry| entry.summary.name == name)
     }
 
+    /// La vue d'une session que le compagnon peut lire ou taper : jamais celle d'une machine distante (ses panes ne sont pas
+    /// ceux du tmux du Mac, où le compagnon capture l'écran ; la Tâche 9 l'aiguillera).
+    fn companion_view(&self, name: &str) -> Option<Entity<SessionView>> {
+        if machine_of(name) != LOCAL_MACHINE {
+            return None;
+        }
+        self.entry_view(name)
+    }
+
     /// La vue de la session `name`, quand elle en a une.
     fn entry_view(&self, name: &str) -> Option<Entity<SessionView>> {
         self.entries[self.entry_index(name)?].view.clone()
@@ -2389,7 +2414,7 @@ impl Workspace {
         pane: u32,
         cx: &App,
     ) -> Option<(Entity<SessionView>, Entity<PaneView>)> {
-        let view = self.entry_view(session)?;
+        let view = self.companion_view(session)?;
         let pane_view = view.read(cx).remote_pane(PaneId(pane))?;
         Some((view, pane_view))
     }
@@ -2413,7 +2438,7 @@ impl Workspace {
         } = request;
         // Le nom vient de l'URL : il n'entre au journal qu'une fois la session résolue.
         let label = self.session_log_label(&session);
-        let (outcome, delayed_enter) = match self.entry_view(&session) {
+        let (outcome, delayed_enter) = match self.companion_view(&session) {
             None => (InputOutcome::UnknownSession, None),
             Some(view) => match view.read(cx).remote_pane(PaneId(pane)) {
                 None => (InputOutcome::NoPane, None),
@@ -2484,7 +2509,7 @@ impl Workspace {
     /// Le nom de session d'une requête, tel qu'il peut figurer au journal : `?` tant qu'aucune session ne le porte.
     fn session_log_label(&self, session: &str) -> String {
         if self.entry_index(session).is_some() {
-            log_safe(session)
+            key_label(session)
         } else {
             "?".to_owned()
         }
@@ -2828,7 +2853,7 @@ impl Workspace {
                     "ssh control dir unusable {}: {error}",
                     spec.control_dir.display()
                 ));
-                RemoteFailure::Unreachable
+                RemoteFailure::ControlDir
             })?;
             probe(&spec).map(|facts| (spec, facts))
         });
@@ -4631,7 +4656,8 @@ impl Workspace {
         let pasted = view.update(cx, |view, cx| view.paste_to_active(text, focus, window, cx));
         match pasted {
             Some(pane) => hud::log_event(&format!(
-                "copy to agent session={name} pane=%{} chars={}",
+                "copy to agent session={} pane=%{} chars={}",
+                key_label(&name),
                 pane.0,
                 text.chars().count()
             )),
@@ -4692,9 +4718,7 @@ impl Workspace {
         if !self.companion.is_on() {
             return;
         }
-        let sessions = self
-            .entries
-            .iter()
+        let sessions = fleet_entries(&self.entries)
             .map(|entry| {
                 let view = entry.view.as_ref().map(|view| view.read(cx));
                 SessionInput {
@@ -4766,7 +4790,7 @@ impl Workspace {
         let alerting = is_alerting_session(entry.summary.ideation, ideation_enabled);
         let chimes = alerting && should_chime(previous, current, view.read(cx).is_seen());
         if chimes {
-            self.chime(&format!("session={name}"));
+            self.chime(&format!("session={}", key_label(&name)));
         }
         self.report_transition(&name, previous, current, now);
         self.refresh_badge(cx);
@@ -4876,7 +4900,7 @@ impl Workspace {
             return;
         }
         let name = entry.summary.name.clone();
-        self.chime(&format!("session={name} pane=%{}", pane.0));
+        self.chime(&format!("session={} pane=%{}", key_label(&name), pane.0));
         // Le son aurait retenti : c'est un épisode « attend » de ce pane, vu ou non.
         self.companion.send(ServiceEvent::EpisodeOpened {
             session: name,
@@ -4913,7 +4937,10 @@ impl Workspace {
             && entry.attempts >= REATTACH_ATTEMPTS
         {
             entry.attempts = 1;
-            hud::log_event(&format!("reattach session={name} attempt=1 reason={raw}"));
+            hud::log_event(&format!(
+                "reattach session={} attempt=1 reason={raw}",
+                key_label(name)
+            ));
             self.reattach_later(name, window, cx);
         }
     }
@@ -5181,12 +5208,16 @@ impl Workspace {
                 if this.server_for(&name).is_none() {
                     return;
                 }
-                let result = match (this.entry_view(&name), this.long_lived_server_for(&name)) {
-                    (Some(view), Some((lease, _))) => {
+                // Le bail n'est pris que pour la reconnexion : `attach` prend le sien, une vue ne consomme jamais deux canaux.
+                let result = match this.entry_view(&name) {
+                    Some(view) => {
+                        let Some((lease, _)) = this.long_lived_server_for(&name) else {
+                            return;
+                        };
                         view.update(cx, |view, cx| view.reconnect(lease, window, cx))
                     }
                     // Sans vue (essais épuisés, ou attache ratée) : une vue neuve, à la taille de la zone si affichée.
-                    _ => {
+                    None => {
                         let size =
                             displayed.then(|| this.central_grid(window, this.stored_gaps(&name)));
                         this.attach(&name, size, Vec::new(), window, cx)
@@ -5225,7 +5256,10 @@ impl Workspace {
         let Some(index) = self.entry_index(name) else {
             return;
         };
-        hud::log_event(&format!("session unreachable session={name}: {raw}"));
+        hud::log_event(&format!(
+            "session unreachable session={}: {raw}",
+            key_label(name)
+        ));
         let now = SystemTime::now();
         let entry = &mut self.entries[index];
         entry.view = None;
@@ -5930,7 +5964,10 @@ impl Workspace {
                         }
                         Err(error) => {
                             failed = true;
-                            hud::log_event(&format!("session kill failed session={name}: {error}"));
+                            hud::log_event(&format!(
+                                "session kill failed session={}: {error}",
+                                key_label(&name)
+                            ));
                         }
                     }
                 }
@@ -8780,5 +8817,23 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn a_remote_entry_never_reaches_the_fleet_input() {
+        use crate::machines::sessions::qualify_listing;
+        let (mut sessions, mut panes) = qualify_listing(
+            "dell-lan",
+            vec![listed_session("testvpc", 1)],
+            vec![listed_pane("testvpc", 7, true, "")],
+        );
+        sessions.push(listed_session("idema-a", 2));
+        panes.push(listed_pane("idema-a", 1, true, "Shell"));
+        let entries = session_entries(&sessions, &panes);
+        assert_eq!(entries.len(), 2);
+        let seen: Vec<&str> = fleet_entries(&entries)
+            .map(|entry| entry.summary.name.as_str())
+            .collect();
+        assert_eq!(seen, ["idema-a"]);
     }
 }

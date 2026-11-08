@@ -26,6 +26,8 @@ pub enum RemoteFailure {
     TmuxMissing,
     /// La sortie de `tmux -V`, telle quelle (`tmux 3.4`).
     TmuxTooOld(String),
+    /// Le dossier des sockets de contrôle ssh n'est pas utilisable (`ensure_control_dir`).
+    ControlDir,
 }
 
 impl RemoteFailure {
@@ -39,6 +41,7 @@ impl RemoteFailure {
             ),
             Self::TmuxMissing => "tmux introuvable".into(),
             Self::TmuxTooOld(found) => format!("tmux 3.8 requis, trouvé : {found}"),
+            Self::ControlDir => "Dossier de contrôle ssh inutilisable".into(),
         }
     }
 
@@ -50,6 +53,7 @@ impl RemoteFailure {
             Self::HostKey => "clé d'hôte",
             Self::TmuxMissing => "tmux introuvable",
             Self::TmuxTooOld(_) => "tmux trop ancien",
+            Self::ControlDir => "dossier ssh",
         }
     }
 }
@@ -288,6 +292,11 @@ mod tests {
             "Authentification refusée"
         );
         assert_eq!(RemoteFailure::TmuxMissing.message("x"), "tmux introuvable");
+        assert_eq!(
+            RemoteFailure::ControlDir.message("x"),
+            "Dossier de contrôle ssh inutilisable"
+        );
+        assert_eq!(RemoteFailure::ControlDir.short(), "dossier ssh");
         assert_eq!(RemoteFailure::Unreachable.short(), "injoignable");
         assert_eq!(
             RemoteFailure::TmuxTooOld("t".into()).short(),
