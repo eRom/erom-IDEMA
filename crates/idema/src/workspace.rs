@@ -54,7 +54,7 @@ use crate::companion::input::{
 use crate::companion::presence;
 use crate::companion::{
     AckOrigin, CompanionController, InputOutcome, PaneCommand, PaneProbe, ServiceEvent,
-    ServiceStatus, log_safe,
+    ServiceStatus, key_label, log_safe,
 };
 use crate::config::{
     AgentEntry, Config, ConfigError, FileWatch, IdeationConfig, ReloadEffects, SHELL_ENTRY,
@@ -93,7 +93,10 @@ use crate::machines::probe::{
     MachineFacts, RemoteFailure, ensure_control_dir, probe, probe_spec, retry_delay,
 };
 use crate::machines::registry::{Lease, MachineStatus, RemoteMachine, SlotPool};
-use crate::machines::sessions::{Route, machine_keys, pane_agent_names, qualify_listing, route};
+use crate::machines::sessions::{
+    Route, SessionServers, machine_keys, no_servers, pane_agent_names, qualify_listing, route,
+    should_reselect,
+};
 use crate::pane_view::{PaneEvent, PaneView};
 use crate::popover::{
     MenuEntry, MenuItemSpec, MenuSpec, OpenMenu, Placement, SUBMENU_DELAY, hidden_panes_dot,
@@ -678,25 +681,32 @@ fn session_entries(sessions: &[ListedSession], panes: &[ListedPane]) -> Vec<Sess
         .collect()
 }
 
-/// Les entrées que le compagnon voit : celles du Mac. Les panes d'une session distante ont les identifiants de son tmux,
-/// que le compagnon irait capturer sur le tmux du Mac (la Tâche 9 l'aiguillera).
-fn fleet_entries(entries: &[SessionEntry]) -> impl Iterator<Item = &SessionEntry> {
+/// Ce que tmux ne dit pas des sessions du Mac, pour les serveurs de dev : les entrées locales seulement. Les panes lus
+/// sont ceux du tmux du Mac, et le registre des serveurs de dev ignore les machines distantes (spec ssh-tmux §3.9).
+fn local_session_infos(entries: &[SessionEntry]) -> Vec<SessionInfo> {
     entries
         .iter()
         .filter(|entry| entry.summary.machine.is_none())
+        .map(|entry| SessionInfo {
+            name: entry.summary.name.clone(),
+            project: entry.summary.project.clone(),
+            display_name: entry.summary.display_name.clone(),
+        })
+        .collect()
+}
+
+/// L'instantané de restauration ne garde que les sessions du Mac (spec ssh-tmux §3.9) : la capture ne lit que le tmux
+/// d'IdemA, mais une clé distante ne doit jamais s'écrire dans `snapshot.json`, ni être recréée au lancement.
+fn local_sessions_only(capture: Vec<SavedSession>) -> Vec<SavedSession> {
+    capture
+        .into_iter()
+        .filter(|session| machine_of(&session.name) == LOCAL_MACHINE)
+        .collect()
 }
 
 /// Des noms de session empruntés, rendus possédés (l'ordre de navigation mêle des sources de durées de vie différentes).
 fn owned_names(names: Vec<&str>) -> Vec<String> {
     names.into_iter().map(str::to_owned).collect()
-}
-
-/// Une clé de session telle qu'elle figure au journal : le nom tmux en local, `<connexion>:<nom tmux>` sur une machine.
-fn key_label(key: &str) -> String {
-    match split_session_key(key) {
-        SessionTarget::Local(name) => name.to_owned(),
-        SessionTarget::Remote { connection, tmux } => format!("{connection}:{}", log_safe(tmux)),
-    }
 }
 
 /// Le résultat d'un amorçage dont le fil s'est arrêté sans répondre : un blocage de démarrage, pas une panique.
@@ -946,6 +956,14 @@ pub struct Workspace {
     _attach_task: Option<Task<()>>,
     /// Le compagnon iPhone : éteint tant que `[companion]` est absente de la config.
     companion: CompanionController,
+    /// Le serveur de chaque machine, partagé avec le fil du compagnon qui y capture l'écran d'un pane
+    /// (`sync_session_servers`).
+    session_servers: SessionServers,
+    /// La session distante que `state.json` gardait au lancement, tant qu'elle attend la connexion de sa machine
+    /// (spec ssh-tmux §3.5, `should_reselect`).
+    reselect_saved: Option<String>,
+    /// Romain a choisi une session depuis le lancement : la sélection mémorisée ne l'emporte plus.
+    chosen_since_launch: bool,
     /// La tâche qui traite sur le fil d'interface les commandes que le service du compagnon lui envoie.
     _companion_task: Option<Task<()>>,
     /// La minuterie de présence (5 s) : elle n'existe que tant que le service du compagnon tourne, et tombe avec lui.
@@ -1206,6 +1224,9 @@ impl Workspace {
             _bootstrap_task: task,
             _attach_task: None,
             companion: CompanionController::new(),
+            session_servers: no_servers(),
+            reselect_saved: None,
+            chosen_since_launch: false,
             _companion_task: None,
             _presence_task: None,
             companion_unavailable_logged: false,
@@ -1248,6 +1269,13 @@ impl Workspace {
             _root_focus: root_focus,
             _quit: quit,
         };
+        // Une session distante sélectionnée à la fermeture laisse le centre vide jusqu'à la connexion de sa machine.
+        workspace.reselect_saved = workspace
+            .state()
+            .ui
+            .selected_session
+            .clone()
+            .filter(|key| machine_of(key) != LOCAL_MACHINE);
         if let Some((result, elapsed)) = early {
             workspace.on_bootstrap(result, elapsed, window, cx);
         }
@@ -1587,7 +1615,9 @@ impl Workspace {
     /// Passe une capture au gardien, journalise les retenues qui commencent et écrit l'instantané s'il a changé (ou si
     /// son dernier enregistrement a échoué).
     fn apply_capture(&mut self, capture: Vec<SavedSession>) {
-        let applied = self.snapshot.apply(capture, Instant::now());
+        let applied = self
+            .snapshot
+            .apply(local_sessions_only(capture), Instant::now());
         for (name, reason) in &applied.held {
             hud::log_event(&format!(
                 "snapshot hold name={name} reason={}",
@@ -1621,6 +1651,10 @@ impl Workspace {
         let mut plans = Vec::new();
         let mut skipped = Vec::new();
         for session in &saved {
+            // Une session distante revient par la connexion de sa machine, jamais par la restauration.
+            if machine_of(&session.name) != LOCAL_MACHINE {
+                continue;
+            }
             // Config lue sans erreur et sans section `[ideation]` : le bouillon n'est pas restauré, sans notice. Il quitte
             // ensuite l'instantané à la prochaine capture (après `snapshot.resume()`, la capture ne le voit plus, et il
             // disparaît de `snapshot.json` à la fin de la retenue de 10 s) ; sa conversation reste reprenable à la main.
@@ -1837,17 +1871,7 @@ impl Workspace {
     /// du volet Terminal.
     fn pane_inputs(&self, cx: &App) -> PaneInputs {
         PaneInputs {
-            // Les panes lus sont ceux du tmux du Mac : une session distante n'y figure pas.
-            sessions: self
-                .entries
-                .iter()
-                .filter(|entry| entry.summary.machine.is_none())
-                .map(|entry| SessionInfo {
-                    name: entry.summary.name.clone(),
-                    project: entry.summary.project.clone(),
-                    display_name: entry.summary.display_name.clone(),
-                })
-                .collect(),
+            sessions: local_session_infos(&self.entries),
             agents: self.config.agents.clone(),
             terminal_shells: self.terminal.shell_pids(cx),
         }
@@ -2094,15 +2118,6 @@ impl Workspace {
             .position(|entry| entry.summary.name == name)
     }
 
-    /// La vue d'une session que le compagnon peut lire ou taper : jamais celle d'une machine distante (ses panes ne sont pas
-    /// ceux du tmux du Mac, où le compagnon capture l'écran ; la Tâche 9 l'aiguillera).
-    fn companion_view(&self, name: &str) -> Option<Entity<SessionView>> {
-        if machine_of(name) != LOCAL_MACHINE {
-            return None;
-        }
-        self.entry_view(name)
-    }
-
     /// La vue de la session `name`, quand elle en a une.
     fn entry_view(&self, name: &str) -> Option<Entity<SessionView>> {
         self.entries[self.entry_index(name)?].view.clone()
@@ -2340,9 +2355,12 @@ impl Workspace {
             self.companion_unavailable_logged = true;
         }
         let scratchpad = scratchpad_path(&self.dir);
+        self.sync_session_servers();
         let started = self.companion.sync(
             self.config.companion.as_ref(),
-            self.server.clone(),
+            self.server
+                .is_some()
+                .then(|| Arc::clone(&self.session_servers)),
             &self.dir,
             &scratchpad,
         );
@@ -2503,7 +2521,7 @@ impl Workspace {
         pane: u32,
         cx: &App,
     ) -> Option<(Entity<SessionView>, Entity<PaneView>)> {
-        let view = self.companion_view(session)?;
+        let view = self.entry_view(session)?;
         let pane_view = view.read(cx).remote_pane(PaneId(pane))?;
         Some((view, pane_view))
     }
@@ -2527,7 +2545,7 @@ impl Workspace {
         } = request;
         // Le nom vient de l'URL : il n'entre au journal qu'une fois la session résolue.
         let label = self.session_log_label(&session);
-        let (outcome, delayed_enter) = match self.companion_view(&session) {
+        let (outcome, delayed_enter) = match self.entry_view(&session) {
             None => (InputOutcome::UnknownSession, None),
             Some(view) => match view.read(cx).remote_pane(PaneId(pane)) {
                 None => (InputOutcome::NoPane, None),
@@ -2846,6 +2864,37 @@ impl Workspace {
         }
     }
 
+    /// Remet la table des serveurs du compagnon d'accord avec l'état des machines : le tmux du Mac une fois l'amorçage fait,
+    /// le serveur bref de chaque machine connectée. Une machine qui n'est plus connectée n'y figure plus : le compagnon ne
+    /// lit alors rien de ses sessions plutôt que de tomber sur un autre serveur. Rien n'est écrit quand la table est déjà
+    /// la bonne.
+    fn sync_session_servers(&self) {
+        let mut wanted: HashMap<String, Arc<TmuxServer>> = HashMap::new();
+        if let Some(server) = &self.server {
+            wanted.insert(LOCAL_MACHINE.to_owned(), Arc::clone(server));
+        }
+        for machine in &self.machines {
+            if machine.status == MachineStatus::Connected
+                && let Some(pool) = &machine.pool
+            {
+                wanted.insert(machine.entry.connection.clone(), pool.brief());
+            }
+        }
+        let mut table = self
+            .session_servers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unchanged = table.len() == wanted.len()
+            && wanted.iter().all(|(machine, server)| {
+                table
+                    .get(machine)
+                    .is_some_and(|held| Arc::ptr_eq(held, server))
+            });
+        if !unchanged {
+            *table = wanted;
+        }
+    }
+
     /// Un canal long (client de contrôle) pour une session, et son nom tmux. Local : un bail sans pool qui porte le
     /// serveur du Mac. Distant : un bail du pool de la machine, si elle est connectée.
     fn long_lived_server_for(&mut self, key: &str) -> Option<(Lease, String)> {
@@ -2926,6 +2975,7 @@ impl Workspace {
             // clients hors du fil d'interface.
             drop(gone);
         }
+        self.sync_session_servers();
         for connection in added {
             self.connect_machine(&connection, window, cx);
         }
@@ -2997,6 +3047,7 @@ impl Workspace {
         machine.refreshing = false;
         machine.refresh_again = false;
         machine.refresh_started = None;
+        self.sync_session_servers();
         if was_connected {
             self.set_machine_link(connection, true, cx);
         }
@@ -3125,6 +3176,8 @@ impl Workspace {
                 }));
             }
         }
+        // Le compagnon lit les sessions d'une machine tant qu'elle est connectée, pas après.
+        self.sync_session_servers();
         cx.notify();
     }
 
@@ -3263,6 +3316,7 @@ impl Workspace {
                     .retain(|key, _| machine_of(key) != connection);
                 self.remote_agents.extend(pane_agent_names(&panes));
                 self.apply_sessions(connection, &snapshot, &sessions, &panes, window, cx);
+                self.reselect_remote_selection(connection, window, cx);
             }
             (Err(error), _) | (_, Err(error)) => {
                 machine.refresh_failures = machine.refresh_failures.saturating_add(1);
@@ -3280,6 +3334,29 @@ impl Workspace {
         }
         if again {
             self.refresh_machine(connection, window, cx);
+        }
+    }
+
+    /// Au premier listage de la machine de la session distante mémorisée au lancement : la resélectionne si elle existe
+    /// encore et si Romain n'a rien choisi d'autre depuis (`should_reselect`). Un seul essai, que la session soit là ou non :
+    /// une session qui apparaîtrait plus tard sous le même nom n'est pas celle que Romain regardait.
+    fn reselect_remote_selection(
+        &mut self,
+        connection: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(saved) = self.reselect_saved.clone() else {
+            return;
+        };
+        if machine_of(&saved) != connection || !self.bootstrapped {
+            return;
+        }
+        self.reselect_saved = None;
+        let connected: Vec<String> = self.machine_entry_keys(connection);
+        if let Some(key) = should_reselect(Some(&saved), self.chosen_since_launch, &connected) {
+            hud::log_event(&format!("selection restored session={}", key_label(&key)));
+            self.select(&key, window, cx);
         }
     }
 
@@ -3311,6 +3388,7 @@ impl Workspace {
         machine.refreshing = false;
         machine.refresh_again = false;
         machine.refresh_started = None;
+        self.sync_session_servers();
         // Plus rien n'arrive à la machine : un client ssh peut rester vivant 30 s après une vraie coupure, la saisie ne doit
         // pas s'y accumuler (`SessionView::set_link_down`).
         self.set_machine_link(connection, true, cx);
@@ -5280,16 +5358,35 @@ impl Workspace {
         if !self.companion.is_on() {
             return;
         }
-        let sessions = fleet_entries(&self.entries)
+        self.sync_session_servers();
+        let sessions = self
+            .entries
+            .iter()
             .map(|entry| {
                 let view = entry.view.as_ref().map(|view| view.read(cx));
                 SessionInput {
                     summary: entry.summary.clone(),
                     state_since: entry.state_since,
                     seen: view.is_some_and(SessionView::is_seen),
-                    agent_names: self.servers.as_ref().map_or_else(Vec::new, |servers| {
-                        servers.read(cx).agents_of(&entry.summary.name).to_vec()
-                    }),
+                    agent_names: match &entry.summary.machine {
+                        // Les agents d'une session distante viennent du listage de sa machine, pas du relevé du Mac.
+                        Some(_) => self
+                            .remote_agents
+                            .get(&entry.summary.name)
+                            .cloned()
+                            .unwrap_or_default(),
+                        None => self.servers.as_ref().map_or_else(Vec::new, |servers| {
+                            servers.read(cx).agents_of(&entry.summary.name).to_vec()
+                        }),
+                    },
+                    remote_agents: entry
+                        .summary
+                        .machine
+                        .as_deref()
+                        .and_then(|connection| self.machine_index(connection))
+                        .and_then(|index| self.machines[index].facts.as_ref())
+                        .and_then(|facts| facts.agents.clone())
+                        .unwrap_or_default(),
                     panes: view.map_or_else(Vec::new, |view| {
                         view.pane_states(cx)
                             .into_iter()
@@ -5309,11 +5406,22 @@ impl Workspace {
             .iter()
             .map(|project| project.path.clone())
             .collect();
+        let machines: Vec<(String, String)> = self
+            .machines
+            .iter()
+            .map(|machine| {
+                (
+                    machine.entry.connection.clone(),
+                    machine.entry.label.clone(),
+                )
+            })
+            .collect();
         self.companion.publish(compose_fleet(
             mac_name(),
             SystemTime::now(),
             self.ideation().map(|ideation| ideation.label.as_str()),
             &projects,
+            &machines,
             &self.config.agents,
             sessions,
         ));
@@ -5490,6 +5598,8 @@ impl Workspace {
             self.project_wins = false;
         }
         self.state_mut().ui.selected_session = Some(name.to_owned());
+        // Un choix de Romain l'emporte sur la session distante mémorisée au lancement (`should_reselect`).
+        self.chosen_since_launch = true;
         self.save();
         // Une session injoignable relance ses essais, le premier une seconde plus tard. Une série déjà relancée
         // (`attempts` sous le maximum) n'est pas doublée par un second clic. Chaque essai est noté au journal
@@ -9808,7 +9918,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_entry_never_reaches_the_fleet_input() {
+    fn pane_inputs_ignore_remote_entries() {
         use crate::machines::sessions::qualify_listing;
         let (mut sessions, mut panes) = qualify_listing(
             "dell-lan",
@@ -9819,9 +9929,32 @@ mod tests {
         panes.push(listed_pane("idema-a", 1, true, "Shell"));
         let entries = session_entries(&sessions, &panes);
         assert_eq!(entries.len(), 2);
-        let seen: Vec<&str> = fleet_entries(&entries)
-            .map(|entry| entry.summary.name.as_str())
+        // Les panes lus pour les serveurs de dev sont ceux du tmux du Mac : `%7` d'une machine n'y figure pas.
+        let names: Vec<String> = local_session_infos(&entries)
+            .into_iter()
+            .map(|info| info.name)
             .collect();
-        assert_eq!(seen, ["idema-a"]);
+        assert_eq!(names, ["idema-a"]);
+    }
+
+    #[test]
+    fn a_remote_key_never_enters_the_restore_snapshot() {
+        use crate::machines::key::remote_session_key;
+        let saved = |name: &str| SavedSession {
+            name: name.into(),
+            project: PathBuf::from("/p"),
+            display_name: name.into(),
+            created: 1,
+            layout: String::new(),
+            ideation: false,
+            remote_name: String::new(),
+            panes: Vec::new(),
+        };
+        let kept = local_sessions_only(vec![
+            saved("idema-a"),
+            saved(&remote_session_key("dell-lan", "testvpc")),
+        ]);
+        let names: Vec<&str> = kept.iter().map(|session| session.name.as_str()).collect();
+        assert_eq!(names, ["idema-a"]);
     }
 }

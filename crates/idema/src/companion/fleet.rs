@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::assets::logo_path;
 use crate::config::AgentEntry;
+use crate::machines::idnma::IdnmaAgentInfo;
 use crate::sidebar_model::{SessionSummary, dock_badge_count, navigation_order};
 
 /// La flotte entière, telle que `GET fleet` la rend et que le flux `events` la pousse.
@@ -153,6 +154,34 @@ pub fn fleet_agents(names: &[String], launchers: &[AgentEntry]) -> Vec<FleetAgen
     agents
 }
 
+/// Les agents `names` d'une session distante (`@idema_agent`, sinon `@idnma_agent` : la clé de l'agent dans le
+/// `~/.idnma.yml` de sa machine), dans leur ordre : le `label` de l'agent dans ce fichier, sinon son nom ; le logo de son
+/// `avatar`, sinon celui de son nom en minuscules (la règle de la barre, `remote_agent_marks`), sinon aucun. Dédoublonné
+/// comme `fleet_agents`.
+pub fn remote_fleet_agents(names: &[String], declared: &[IdnmaAgentInfo]) -> Vec<FleetAgent> {
+    let mut agents: Vec<FleetAgent> = Vec::new();
+    for name in names {
+        let info = declared.iter().find(|agent| &agent.key == name);
+        let logo = info
+            .and_then(|agent| agent.avatar.as_deref())
+            .map(str::to_lowercase)
+            .filter(|avatar| logo_path(avatar).is_some())
+            .or_else(|| Some(name.to_lowercase()).filter(|lower| logo_path(lower).is_some()));
+        let label = info
+            .and_then(|agent| agent.label.clone())
+            .unwrap_or_else(|| name.clone());
+        let shown = agents.iter().any(|agent| match (&agent.logo, &logo) {
+            (Some(held), Some(wanted)) => held == wanted,
+            (None, None) => agent.label == label,
+            _ => false,
+        });
+        if !shown {
+            agents.push(FleetAgent { label, logo });
+        }
+    }
+    agents
+}
+
 /// Ce que l'espace de travail sait d'une session, avant d'en faire une ligne de l'instantané.
 pub struct SessionInput {
     pub summary: SessionSummary,
@@ -160,40 +189,88 @@ pub struct SessionInput {
     pub seen: bool,
     /// Les noms des agents reconnus dans ses panes (relevé des serveurs) ; ignorés pour un bouillon.
     pub agent_names: Vec<String>,
+    /// Les agents déclarés par la machine d'une session distante (son `~/.idnma.yml`) ; vide pour une session locale.
+    pub remote_agents: Vec<IdnmaAgentInfo>,
     pub panes: Vec<FleetPane>,
+}
+
+/// Le pseudo-projet d'une machine distante dans l'instantané : ses sessions s'y rangent comme dans un projet, sous le
+/// label de la machine. La page de l'iPhone ne change pas.
+fn machine_project(connection: &str) -> String {
+    format!("ssh://{connection}")
 }
 
 /// Compose l'instantané : les sessions dans l'ordre de la barre avec tous les projets dépliés (les bouillons en tête
 /// quand `[ideation]` est présente, donc `ideation_label` est `Some`), le badge du Dock, et pour chaque session ses
 /// agents. Un bouillon porte toujours le logo de Claude sous le libellé de la section, et n'a pas de projet. Sans
 /// `[ideation]`, les bouillons n'y figurent pas.
+///
+/// `machines` : (connexion, label) de chaque machine distante, dans l'ordre de la config. Une session distante a pour
+/// projet `ssh://<connexion>`, et chaque machine qui a au moins une session ajoute `FleetProject { path:
+/// "ssh://<connexion>", name: <label> }` après les projets du Mac.
 pub fn compose_fleet(
     mac: &str,
     now: SystemTime,
     ideation_label: Option<&str>,
     projects: &[PathBuf],
+    machines: &[(String, String)],
     launchers: &[AgentEntry],
     sessions: Vec<SessionInput>,
 ) -> Fleet {
+    // Le dossier d'une session distante n'est pas un projet du Mac : elle prend le pseudo-projet de sa machine.
     let summaries: Vec<SessionSummary> = sessions
         .iter()
-        .map(|session| session.summary.clone())
+        .map(|session| {
+            let mut summary = session.summary.clone();
+            if let Some(connection) = &summary.machine {
+                summary.project = PathBuf::from(machine_project(connection));
+            }
+            summary
+        })
         .collect();
-    let order = navigation_order(projects, |_| true, ideation_label.is_some(), &summaries);
+    let machine_projects: Vec<FleetProject> = machines
+        .iter()
+        .filter(|(connection, _)| {
+            summaries
+                .iter()
+                .any(|summary| summary.machine.as_deref() == Some(connection.as_str()))
+        })
+        .map(|(connection, label)| FleetProject {
+            path: machine_project(connection),
+            name: label.clone(),
+        })
+        .collect();
+    let ordered_projects: Vec<PathBuf> = projects
+        .iter()
+        .cloned()
+        .chain(
+            machine_projects
+                .iter()
+                .map(|project| PathBuf::from(&project.path)),
+        )
+        .collect();
+    let order = navigation_order(
+        &ordered_projects,
+        |_| true,
+        ideation_label.is_some(),
+        &summaries,
+    );
     let sessions = order
         .iter()
         .filter_map(|name| {
             sessions
                 .iter()
-                .find(|session| session.summary.name == *name)
+                .zip(&summaries)
+                .find(|(_, summary)| summary.name == *name)
         })
-        .map(|session| {
-            let summary = &session.summary;
+        .map(|(session, summary)| {
             let agents = if summary.ideation {
                 vec![FleetAgent {
                     label: ideation_label.unwrap_or_default().to_owned(),
                     logo: Some("claude".into()),
                 }]
+            } else if summary.machine.is_some() {
+                remote_fleet_agents(&session.agent_names, &session.remote_agents)
             } else {
                 fleet_agents(&session.agent_names, launchers)
             };
@@ -219,7 +296,11 @@ pub fn compose_fleet(
         generated_at: unix_millis(now),
         badge: dock_badge_count(summaries.iter(), ideation_label.is_some()),
         ideation_label: ideation_label.map(str::to_owned),
-        projects: projects.iter().map(|path| project_of(path)).collect(),
+        projects: projects
+            .iter()
+            .map(|path| project_of(path))
+            .chain(machine_projects)
+            .collect(),
         sessions,
     }
 }
@@ -278,6 +359,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_agents_take_the_labels_and_avatars_of_their_machine() {
+        let declared = |key: &str, label: Option<&str>, avatar: Option<&str>| IdnmaAgentInfo {
+            key: key.into(),
+            label: label.map(str::to_owned),
+            avatar: avatar.map(str::to_owned),
+        };
+        let declared = [
+            declared("sonnet", Some("Sonnet 5.5"), Some("Claude")),
+            declared("glm", None, None),
+            declared("maison", Some("Maison"), Some("inconnu")),
+        ];
+        let names = ["sonnet", "glm", "maison", "claude", "disparu"].map(String::from);
+        assert_eq!(
+            remote_fleet_agents(&names, &declared),
+            [
+                FleetAgent {
+                    label: "Sonnet 5.5".into(),
+                    logo: Some("claude".into())
+                },
+                FleetAgent {
+                    label: "glm".into(),
+                    logo: Some("glm".into())
+                },
+                FleetAgent {
+                    label: "Maison".into(),
+                    logo: None
+                },
+                FleetAgent {
+                    label: "disparu".into(),
+                    logo: None
+                },
+            ],
+            "the avatar picks the logo, the label the text; `claude` shares the logo of `sonnet`: one mark"
+        );
+    }
+
     fn input(name: &str, project: &str, ideation: bool, state: ActivityState) -> SessionInput {
         SessionInput {
             summary: SessionSummary {
@@ -292,6 +410,7 @@ mod tests {
             state_since: UNIX_EPOCH + std::time::Duration::from_secs(100),
             seen: false,
             agent_names: vec!["Faux".into()],
+            remote_agents: Vec::new(),
             panes: vec![FleetPane {
                 id: 1,
                 active: true,
@@ -308,6 +427,7 @@ mod tests {
             UNIX_EPOCH + std::time::Duration::from_secs(200),
             label,
             &projects,
+            &[],
             &launchers,
             sessions,
         )
@@ -356,6 +476,80 @@ mod tests {
             }]
         );
         assert_eq!(in_b.panes.len(), 1);
+    }
+
+    /// Une session distante telle que l'espace de travail la rend : clé qualifiée, aucun projet du Mac.
+    fn remote_input(connection: &str, tmux: &str, state: ActivityState) -> SessionInput {
+        SessionInput {
+            summary: SessionSummary {
+                name: crate::machines::key::remote_session_key(connection, tmux),
+                project: PathBuf::new(),
+                display_name: tmux.into(),
+                created: 0,
+                state,
+                ideation: false,
+                machine: Some(connection.into()),
+            },
+            state_since: UNIX_EPOCH + std::time::Duration::from_secs(100),
+            seen: false,
+            agent_names: vec!["sonnet".into()],
+            remote_agents: vec![IdnmaAgentInfo {
+                key: "sonnet".into(),
+                label: Some("Sonnet 5.5".into()),
+                avatar: Some("Claude".into()),
+            }],
+            panes: vec![FleetPane {
+                id: 0,
+                active: true,
+                state: state_label(state),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_remote_session_groups_under_its_machine_label() {
+        let machines = [
+            ("caserne-claude".to_owned(), "VPS Hostinger".to_owned()),
+            ("dell-lan".to_owned(), "Dell".to_owned()),
+        ];
+        let key = crate::machines::key::remote_session_key("caserne-claude", "testvpc");
+        let fleet = compose_fleet(
+            "Mac",
+            UNIX_EPOCH + std::time::Duration::from_secs(200),
+            None,
+            &[PathBuf::from("/b")],
+            &machines,
+            &[entry("Faux", Some("gemini"))],
+            vec![
+                remote_input("caserne-claude", "testvpc", ActivityState::Waiting),
+                input("in-b", "/b", false, ActivityState::Idle),
+            ],
+        );
+        let remote = fleet.sessions.iter().find(|s| s.name == key).unwrap();
+        assert_eq!(remote.project, "ssh://caserne-claude");
+        assert_eq!(remote.display_name, "testvpc");
+        assert!(!remote.ideation);
+        // L'agent porte le label et l'avatar que la machine lui donne dans son `~/.idnma.yml`.
+        assert_eq!(
+            remote.agents,
+            [FleetAgent {
+                label: "Sonnet 5.5".into(),
+                logo: Some("claude".into())
+            }]
+        );
+        // Les projets du Mac d'abord, puis la machine qui a une session ; celle qui n'en a pas n'ajoute rien.
+        assert_eq!(
+            fleet.projects.last().unwrap(),
+            &FleetProject {
+                path: "ssh://caserne-claude".into(),
+                name: "VPS Hostinger".into()
+            }
+        );
+        assert_eq!(fleet.projects.len(), 2);
+        // L'ordre de la barre : le projet local, puis la machine ; l'attente distante compte au badge.
+        let names: Vec<_> = fleet.sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["in-b", key.as_str()]);
+        assert_eq!(fleet.badge, 1);
     }
 
     #[test]

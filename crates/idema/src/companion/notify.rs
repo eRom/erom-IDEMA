@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use futures::channel::mpsc::UnboundedSender as CommandSender;
 use futures::future::join_all;
-use idema_tmux::server::TmuxServer;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, watch};
 
@@ -20,9 +19,11 @@ use super::fleet::Fleet;
 use super::notify_text::{payload, title, useful_lines};
 use super::push_send::{Delivery, PushSender};
 use super::screen;
-use super::{AckOrigin, PaneCommand, ServiceEvent, log_safe};
+use super::{AckOrigin, PaneCommand, ServiceEvent, key_label};
 use crate::config::CompanionConfig;
 use crate::hud;
+use crate::machines::key::{SessionTarget, split_session_key};
+use crate::machines::sessions::SessionServers;
 
 /// Les lignes de l'écran que l'on capture au-dessus de son bas pour y chercher le corps de la notification.
 const CAPTURE_HISTORY: u16 = 30;
@@ -72,7 +73,8 @@ pub struct Notifier {
     /// `None` : la clé VAPID est illisible, aucun envoi n'est possible.
     pub push: Option<Arc<PushSender>>,
     pub fleet: watch::Receiver<Arc<Fleet>>,
-    pub tmux: Arc<TmuxServer>,
+    /// Les serveurs tmux par machine : le corps d'une notification se capture sur celui de la session.
+    pub servers: SessionServers,
     /// Le fil d'interface : un pane regardé s'y acquitte.
     pub commands: CommandSender<PaneCommand>,
     /// La file de la boucle elle-même : chaque envoi y dépose son verdict.
@@ -90,7 +92,7 @@ pub async fn run(notifier: Arc<Notifier>, mut inbox: UnboundedReceiver<Message>,
             hud::log_event(&format!(
                 "companion push held kind={} session={} reason={}",
                 due.kind.as_str(),
-                log_safe(&due.session),
+                key_label(&due.session),
                 reason.as_str()
             ));
         }
@@ -163,7 +165,7 @@ fn apply(message: Message, episodes: &mut Episodes, notifier: &Notifier) {
                     hud::log_event(&format!(
                         "companion push failed kind={} session={} reason=gave_up",
                         due.kind.as_str(),
-                        log_safe(&due.session)
+                        key_label(&due.session)
                     ));
                 }
             }
@@ -189,7 +191,7 @@ async fn deliver(notifier: Arc<Notifier>, due: Due) {
 }
 
 async fn send_episode(notifier: &Arc<Notifier>, due: &Due) -> Verdict {
-    let label = log_safe(&due.session);
+    let label = key_label(&due.session);
     let Some(push) = notifier.push.clone() else {
         hud::log_event(&format!(
             "companion push failed kind={} session={label} reason=push_unavailable",
@@ -198,10 +200,10 @@ async fn send_episode(notifier: &Arc<Notifier>, due: &Due) -> Verdict {
         return Verdict::Done;
     };
     // La capture lance tmux : hors du runtime. Un pane disparu entre-temps donne une notification sans corps.
-    let tmux = Arc::clone(&notifier.tmux);
-    let pane = due.pane;
+    let servers = Arc::clone(&notifier.servers);
+    let (pane, session) = (due.pane, due.session.clone());
     let lines = tokio::task::spawn_blocking(move || {
-        screen::capture(&tmux, pane, CAPTURE_HISTORY)
+        screen::capture_for(&servers, &session, pane, CAPTURE_HISTORY)
             .map(|screen| useful_lines(&screen.text, BODY_LINES))
             .unwrap_or_default()
     })
@@ -264,7 +266,7 @@ async fn send_one(
     full: String,
     shrunk: String,
 ) -> Delivery {
-    let label = log_safe(&due.session);
+    let label = key_label(&due.session);
     let kind = due.kind.as_str();
     let mut body = full;
     let mut second_try = false;
@@ -320,10 +322,16 @@ async fn forget_subscription(
 }
 
 /// Le titre de la notification d'une session : l'agent est le premier de la session, à défaut son nom affiché ; le
-/// projet est le nom du dossier (le libellé de la section pour un bouillon).
+/// projet est le nom du dossier (le libellé de la section pour un bouillon, le label de sa machine pour une session
+/// distante).
 pub fn title_of(fleet: &Fleet, session: &str, kind: EpisodeKind) -> String {
     let Some(entry) = fleet.sessions.iter().find(|entry| entry.name == session) else {
-        return title(kind, None, session, "");
+        // Jamais la clé qualifiée d'une session distante : son nom tmux.
+        let name = match split_session_key(session) {
+            SessionTarget::Local(name) => name,
+            SessionTarget::Remote { tmux, .. } => tmux,
+        };
+        return title(kind, None, name, "");
     };
     let project = if entry.ideation {
         fleet.ideation_label.clone().unwrap_or_default()
@@ -891,5 +899,61 @@ mod tests {
         );
         // Une session qui n'est plus dans la flotte : son nom, sans projet.
         assert_eq!(title_of(&fleet, "gone", waiting), "gone attend");
+    }
+
+    #[test]
+    fn a_remote_title_names_the_machine() {
+        use crate::companion::fleet::{SessionInput, compose_fleet};
+        use crate::config::AgentEntry;
+        use crate::machines::key::remote_session_key;
+        use crate::sidebar_model::SessionSummary;
+        use idema_term::activity::ActivityState;
+
+        let key = remote_session_key("caserne-claude", "testvpc");
+        let launchers = [AgentEntry {
+            name: "Sonnet 5.5".into(),
+            harness: None,
+            command: "idnma run sonnet".into(),
+            default: false,
+            icon: None,
+        }];
+        let fleet = compose_fleet(
+            "Mac",
+            std::time::UNIX_EPOCH,
+            None,
+            &[],
+            &[("caserne-claude".to_owned(), "VPS Hostinger".to_owned())],
+            &launchers,
+            vec![SessionInput {
+                summary: SessionSummary {
+                    name: key.clone(),
+                    project: std::path::PathBuf::new(),
+                    display_name: "testvpc".into(),
+                    created: 0,
+                    state: ActivityState::Waiting,
+                    ideation: false,
+                    machine: Some("caserne-claude".into()),
+                },
+                state_since: std::time::UNIX_EPOCH,
+                seen: false,
+                agent_names: vec!["Sonnet 5.5".into()],
+                remote_agents: Vec::new(),
+                panes: Vec::new(),
+            }],
+        );
+        let title = title_of(&fleet, &key, EpisodeKind::Waiting);
+        assert!(title.ends_with("· VPS Hostinger"), "{title}");
+        assert_eq!(
+            title,
+            super::title(
+                EpisodeKind::Waiting,
+                Some("Sonnet 5.5"),
+                "testvpc",
+                "VPS Hostinger"
+            )
+        );
+        // Une session qui n'est plus dans la flotte : son nom tmux, jamais la clé qualifiée.
+        let lost = title_of(&Fleet::default(), &key, EpisodeKind::Waiting);
+        assert_eq!(lost, "testvpc attend");
     }
 }

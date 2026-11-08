@@ -18,7 +18,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
-use idema_tmux::server::TmuxServer;
 use serde::Deserialize;
 use tokio::sync::{oneshot, watch};
 
@@ -37,6 +36,7 @@ use super::web_assets;
 use super::webpush::UaKeys;
 use super::{AckOrigin, InputOutcome, PaneCommand, PaneProbe, ServiceEvent};
 use crate::hud;
+use crate::machines::sessions::SessionServers;
 
 /// L'intervalle du commentaire de maintien du flux : il garde la connexion ouverte à travers les relais.
 const KEEP_ALIVE: Duration = Duration::from_secs(20);
@@ -73,8 +73,8 @@ pub struct AppState {
     /// Le dernier instantané de la flotte : `fleet` le lit, chaque flux `events` s'y abonne.
     pub fleet: watch::Receiver<Arc<Fleet>>,
     pub timeline: Arc<Mutex<Timeline>>,
-    /// Le serveur tmux d'IdemA, pour capturer l'écran d'un pane.
-    pub tmux: Arc<TmuxServer>,
+    /// Les serveurs tmux par machine, pour capturer l'écran d'un pane sur celui de sa session.
+    pub servers: SessionServers,
     /// La file des commandes sur un pane, traitées par l'espace de travail sur le fil d'interface.
     pub commands: UnboundedSender<PaneCommand>,
     /// L'envoi des notifications. `None` : la clé VAPID est illisible, les routes push répondent 503.
@@ -442,7 +442,7 @@ enum ScreenLog {
 fn screen_log(rendered: &Rendered, session: &str, pane: u32, took_ms: u64) -> ScreenLog {
     let line = format!(
         "companion screen session={} pane={pane} took_ms={took_ms}",
-        super::log_safe(session)
+        super::key_label(session)
     );
     match rendered {
         Rendered::Body { .. } => ScreenLog::Event(line),
@@ -452,14 +452,15 @@ fn screen_log(rendered: &Rendered, session: &str, pane: u32, took_ms: u64) -> Sc
 
 /// Capture le pane et prépare la réponse. Bloquant : capture tmux, JSON et compression sont ici, sur `spawn_blocking`.
 fn render_screen(
-    tmux: &TmuxServer,
+    servers: &SessionServers,
+    session: &str,
     pane: u32,
     history: u16,
     probe: PaneProbe,
     if_none_match: Option<&str>,
     gzip: bool,
 ) -> Result<(Rendered, String, u64), String> {
-    let screen = screen::capture(tmux, pane, history)?;
+    let screen = screen::capture_for(servers, session, pane, history)?;
     // L'état et la prise en compte de la saisie figurent dans la réponse : ils changent l'`ETag` comme le texte.
     let etag = format!(
         "\"{}-{}-{}\"",
@@ -523,14 +524,23 @@ async fn screen(
         Ok(None) => return error_reply(StatusCode::NOT_FOUND, "not_found"),
         Err(why) => return unanswered_reply(why),
     };
-    let tmux = Arc::clone(&state.tmux);
+    let servers = Arc::clone(&state.servers);
+    let session_key = session.clone();
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let gzip = accepts_gzip(&headers);
     let work = tokio::task::spawn_blocking(move || {
-        render_screen(&tmux, pane, history, probe, if_none_match.as_deref(), gzip)
+        render_screen(
+            &servers,
+            &session_key,
+            pane,
+            history,
+            probe,
+            if_none_match.as_deref(),
+            gzip,
+        )
     });
     let rendered = match tokio::time::timeout(HTTP_WAIT, work).await {
         Ok(Ok(Ok(rendered))) => rendered,
@@ -1933,6 +1943,48 @@ mod tests {
         let log = calls(&log);
         assert!(log.contains("capture-pane -p -e -J -t %5 -S -200"), "{log}");
         assert!(log.contains("display-message -p -t %5"), "{log}");
+    }
+
+    #[test]
+    fn a_remote_screen_is_captured_on_the_server_of_its_machine() {
+        let dir = TempDir::new("two-servers");
+        let remote_dir = TempDir::new("two-servers-remote");
+        let (local, local_log) = fake_tmux(&dir.0, b"LOCAL\n");
+        let (remote, remote_log) = fake_tmux(&remote_dir.0, b"REMOTE\n");
+        let servers: crate::machines::sessions::SessionServers = Arc::new(std::sync::RwLock::new(
+            [
+                ("local".to_owned(), local),
+                ("caserne-claude".to_owned(), remote),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let mut service = Harness::start_with_servers(dir, servers);
+        serve_commands(&mut service, move |command| {
+            if let PaneCommand::Probe { reply, .. } = command {
+                let _ = reply.send(Some(PaneProbe {
+                    accepts_input: true,
+                    state: "idle",
+                }));
+            }
+        });
+        let cookie = service.pair(IPHONE);
+        // Le pane `%5` existe sur les deux serveurs : la clé de la session dit lequel est lu.
+        let remote_path = "/idema-api/sessions/caserne-claude%1Ftestvpc/panes/5/screen";
+        let reply = service.request("GET", remote_path, &[("Cookie", &cookie)], None);
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        assert_eq!(reply.json()["text"], "REMOTE\n");
+        assert!(calls(&remote_log).contains("capture-pane -p -e -J -t %5"));
+        assert_eq!(calls(&local_log), "", "the local server is never asked");
+
+        let reply = service.request("GET", SCREEN, &[("Cookie", &cookie)], None);
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        assert_eq!(reply.json()["text"], "LOCAL\n");
+
+        // Une machine qui n'a plus de serveur (déconnectée) ne se lit pas sur le serveur local.
+        let lost = "/idema-api/sessions/dell-lan%1Ftestvpc/panes/5/screen";
+        let reply = service.request("GET", lost, &[("Cookie", &cookie)], None);
+        assert_eq!(reply.status, 404, "{}", reply.text());
     }
 
     #[test]

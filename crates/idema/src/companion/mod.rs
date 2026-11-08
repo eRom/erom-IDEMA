@@ -31,6 +31,7 @@ use std::time::{Instant, SystemTime};
 use tokio::sync::oneshot;
 
 use crate::config::CompanionConfig;
+use crate::machines::key::{SessionTarget, split_session_key};
 pub use controller::CompanionController;
 use episodes::EpisodeKind;
 use input::RemoteInput;
@@ -196,6 +197,15 @@ pub fn log_safe(text: &str) -> String {
         .collect()
 }
 
+/// Une clé de session telle qu'elle figure au journal : le nom tmux en local, `<connexion>:<nom tmux>` sur une machine
+/// (jamais la clé qualifiée, dont le séparateur est un caractère de contrôle). Le nom passe par `log_safe`.
+pub fn key_label(key: &str) -> String {
+    match split_session_key(key) {
+        SessionTarget::Local(name) => log_safe(name),
+        SessionTarget::Remote { connection, tmux } => format!("{connection}:{}", log_safe(tmux)),
+    }
+}
+
 /// Ce que le pane accepte, tel que l'écran le dit à la page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneProbe {
@@ -216,5 +226,14 @@ mod tests {
         assert!(!forged.chars().any(char::is_control), "{forged:?}");
         assert!(forged.starts_with("x?companion pair ok"));
         assert_eq!(log_safe(&"a".repeat(500)).len(), 80);
+    }
+
+    #[test]
+    fn a_session_key_is_journaled_by_its_machine_and_name() {
+        use crate::machines::key::remote_session_key;
+        assert_eq!(key_label("idema-ab12cd34"), "idema-ab12cd34");
+        let label = key_label(&remote_session_key("caserne-claude", "test\nvpc"));
+        assert_eq!(label, "caserne-claude:test?vpc");
+        assert!(!label.chars().any(char::is_control), "{label:?}");
     }
 }

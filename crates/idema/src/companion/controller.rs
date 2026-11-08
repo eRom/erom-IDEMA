@@ -8,7 +8,6 @@ use std::time::{Instant, SystemTime};
 
 use futures::channel::mpsc;
 use idema_term::activity::ActivityState;
-use idema_tmux::server::TmuxServer;
 use tokio::sync::watch;
 
 use super::auth::test_routes_enabled;
@@ -22,6 +21,7 @@ use super::timeline::Timeline;
 use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
 use crate::hud;
+use crate::machines::sessions::SessionServers;
 
 /// Un service qui tourne (ou démarre), avec la config qui l'a lancé.
 struct Running {
@@ -75,7 +75,8 @@ impl CompanionController {
         }
     }
 
-    /// Démarre, arrête ou redémarre selon `config` ; ne démarre qu'avec `tmux` présent. Rend la file de commandes du
+    /// Démarre, arrête ou redémarre selon `config` ; ne démarre qu'avec les serveurs (`servers`) présents, c'est-à-dire
+    /// le tmux du Mac prêt. Rend la file de commandes du
     /// nouveau service quand il en démarre un, pour que l'espace de travail lance sa tâche de traitement.
     ///
     /// Un redémarrage (port changé, tmux changé) signale l'arrêt de l'ancien service et lance le nouveau tout de suite :
@@ -83,11 +84,11 @@ impl CompanionController {
     pub fn sync(
         &mut self,
         config: Option<&CompanionConfig>,
-        tmux: Option<Arc<TmuxServer>>,
+        servers: Option<SessionServers>,
         dir: &Path,
         scratchpad: &Path,
     ) -> Option<mpsc::UnboundedReceiver<PaneCommand>> {
-        let wanted = config.zip(tmux);
+        let wanted = config.zip(servers);
         // Seul un changement de port redémarre le service. Les autres réglages (notifications, seuil d'absence, adresse
         // publique) lui sont dits tels quels : ses flux ouverts ne tombent pas.
         // Un service dont la prise n'a pas pu être liée (port pris) ne répond plus à rien : tout changement de config le
@@ -106,7 +107,7 @@ impl CompanionController {
             return None;
         }
         let previous = self.stop().or_else(|| self.stopping.take());
-        let Some((config, tmux)) = wanted else {
+        let Some((config, servers)) = wanted else {
             self.away = false;
             self.stopping = previous;
             return None;
@@ -119,7 +120,7 @@ impl CompanionController {
             dir: dir.to_path_buf(),
             version: env!("CARGO_PKG_VERSION"),
             config: config.clone(),
-            tmux,
+            servers,
             scratchpad: scratchpad.to_path_buf(),
             events: events_receiver,
             commands,
@@ -273,18 +274,20 @@ impl CompanionController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machines::sessions::local_servers;
+    use idema_tmux::server::TmuxServer;
 
     fn config(port: u16) -> CompanionConfig {
         toml::from_str(&format!("port = {port}")).unwrap()
     }
 
-    fn tmux() -> Arc<TmuxServer> {
-        Arc::new(TmuxServer::new(
+    fn tmux() -> SessionServers {
+        local_servers(Arc::new(TmuxServer::new(
             "/nonexistent/tmux".into(),
             "idema-test-controller",
             "/nonexistent/tmux.conf".into(),
             Vec::new(),
-        ))
+        )))
     }
 
     /// La chronologie est celle d'IdemA : un service qui redémarre (port changé) la garde, avec le même instant de

@@ -8,6 +8,8 @@ use std::time::Instant;
 use idema_tmux::server::TmuxServer;
 use sha2::{Digest, Sha256};
 
+use crate::machines::sessions::{SessionServers, with_session_server};
+
 /// Un écran capturé.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Screen {
@@ -98,6 +100,19 @@ pub fn capture(tmux: &TmuxServer, pane: u32, history: u16) -> Result<Screen, Str
     }
     let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(screen_from_output(&captured.stdout, cols, rows, took_ms))
+}
+
+/// `capture` sur le serveur de la session `session_key` : le tmux du Mac pour une session locale, celui de sa machine
+/// (par ssh, derrière la porte des appels ponctuels) pour une session distante. Un pane ne se lit jamais sur un autre
+/// serveur que celui de sa session. Bloquant.
+pub fn capture_for(
+    servers: &SessionServers,
+    session_key: &str,
+    pane: u32,
+    history: u16,
+) -> Result<Screen, String> {
+    with_session_server(servers, session_key, |tmux, _| capture(tmux, pane, history))
+        .unwrap_or_else(|| Err("no server for the session".into()))
 }
 
 #[cfg(test)]

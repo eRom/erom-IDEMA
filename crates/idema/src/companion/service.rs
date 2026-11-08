@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::{Either, select};
-use idema_tmux::server::TmuxServer;
 use tokio::sync::{Notify, mpsc::UnboundedReceiver, watch};
 
 use super::access::Access;
@@ -26,6 +25,7 @@ use super::timeline::Timeline;
 use super::{ListenState, PaneCommand, ServiceEvent, ServiceStatus};
 use crate::config::CompanionConfig;
 use crate::hud;
+use crate::machines::sessions::SessionServers;
 
 /// Le temps que le serveur a pour finir ses échanges en cours une fois le signal d'arrêt posé. Au-delà, on l'abandonne.
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -42,8 +42,8 @@ pub struct ServiceDeps {
     pub dir: PathBuf,
     pub version: &'static str,
     pub config: CompanionConfig,
-    /// Le serveur tmux d'IdemA : l'écran d'un pane s'y capture.
-    pub tmux: Arc<TmuxServer>,
+    /// Les serveurs tmux par machine : l'écran d'un pane se capture sur celui de sa session.
+    pub servers: SessionServers,
     /// La note `scratchpad.md` du dossier d'IdemA, que la page lit et complète.
     pub scratchpad: PathBuf,
     pub events: UnboundedReceiver<ServiceEvent>,
@@ -130,7 +130,7 @@ struct Serving {
     bind_retry: Duration,
     fleet: watch::Receiver<Arc<Fleet>>,
     timeline: Arc<Mutex<Timeline>>,
-    tmux: Arc<TmuxServer>,
+    servers: SessionServers,
     commands: UnboundedSender<PaneCommand>,
     scratchpad: PathBuf,
 }
@@ -141,7 +141,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         dir,
         version,
         config,
-        tmux,
+        servers,
         events,
         commands,
         scratchpad,
@@ -220,7 +220,7 @@ fn run(deps: ServiceDeps, stop: watch::Receiver<bool>) {
         },
         fleet,
         timeline,
-        tmux,
+        servers,
         commands,
         scratchpad,
     };
@@ -255,7 +255,7 @@ async fn serve(
         bind_retry,
         fleet,
         timeline,
-        tmux,
+        servers,
         commands,
         scratchpad,
     } = serving;
@@ -285,7 +285,7 @@ async fn serve(
         access: Arc::clone(&access),
         push: push.clone(),
         fleet: fleet.clone(),
-        tmux: Arc::clone(&tmux),
+        servers: Arc::clone(&servers),
         commands: commands.clone(),
         inbox: inbox.clone(),
     });
@@ -322,7 +322,7 @@ async fn serve(
         test_routes,
         fleet,
         timeline,
-        tmux,
+        servers,
         commands,
         scratchpad,
         push,

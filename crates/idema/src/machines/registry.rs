@@ -1,6 +1,7 @@
 //! Le registre des machines distantes et le pool de maîtres ssh de chacune.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use gpui::Task;
@@ -13,6 +14,18 @@ use crate::config::RemoteMachineEntry;
 /// Canaux longs (un par volet de terminal ou client de contrôle) portés par un maître avant d'en ouvrir un autre :
 /// sshd limite à 10 sessions par connexion (`MaxSessions`), on en garde 6 pour les longs et le reste pour les brefs.
 const LONG_LIVED_PER_MASTER: usize = 6;
+
+/// La porte du second canal bref de la machine `connection` : une par connexion pour tout le process, partagée entre
+/// l'espace de travail (`RemoteMachine::adhoc`) et le fil du compagnon, qui n'a pas accès à l'espace de travail. Elle
+/// survit au retrait puis à la remise d'une machine : un appel encore en vol ne se double pas d'un second.
+pub fn adhoc_gate(connection: &str) -> Arc<Mutex<()>> {
+    static GATES: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(gates.entry(connection.to_owned()).or_default())
+}
 
 /// L'état de la connexion à une machine.
 #[derive(Debug, Clone, PartialEq)]
@@ -158,7 +171,8 @@ pub struct RemoteMachine {
     pub refresh_again: bool,
     /// Les relectures de suite qui ont échoué : la connexion est tenue pour perdue au troisième échec.
     pub refresh_failures: u8,
-    /// Le second canal bref : les commandes ponctuelles (fermer, renommer, `has-session`) passent une à une.
+    /// Le second canal bref : les commandes ponctuelles (fermer, renommer, `has-session`, lecture d'écran du compagnon)
+    /// passent une à une (`adhoc_gate`).
     pub adhoc: Arc<Mutex<()>>,
     /// La relecture toutes les 2 s tant que la machine est connectée.
     pub poll: Option<Task<()>>,
@@ -179,6 +193,7 @@ impl RemoteMachine {
 
     /// Une machine qui vient d'être déclarée : elle se connecte.
     pub fn new(entry: RemoteMachineEntry) -> Self {
+        let connection = entry.connection.clone();
         Self {
             entry,
             status: MachineStatus::Connecting,
@@ -191,7 +206,7 @@ impl RemoteMachine {
             refresh_again: false,
             refresh_started: None,
             refresh_failures: 0,
-            adhoc: Arc::new(Mutex::new(())),
+            adhoc: adhoc_gate(&connection),
             poll: None,
             retry: None,
         }

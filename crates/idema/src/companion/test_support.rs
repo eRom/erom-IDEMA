@@ -44,6 +44,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use idema_tmux::server::TmuxServer;
+
+use crate::machines::sessions::{SessionServers, local_servers};
 use tokio::sync::{mpsc, watch};
 
 use super::fleet::Fleet;
@@ -108,17 +110,17 @@ pub fn deps_in(
     let (status, status_receiver) = watch::channel(ServiceStatus::default());
     let (fleet_sender, fleet) = watch::channel(Arc::new(Fleet::default()));
     let config: CompanionConfig = toml::from_str(&format!("port = {port}")).unwrap();
-    let tmux = Arc::new(TmuxServer::new(
+    let servers = local_servers(Arc::new(TmuxServer::new(
         "/nonexistent/tmux".into(),
         "idema-test-companion",
         "/nonexistent/tmux.conf".into(),
         Vec::new(),
-    ));
+    )));
     let deps = ServiceDeps {
         dir: dir.clone(),
         version: "test",
         config,
-        tmux,
+        servers,
         scratchpad: dir.join("scratchpad.md"),
         events,
         commands,
@@ -199,17 +201,31 @@ impl Harness {
         Self::start_full(home, true, None, Some(push_override))
     }
 
+    /// Démarre avec une table de serveurs par machine à la place de celle du Mac seul.
+    pub fn start_with_servers(home: TempDir, servers: SessionServers) -> Self {
+        Self::start_on(home, true, Some(servers), None)
+    }
+
     pub fn start_full(
         home: TempDir,
         test_routes: bool,
         tmux: Option<Arc<TmuxServer>>,
         push_override: Option<String>,
     ) -> Self {
+        Self::start_on(home, test_routes, tmux.map(local_servers), push_override)
+    }
+
+    fn start_on(
+        home: TempDir,
+        test_routes: bool,
+        servers: Option<SessionServers>,
+        push_override: Option<String>,
+    ) -> Self {
         let port = free_port();
         let (mut deps, events, mut status, fleet) =
             deps_in(port, home.0.clone(), None, test_routes);
-        if let Some(tmux) = tmux {
-            deps.tmux = tmux;
+        if let Some(servers) = servers {
+            deps.servers = servers;
         }
         deps.push_override = push_override;
         let (commands, commands_receiver) = futures::channel::mpsc::unbounded();
