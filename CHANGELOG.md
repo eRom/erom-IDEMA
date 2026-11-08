@@ -4,6 +4,12 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-08
+
+### Ajouté
+
+- Machines distantes (Personnaliser › Machines) : IdemA pilote par ssh le tmux d'un serveur ou d'un autre ordinateur. Chaque machine a sa section repliable dans la barre latérale, avec toutes ses sessions tmux (celles ouvertes à la main comprises), leur état, la sonnerie et le lanceur d'agents lu dans le `~/.idnma.yml` de la machine. IdemA fixe la taille des fenêtres qu'il affiche. Une coupure ne recrée rien : la saisie est bloquée et signalée pendant la perte, les vues se rattachent seules avec leur historique, tout de suite au retour du réseau. Le volet Terminal ouvre un shell sur la machine ; le Scratchpad est partagé ; les autres volets ne sont pas encore disponibles à distance. Le compagnon iPhone voit et notifie aussi les sessions distantes. Prérequis : tmux 3.8 sur la machine, une connexion ssh sans mot de passe et une clé d'hôte déjà acceptée.
+
 ## [0.5.0] - 2026-11-06
 
 ### Ajouté
