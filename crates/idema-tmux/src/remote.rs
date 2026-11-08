@@ -41,6 +41,8 @@ pub fn ssh_arguments(spec: &RemoteSpec, tty: bool) -> Vec<String> {
     let mut arguments = vec![(if tty { "-t" } else { "-T" }).to_string()];
     let options = [
         "BatchMode=yes".to_string(),
+        // Une config `accept-new` ou `no` ne doit jamais faire accepter une clé inconnue en silence.
+        "StrictHostKeyChecking=yes".to_string(),
         "ConnectTimeout=5".to_string(),
         "ServerAliveInterval=10".to_string(),
         "ServerAliveCountMax=3".to_string(),
@@ -271,6 +273,8 @@ mod tests {
             "-T",
             "-o",
             "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
             "-o",
             "ConnectTimeout=5",
             "-o",
