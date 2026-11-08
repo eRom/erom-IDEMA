@@ -81,7 +81,8 @@ use crate::machines::key::{
 };
 use crate::machines::lifecycle::{
     RemoteAfterClose, RemoteMenuLine, after_remote_close, close_master, default_remote_agent,
-    idnma_run_command, is_wake_jump, remote_menu_lines, set_extended_keys, settle_server,
+    idnma_run_command, is_wake_jump, link_stalled, remote_menu_lines, set_extended_keys,
+    settle_server,
 };
 use crate::machines::probe::{
     MachineFacts, RemoteFailure, ensure_control_dir, probe, probe_spec, retry_delay,
@@ -3117,12 +3118,17 @@ impl Workspace {
         }
         if machine.refreshing {
             machine.refresh_again = true;
+            // Une relecture qui ne rend pas : ssh ne dira la coupure qu'après ses 30 s, la saisie est coupée dès maintenant.
+            if link_stalled(machine.refresh_started, Instant::now()) {
+                self.set_machine_link(connection, true, cx);
+            }
             return;
         }
         let Some(server) = machine.pool.as_ref().map(SlotPool::brief) else {
             return;
         };
         machine.refreshing = true;
+        machine.refresh_started = Some(Instant::now());
         let snapshot = self.machine_entry_keys(connection);
         let listing =
             cx.background_spawn(async move { (server.remote_sessions(), server.panes()) });
@@ -3152,6 +3158,7 @@ impl Workspace {
         };
         let machine = &mut self.machines[index];
         machine.refreshing = false;
+        machine.refresh_started = None;
         let again = std::mem::take(&mut machine.refresh_again);
         // La machine a été perdue pendant la relecture : son résultat est périmé, la reconnexion relira.
         if machine.status != MachineStatus::Connected {
@@ -3160,6 +3167,8 @@ impl Workspace {
         match listing {
             (Ok(sessions), Ok(panes)) => {
                 machine.refresh_failures = 0;
+                // La machine répond : les clients encore vivants reprennent la saisie.
+                self.live_clients_resume(connection, cx);
                 let (sessions, panes) = qualify_listing(connection, sessions, panes);
                 // Les agents des panes de cette machine remplacent ceux du listage précédent.
                 self.remote_agents
@@ -3227,6 +3236,18 @@ impl Workspace {
         {
             if let Some(view) = &entry.view {
                 view.update(cx, |view, _| view.release_size_pin());
+            }
+        }
+    }
+
+    /// La machine répond : les vues dont le client est encore vivant reprennent la saisie. Celles dont le client est sorti
+    /// attendent leur reconnexion.
+    fn live_clients_resume(&self, connection: &str, cx: &mut Context<Self>) {
+        for key in self.machine_entry_keys(connection) {
+            if let Some(view) = self.entry_view(&key)
+                && !view.read(cx).control_client_exited()
+            {
+                view.update(cx, |view, cx| view.set_link_down(false, cx));
             }
         }
     }

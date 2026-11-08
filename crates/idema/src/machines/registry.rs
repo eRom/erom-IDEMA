@@ -1,6 +1,7 @@
 //! Le registre des machines distantes et le pool de maîtres ssh de chacune.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use gpui::Task;
 use idema_tmux::remote::RemoteSpec;
@@ -151,6 +152,8 @@ pub struct RemoteMachine {
     pub probing: bool,
     /// Une relecture des sessions est en vol (au plus une par machine : un canal bref, jamais empilé).
     pub refreshing: bool,
+    /// Depuis quand la relecture en vol est partie : une relecture qui ne rend pas signale un lien figé (`link_stalled`).
+    pub refresh_started: Option<Instant>,
     /// Une relecture a été demandée pendant la précédente : elle repart dès que celle-ci a rendu.
     pub refresh_again: bool,
     /// Les relectures de suite qui ont échoué : la connexion est tenue pour perdue au troisième échec.
@@ -186,6 +189,7 @@ impl RemoteMachine {
             probing: false,
             refreshing: false,
             refresh_again: false,
+            refresh_started: None,
             refresh_failures: 0,
             adhoc: Arc::new(Mutex::new(())),
             poll: None,

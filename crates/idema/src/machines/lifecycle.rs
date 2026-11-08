@@ -2,7 +2,7 @@
 //! taille et le réveil du Mac.
 
 use std::process::Stdio;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use idema_tmux::remote::{RemoteSpec, control_exit_command};
 use idema_tmux::server::{ServerError, TmuxServer};
@@ -14,6 +14,15 @@ use crate::lifecycle::{AfterClose, after_close};
 
 /// Au-delà de ce saut de l'horloge murale, par rapport au pas de la minuterie, le Mac s'est endormi.
 const WAKE_MARGIN: Duration = Duration::from_secs(10);
+
+/// Une relecture des sessions qui n'a pas rendu au bout de ce temps : le lien est tenu pour tombé. ssh ne le dira qu'après
+/// ses 30 s de `ServerAlive`, et pendant ce temps une saisie s'accumulerait dans un tuyau qui ne part plus.
+pub const LINK_STALL: Duration = Duration::from_secs(6);
+
+/// La relecture partie à `started` (s'il y en a une en vol) est-elle bloquée ?
+pub fn link_stalled(started: Option<Instant>, now: Instant) -> bool {
+    started.is_some_and(|started| now.saturating_duration_since(started) > LINK_STALL)
+}
 
 /// La clé d'agent d'une commande de lanceur `idnma run <clé> [options]`. `None` pour toute autre commande.
 pub fn idnma_key_of(command: &str) -> Option<&str> {
@@ -246,7 +255,7 @@ mod tests {
     use idema_tmux::command::border_reset;
     use idema_tmux::remote::forbidden_on_remote;
     use idema_tmux::server::ServerError;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     fn local(command: &str) -> AgentEntry {
         AgentEntry {
@@ -414,6 +423,18 @@ mod tests {
             let words: Vec<&str> = command.iter().map(String::as_str).collect();
             assert_eq!(forbidden_on_remote(&words), None, "{words:?}");
         }
+    }
+
+    #[test]
+    fn a_listing_in_flight_for_too_long_reads_as_a_stalled_link() {
+        let now = Instant::now();
+        let started = now - Duration::from_secs(1);
+        assert!(!link_stalled(None, now));
+        assert!(!link_stalled(Some(started), now));
+        assert!(link_stalled(
+            Some(now - LINK_STALL - Duration::from_millis(1)),
+            now
+        ));
     }
 
     #[test]
