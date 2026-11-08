@@ -33,15 +33,22 @@ pub fn idnma_key_of(command: &str) -> Option<&str> {
 }
 
 /// L'agent par défaut d'une machine : celui que l'agent par défaut local désigne (`idnma run <clé>`) si la machine a cette
-/// clé, sinon son premier agent. `None` : la machine n'en a aucun, le shell seul.
+/// clé, sinon son premier agent. Un agent dont la clé n'est pas un mot simple (`idnma_run_command` la refuse) n'est jamais
+/// le défaut. `None` : la machine n'en a aucun, le shell seul.
 pub fn default_remote_agent<'a>(
     local_default: Option<&AgentEntry>,
     agents: &'a [IdnmaAgentInfo],
 ) -> Option<&'a IdnmaAgentInfo> {
+    let runnable = |agent: &&IdnmaAgentInfo| idnma_run_command(&agent.key).is_some();
     local_default
         .and_then(|entry| idnma_key_of(&entry.command))
-        .and_then(|key| agents.iter().find(|agent| agent.key == key))
-        .or_else(|| agents.first())
+        .and_then(|key| {
+            agents
+                .iter()
+                .filter(runnable)
+                .find(|agent| agent.key == key)
+        })
+        .or_else(|| agents.iter().find(runnable))
 }
 
 /// Ce que l'espace de travail fait d'une session distante dont le client est tombé.
@@ -94,6 +101,107 @@ pub fn pin_commands(window: &str, columns: u16, lines: u16) -> Vec<Vec<String>> 
     ]
 }
 
+/// Ce que la vue veut de l'épingle de taille à cet instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinWant {
+    /// La session est affichée : sa fenêtre visible `window` (`@<n>`) à cette taille.
+    Pin {
+        window: u32,
+        columns: u16,
+        lines: u16,
+    },
+    /// La session n'est pas (ou plus) affichée : plus d'épingle.
+    Release,
+    /// Affichée, mais la fenêtre visible ou la taille ne sont pas connues encore : rien à changer.
+    Hold,
+}
+
+/// Une écriture d'épingle à envoyer sur le client de contrôle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinAction {
+    Pin {
+        window: u32,
+        columns: u16,
+        lines: u16,
+    },
+    Unpin {
+        window: u32,
+    },
+}
+
+impl PinAction {
+    /// La ligne du client de contrôle.
+    pub fn line(&self) -> String {
+        match *self {
+            Self::Pin {
+                window,
+                columns,
+                lines,
+            } => control_line(&pin_commands(&format!("@{window}"), columns, lines)),
+            Self::Unpin { window } => control_line(&unpin_commands(&format!("@{window}"))),
+        }
+    }
+}
+
+/// L'épingle de taille d'une vue : la fenêtre que cette vue a épinglée et dont elle doit encore la retirer. Pure : la vue
+/// demande un plan, envoie ses actions, et ne note (`sent`) que celles dont l'écriture a réussi. Une épingle n'est donc
+/// jamais oubliée avant son retrait, quel que soit le chemin (lien tombé puis revenu, reconnexion, fenêtre changée).
+#[derive(Debug, Default)]
+pub struct SizePin {
+    pinned: Option<u32>,
+}
+
+impl SizePin {
+    /// La fenêtre épinglée par cette vue, s'il y en a une.
+    pub fn pinned(&self) -> Option<u32> {
+        self.pinned
+    }
+
+    /// Les écritures à faire pour passer de l'état noté à `want`. Un client sorti ne reçoit rien : l'état est gardé et la
+    /// reconnexion refait le plan. Poser rejoue toujours la taille ; une autre fenêtre déjà épinglée est libérée d'abord.
+    pub fn plan(&self, want: PinWant, client_alive: bool) -> Vec<PinAction> {
+        if !client_alive {
+            return Vec::new();
+        }
+        match want {
+            PinWant::Hold => Vec::new(),
+            PinWant::Release => self
+                .pinned
+                .map(|window| PinAction::Unpin { window })
+                .into_iter()
+                .collect(),
+            PinWant::Pin {
+                window,
+                columns,
+                lines,
+            } => {
+                let mut actions = Vec::new();
+                if let Some(old) = self.pinned.filter(|old| *old != window) {
+                    actions.push(PinAction::Unpin { window: old });
+                }
+                actions.push(PinAction::Pin {
+                    window,
+                    columns,
+                    lines,
+                });
+                actions
+            }
+        }
+    }
+
+    /// Note une action dont l'écriture a réussi.
+    pub fn sent(&mut self, action: &PinAction) {
+        match *action {
+            PinAction::Pin { window, .. } => self.pinned = Some(window),
+            PinAction::Unpin { window } => {
+                if self.pinned == Some(window) {
+                    self.pinned = None;
+                }
+            }
+        }
+    }
+}
+
 /// Les commandes qui rendent la taille de la fenêtre `window` à tmux et à Ghostty.
 pub fn unpin_commands(window: &str) -> Vec<Vec<String>> {
     vec![
@@ -120,10 +228,13 @@ pub fn control_line(commands: &[Vec<String>]) -> String {
         .join(" ; ")
 }
 
-/// L'horloge murale a-t-elle sauté de plus de `tick + 10 s` ? Le Mac sort de veille. Une horloge qui recule n'en est pas un.
-pub fn is_wake_jump(previous: SystemTime, now: SystemTime, tick: Duration) -> bool {
+/// Le Mac sort-il de veille ? L'horloge murale a avancé de plus de 10 s de plus que l'horloge monotone (`Instant`, qui sur
+/// macOS ne compte pas le temps de veille) : une minuterie en retard (App Nap, fil d'interface bloqué) fait avancer les
+/// deux de la même durée et n'est pas un réveil. Une horloge murale qui recule (réglage manuel) n'en est pas un non plus.
+/// `monotonic` : le temps écoulé de l'horloge monotone entre les deux relevés.
+pub fn is_wake_jump(previous: SystemTime, now: SystemTime, monotonic: Duration) -> bool {
     now.duration_since(previous)
-        .is_ok_and(|elapsed| elapsed > tick + WAKE_MARGIN)
+        .is_ok_and(|wall| wall.saturating_sub(monotonic) > WAKE_MARGIN)
 }
 
 /// La ligne grisée d'un menu de machine sans `~/.idnma.yml`.
@@ -137,6 +248,8 @@ pub enum RemoteMenuLine {
         key: String,
         text: String,
         default: bool,
+        /// Faux : la clé n'est pas un mot simple, l'entrée est grisée (elle serait lue par le shell de la machine).
+        runnable: bool,
     },
     Note(&'static str),
     Separator,
@@ -160,6 +273,7 @@ pub fn remote_menu_lines(
                 key: agent.key.clone(),
                 text: agent.label.clone().unwrap_or_else(|| agent.key.clone()),
                 default: default_key == Some(agent.key.as_str()),
+                runnable: idnma_run_command(&agent.key).is_some(),
             }));
             if !agents.is_empty() {
                 lines.push(RemoteMenuLine::Separator);
@@ -179,15 +293,17 @@ pub fn remote_menu_lines(
 pub const PINNED_WINDOWS_FORMAT: &str = "#{session_name}\t#{window_id}\t#{@idema_size_pin}";
 
 /// Les fenêtres dont IdemA a épinglé la taille (`@idema_size_pin` à 1) et qu'il n'affiche pas : un IdemA tombé les a
-/// laissées. `displayed` : le nom tmux de la session que cette instance affiche, dont l'épingle sera reposée par sa vue.
-pub fn windows_to_unpin(listing: &str, displayed: Option<&str>) -> Vec<String> {
+/// laissées. `spared` : la session que cette instance affiche et sa fenêtre visible (`@<n>`), seule épargnée : sa vue
+/// repose son épingle, et une autre fenêtre épinglée de la même session est périmée.
+pub fn windows_to_unpin(listing: &str, spared: Option<(&str, u32)>) -> Vec<String> {
     listing
         .lines()
         .filter_map(|line| {
             let mut fields = line.split('\t');
             let (session, window, pin) = (fields.next()?, fields.next()?, fields.next()?);
-            (pin == "1" && Some(session) != displayed && window.starts_with('@'))
-                .then(|| window.to_owned())
+            let number: u32 = window.strip_prefix('@')?.parse().ok()?;
+            let keeps = spared == Some((session, number));
+            (pin == "1" && !keeps).then(|| window.to_owned())
         })
         .collect()
 }
@@ -203,17 +319,19 @@ pub fn set_extended_keys(server: &TmuxServer) {
     }
 }
 
-/// À la connexion d'une machine : `extended-keys`, puis la libération des épingles qu'un IdemA tombé a laissées. Bloquant
-/// (ssh), hors du fil d'interface. Rien n'est fatal : sans serveur tmux, il n'y a ni fenêtre épinglée ni option à poser.
-pub fn settle_server(server: &TmuxServer, displayed: Option<&str>) {
-    set_extended_keys(server);
-    let Ok(listing) = server.run(&["list-windows", "-a", "-F", PINNED_WINDOWS_FORMAT]) else {
-        return;
-    };
-    for window in windows_to_unpin(&listing, displayed) {
-        let line = unpin_commands(&window);
+/// Les fenêtres épinglées de la machine (`list-windows -a`) : une ligne `session<TAB>@fenêtre<TAB>épingle` par fenêtre.
+/// Bloquant (ssh), hors du fil d'interface. Sans serveur tmux, il n'y en a aucune.
+pub fn list_pinned_windows(server: &TmuxServer) -> String {
+    server
+        .run(&["list-windows", "-a", "-F", PINNED_WINDOWS_FORMAT])
+        .unwrap_or_default()
+}
+
+/// Libère les épingles de `windows` (`@<n>`) : bloquant (ssh), hors du fil d'interface.
+pub fn release_windows(server: &TmuxServer, windows: &[String]) {
+    for window in windows {
         let mut args: Vec<String> = Vec::new();
-        for (index, command) in line.into_iter().enumerate() {
+        for (index, command) in unpin_commands(window).into_iter().enumerate() {
             if index > 0 {
                 args.push(";".into());
             }
@@ -439,16 +557,178 @@ mod tests {
 
     #[test]
     fn a_clock_jump_reads_as_a_wake() {
-        let tick = Duration::from_secs(2);
-        let before = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        assert!(!is_wake_jump(before, before + Duration::from_secs(2), tick));
-        assert!(is_wake_jump(before, before + Duration::from_secs(60), tick));
-        // Une horloge qui recule (réglage manuel) n'est pas un réveil.
-        assert!(!is_wake_jump(
-            before,
-            before - Duration::from_secs(60),
-            tick
+        let secs = Duration::from_secs;
+        let before = SystemTime::UNIX_EPOCH + secs(1_000);
+        // Un tick à l'heure.
+        assert!(!is_wake_jump(before, before + secs(2), secs(2)));
+        // Un tick en retard (App Nap, fil bloqué) : les deux horloges ont avancé autant, ce n'est pas un réveil.
+        assert!(!is_wake_jump(before, before + secs(60), secs(60)));
+        assert!(!is_wake_jump(before, before + secs(20), secs(20)));
+        // Une veille : l'horloge murale a avancé de 60 s, la monotone de 2 s.
+        assert!(is_wake_jump(before, before + secs(60), secs(2)));
+        // Juste sous la marge de 10 s : pas un réveil.
+        assert!(!is_wake_jump(before, before + secs(12), secs(2)));
+        // Une horloge murale qui recule (réglage manuel) n'est pas un réveil.
+        assert!(!is_wake_jump(before, before - secs(60), secs(2)));
+    }
+
+    #[test]
+    fn a_remote_agent_the_shell_would_misread_is_neither_runnable_nor_the_default() {
+        let agents = [remote("a;b"), remote("glm")];
+        // Le défaut local désigne la clé refusée : on prend le premier agent qu'on sait lancer.
+        let risky = local("idnma run a;b");
+        assert_eq!(
+            default_remote_agent(Some(&risky), &agents).map(|agent| agent.key.as_str()),
+            Some("glm")
+        );
+        assert_eq!(
+            default_remote_agent(None, &[remote("a b")]).map(|agent| agent.key.as_str()),
+            None
+        );
+        let lines = remote_menu_lines(Some(&agents), None);
+        assert!(matches!(
+            &lines[0],
+            RemoteMenuLine::Agent {
+                runnable: false,
+                default: false,
+                ..
+            }
         ));
+        assert!(matches!(
+            &lines[1],
+            RemoteMenuLine::Agent { runnable: true, .. }
+        ));
+    }
+
+    /// Le décor des scénarios de l'épingle : la fenêtre `@3`, 120x40.
+    fn want(window: u32) -> PinWant {
+        PinWant::Pin {
+            window,
+            columns: 120,
+            lines: 40,
+        }
+    }
+
+    /// Planifie puis applique, chaque action réussie étant notée.
+    fn step(pin: &mut SizePin, want: PinWant, client_alive: bool) -> Vec<PinAction> {
+        let plan = pin.plan(want, client_alive);
+        apply(pin, plan.clone());
+        plan
+    }
+
+    /// Applique un plan comme la vue : chaque action réussie est notée.
+    fn apply(pin: &mut SizePin, plan: Vec<PinAction>) {
+        for action in plan {
+            pin.sent(&action);
+        }
+    }
+
+    #[test]
+    fn a_displayed_session_pins_its_visible_window_and_a_release_unpins_it() {
+        let mut pin = SizePin::default();
+        let plan = pin.plan(want(3), true);
+        assert_eq!(
+            plan,
+            vec![PinAction::Pin {
+                window: 3,
+                columns: 120,
+                lines: 40
+            }]
+        );
+        apply(&mut pin, plan);
+        assert_eq!(pin.pinned(), Some(3));
+        // Plus rien à envoyer tant que rien ne change : seul `Pin` rejoue la taille.
+        assert_eq!(pin.plan(PinWant::Hold, true), vec![]);
+        let plan = pin.plan(PinWant::Release, true);
+        assert_eq!(plan, vec![PinAction::Unpin { window: 3 }]);
+        apply(&mut pin, plan);
+        assert_eq!(pin.pinned(), None);
+        assert_eq!(pin.plan(PinWant::Release, true), vec![]);
+    }
+
+    #[test]
+    fn a_pin_is_forgotten_only_after_its_unpin_was_sent() {
+        let mut pin = SizePin::default();
+        step(&mut pin, want(3), true);
+        // Client sorti : rien ne part, l'épingle reste due.
+        assert_eq!(pin.plan(PinWant::Release, false), vec![]);
+        assert_eq!(pin.pinned(), Some(3));
+        // L'écriture a échoué (`sent` jamais appelé) : le plan suivant réessaie.
+        let _lost = pin.plan(PinWant::Release, true);
+        assert_eq!(pin.pinned(), Some(3));
+        assert_eq!(
+            pin.plan(PinWant::Release, true),
+            vec![PinAction::Unpin { window: 3 }]
+        );
+    }
+
+    #[test]
+    fn a_session_left_while_its_link_was_down_unpins_once_the_link_is_back() {
+        // Chemin A : relecture bloquée, l'utilisateur passe sur une session locale, la relecture répond.
+        let mut pin = SizePin::default();
+        step(&mut pin, want(3), true);
+        // Pendant la coupure le client est resté vivant : le retrait part quand même (la file ne bloque plus).
+        assert_eq!(
+            pin.plan(PinWant::Release, true),
+            vec![PinAction::Unpin { window: 3 }]
+        );
+    }
+
+    #[test]
+    fn a_window_that_changed_during_a_cut_loses_its_old_pin() {
+        // La fenêtre épinglée est `@3`, la visible devient `@5` : l'ancienne est libérée avant que la nouvelle soit posée.
+        let mut pin = SizePin::default();
+        step(&mut pin, want(3), true);
+        let plan = pin.plan(want(5), true);
+        assert_eq!(
+            plan,
+            vec![
+                PinAction::Unpin { window: 3 },
+                PinAction::Pin {
+                    window: 5,
+                    columns: 120,
+                    lines: 40
+                }
+            ]
+        );
+        apply(&mut pin, plan);
+        assert_eq!(pin.pinned(), Some(5));
+    }
+
+    #[test]
+    fn a_pin_resent_after_a_zone_resize_carries_the_new_size() {
+        let mut pin = SizePin::default();
+        step(&mut pin, want(3), true);
+        let plan = pin.plan(
+            PinWant::Pin {
+                window: 3,
+                columns: 90,
+                lines: 30,
+            },
+            true,
+        );
+        assert_eq!(
+            plan,
+            vec![PinAction::Pin {
+                window: 3,
+                columns: 90,
+                lines: 30
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unpin_command_line_matches_the_pin_that_was_sent() {
+        let pin = PinAction::Pin {
+            window: 3,
+            columns: 120,
+            lines: 40,
+        };
+        assert_eq!(pin.line(), control_line(&pin_commands("@3", 120, 40)));
+        assert_eq!(
+            PinAction::Unpin { window: 3 }.line(),
+            control_line(&unpin_commands("@3"))
+        );
     }
 
     fn labelled(key: &str, label: &str) -> IdnmaAgentInfo {
@@ -469,11 +749,13 @@ mod tests {
                     key: "opus".into(),
                     text: "Opus 4".into(),
                     default: false,
+                    runnable: true,
                 },
                 RemoteMenuLine::Agent {
                     key: "glm".into(),
                     text: "glm".into(),
                     default: true,
+                    runnable: true,
                 },
                 RemoteMenuLine::Separator,
                 RemoteMenuLine::Shell { default: false },
@@ -505,9 +787,15 @@ mod tests {
 
     #[test]
     fn only_pinned_windows_of_sessions_that_are_not_displayed_are_released() {
-        let listing = "work\t@1\t1\nwork\t@2\t\nold\t@7\t1\nother\t@9\t0\n\nbroken line\n";
-        assert_eq!(windows_to_unpin(listing, Some("work")), vec!["@7"]);
-        assert_eq!(windows_to_unpin(listing, None), vec!["@1", "@7"]);
+        let listing =
+            "work\t@1\t1\nwork\t@2\t\nold\t@7\t1\nother\t@9\t0\nwork\t@4\t1\n\nbroken line\n";
+        // Seule la fenêtre visible de la session affichée est épargnée : son autre fenêtre épinglée (`@4`, restée d'une
+        // coupure où la visible a changé) est libérée avec celles des autres sessions.
+        assert_eq!(
+            windows_to_unpin(listing, Some(("work", 1))),
+            vec!["@7", "@4"]
+        );
+        assert_eq!(windows_to_unpin(listing, None), vec!["@1", "@7", "@4"]);
         assert!(windows_to_unpin("", None).is_empty());
     }
 

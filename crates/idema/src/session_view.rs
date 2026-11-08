@@ -20,7 +20,7 @@ use idema_term::pane_session::size_watch_pane;
 use idema_tmux::client::ControlClient;
 use idema_tmux::command::{BORDER_WATCH, PaneWatch, border_reset, border_subscription};
 use idema_tmux::layout::{Direction, PaneRect, Preset, WindowLayout, neighbor, preset_cell};
-use idema_tmux::protocol::{ControlEvent, PaneId, WindowId};
+use idema_tmux::protocol::{ControlEvent, PaneId};
 use idema_tmux::server::{ServerError, TmuxServer};
 use idema_tmux::windows::{
     LayoutRepair, PaneRoster, QueryStep, SessionWindows, UNZOOM_SETTLE, WindowsQuery, layout_repair,
@@ -30,7 +30,7 @@ use crate::config::SHELL_SESSION_NAME;
 use crate::file_open::PathTarget;
 use crate::gutter::{Frame, pane_frame, separator_frame, session_columns};
 use crate::hud;
-use crate::machines::lifecycle::{control_line, pin_commands, unpin_commands};
+use crate::machines::lifecycle::{PinWant, SizePin};
 use crate::machines::registry::Lease;
 use crate::pane_view::{LaunchRequest, PaneEvent, PaneView, RESIZE_SETTLE, SessionRef};
 use crate::signpost;
@@ -79,11 +79,6 @@ const NO_PANE: u32 = u32::MAX;
 /// `refresh-client -C` : la taille de la zone centrale, demandée à tmux pour la session affichée (spec §3.3).
 fn client_size_command(grid: GridSize) -> String {
     format!("refresh-client -C {}x{}", grid.columns, grid.lines)
-}
-
-/// La cible tmux d'une fenêtre : `@3`.
-fn window_target(window: WindowId) -> String {
-    format!("@{}", window.0)
 }
 
 /// La commande d'agent d'un pane, et le délai avant lequel elle ne part pas : une restauration étale ses lancements.
@@ -515,8 +510,9 @@ pub struct SessionView {
     /// Le lien vers la machine est tombé (client sorti, ou machine qui ne répond plus) : les panes n'écrivent plus rien
     /// sur l'entrée de ssh. Posé par l'espace de travail ; levé à la reconnexion. Toujours faux en local.
     link_down: bool,
-    /// La fenêtre dont IdemA a épinglé la taille (session distante affichée), pour la libérer. `None` : rien d'épinglé.
-    pinned_window: Option<WindowId>,
+    /// La fenêtre dont IdemA a épinglé la taille (session distante affichée), pour la libérer : oubliée seulement une fois
+    /// son retrait écrit (`apply_pin`).
+    pin: SizePin,
     /// Compteur qui annule les épingles dépassées par un nouveau changement de la zone.
     pin_generation: u64,
     /// L'entrée du canal d'événements, gardée pour le client d'une reconnexion.
@@ -657,7 +653,7 @@ impl SessionView {
                 exit_reason: None,
                 client_exited: false,
                 link_down: false,
-                pinned_window: None,
+                pin: SizePin::default(),
                 pin_generation: 0,
                 sender,
                 echo_pane,
@@ -694,6 +690,11 @@ impl SessionView {
         }));
         hud::log_step("attach.view", step);
         view
+    }
+
+    /// La fenêtre visible de la session (`@<n>`), quand les fenêtres sont lues.
+    pub fn visible_window(&self) -> Option<u32> {
+        self.windows.visible().map(|state| state.id.0)
     }
 
     /// Le pane actif : celui qui a le focus de tmux.
@@ -856,16 +857,17 @@ impl SessionView {
         self.apply_flags(window, cx);
         if displayed {
             self.sync_size(window, cx);
-            self.schedule_pin(window, cx);
-        } else {
-            // IdemA ne mène plus la taille : la fenêtre retombe sous la règle de tmux et de Ghostty.
-            self.unpin();
         }
+        // Affichée : la fenêtre visible est épinglée. Retirée : IdemA ne mène plus la taille, la fenêtre retombe sous la
+        // règle de tmux et de Ghostty.
+        self.schedule_pin(cx);
         cx.notify();
     }
 
     /// Le lien vers la machine tombe ou revient. Tant qu'il est tombé, ses panes n'écrivent rien sur l'entrée de ssh.
-    /// Sans effet en local, où une écriture qui échoue ne coûte rien.
+    /// Sans effet en local, où une écriture qui échoue ne coûte rien. Quand il revient sans reconnexion (le client est
+    /// resté vivant), l'épingle est remise d'accord avec ce que la vue affiche : reposée à la taille d'aujourd'hui si la
+    /// session l'est, retirée si on l'a quittée pendant la coupure.
     pub fn set_link_down(&mut self, link_down: bool, cx: &mut Context<Self>) {
         if !self.remote || self.link_down == link_down {
             return;
@@ -875,69 +877,73 @@ impl SessionView {
             slot.view
                 .update(cx, |pane, _| pane.set_link_down(link_down));
         }
+        if !link_down {
+            self.schedule_pin(cx);
+        }
     }
 
-    /// Épingle la taille de la fenêtre visible d'une session distante affichée, 100 ms après le dernier changement : la
-    /// ligne part par le client de contrôle de la vue, jamais par un processus ssh de plus.
-    fn schedule_pin(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if !self.remote || !self.displayed {
+    /// Remet l'épingle de taille d'accord avec la vue, 100 ms après le dernier changement : la ligne part par le client de
+    /// contrôle de la vue, jamais par un processus ssh de plus. Sans effet en local.
+    fn schedule_pin(&mut self, cx: &mut Context<Self>) {
+        if !self.remote {
             return;
         }
         self.pin_generation += 1;
         let generation = self.pin_generation;
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PIN_DELAY).await;
             let _ = this.update(cx, |view, _| {
                 if view.pin_generation == generation {
-                    view.send_pin();
+                    view.apply_pin();
                 }
             });
         })
         .detach();
     }
 
-    /// Écrit l'épingle : la taille demandée à tmux, sur la fenêtre visible (jamais la cachée). Sans lien, rien n'est
-    /// écrit : la reconnexion la repose.
-    fn send_pin(&mut self) {
-        if self.link_down || self.client_exited || !self.displayed {
-            return;
+    /// Ce que la vue veut de l'épingle : la fenêtre visible à la taille demandée tant que la session est affichée, rien
+    /// quand elle ne l'est pas.
+    fn pin_want(&self) -> PinWant {
+        if !self.displayed {
+            return PinWant::Release;
         }
-        let (Some(window), Some(grid)) =
-            (self.windows.visible().map(|state| state.id), self.requested)
-        else {
-            return;
-        };
-        // La fenêtre épinglée change (la visible n'est plus la même) : l'ancienne est libérée d'abord.
-        if self.pinned_window.is_some_and(|pinned| pinned != window) {
-            self.unpin();
-        }
-        let columns = u16::try_from(grid.columns).unwrap_or(u16::MAX).max(1);
-        let lines = u16::try_from(grid.lines).unwrap_or(u16::MAX).max(1);
-        let line = control_line(&pin_commands(&window_target(window), columns, lines));
-        if self.client.send(&line).is_ok() {
-            self.pinned_window = Some(window);
+        match (self.windows.visible(), self.requested) {
+            (Some(state), Some(grid)) => PinWant::Pin {
+                window: state.id.0,
+                columns: u16::try_from(grid.columns).unwrap_or(u16::MAX).max(1),
+                lines: u16::try_from(grid.lines).unwrap_or(u16::MAX).max(1),
+            },
+            _ => PinWant::Hold,
         }
     }
 
-    /// Retire l'épingle posée par cette vue, s'il y en a une. Un client mort ne peut rien écrire : l'épingle reste
-    /// (exception acceptée, spec §3.3) et la connexion suivante de la machine la retire.
-    fn unpin(&mut self) {
-        // Une épingle en attente de son délai ne doit pas se poser après.
-        self.pin_generation += 1;
-        let Some(window) = self.pinned_window.take() else {
-            return;
-        };
-        if self.link_down || self.client_exited {
+    /// Envoie ce que `SizePin` planifie, et ne note que les écritures réussies. Un lien tombé dont le client est vivant
+    /// n'empêche rien : l'écriture distante passe par la file d'un fil (`ClientWriter`), elle ne bloque pas. Un client
+    /// sorti ne reçoit rien et l'épingle reste due jusqu'à la reconnexion.
+    fn apply_pin(&mut self) {
+        if !self.remote {
             return;
         }
-        let _ = self
-            .client
-            .send(&control_line(&unpin_commands(&window_target(window))));
+        for action in self.pin.plan(self.pin_want(), !self.client_exited) {
+            if self.client.send(&action.line()).is_err() {
+                break;
+            }
+            self.pin.sent(&action);
+        }
     }
 
     /// Libère l'épingle avant que la vue ne parte : sortie propre d'IdemA, session retirée de la barre.
     pub fn release_size_pin(&mut self) {
-        self.unpin();
+        self.pin_generation += 1;
+        if !self.remote {
+            return;
+        }
+        for action in self.pin.plan(PinWant::Release, !self.client_exited) {
+            if self.client.send(&action.line()).is_err() {
+                break;
+            }
+            self.pin.sent(&action);
+        }
     }
 
     /// Le clavier est de nouveau du côté de la session, ou l'a quittée pour le volet Terminal : ses panes l'apprennent
@@ -1120,7 +1126,7 @@ impl SessionView {
                     let _ = view.client.send(&client_size_command(grid));
                     view.reapply_preset = true;
                     view.schedule_repair(window, cx);
-                    view.schedule_pin(window, cx);
+                    view.schedule_pin(cx);
                 }
             });
         })
@@ -1262,9 +1268,9 @@ impl SessionView {
         // La fenêtre visible n'est plus celle qui porte l'épingle (une fenêtre ouverte depuis Ghostty) : elle la reçoit.
         if self.remote
             && self.displayed
-            && self.windows.visible().map(|state| state.id) != self.pinned_window
+            && self.windows.visible().map(|state| state.id.0) != self.pin.pinned()
         {
-            self.schedule_pin(window, cx);
+            self.schedule_pin(cx);
         }
         self.sync_panes(window, cx);
         self.schedule_repair(window, cx);
@@ -1654,7 +1660,7 @@ impl SessionView {
     pub fn reconnect(
         &mut self,
         lease: Lease,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), ServerError> {
         let generation = self.client_generation + 1;
@@ -1688,9 +1694,10 @@ impl SessionView {
         self.exit_reason = None;
         self.client_exited = false;
         self.set_link_down(false, cx);
-        // Le nouveau client repose l'épingle : l'ancienne vit dans tmux, mais la taille a pu changer pendant la coupure.
-        self.pinned_window = None;
-        self.schedule_pin(window, cx);
+        // L'épingle posée vit dans tmux, et la vue la garde en mémoire : affichée, la fenêtre visible d'aujourd'hui la
+        // reçoit à la taille d'aujourd'hui (l'ancienne fenêtre est libérée si elle a changé) ; quittée pendant la coupure,
+        // elle est retirée maintenant que le client est vivant.
+        self.schedule_pin(cx);
         cx.notify();
         Ok(())
     }
@@ -1718,7 +1725,7 @@ impl EventEmitter<SessionEvent> for SessionView {}
 impl Drop for SessionView {
     /// Une session retirée de la barre rend sa taille à tmux avant que son client ne se détache.
     fn drop(&mut self) {
-        self.unpin();
+        self.release_size_pin();
     }
 }
 

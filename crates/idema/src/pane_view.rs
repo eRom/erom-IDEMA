@@ -1200,7 +1200,7 @@ impl PaneView {
     /// Faux, sans rien taper, quand un programme tourne. Une porte encore en attente est abandonnée : la commande
     /// ne partirait pas deux fois.
     pub fn launch_in_pane(&mut self, command: &str) -> bool {
-        if !self.at_prompt() {
+        if !launch_reaches_program(self.at_prompt(), self.link_down) {
             return false;
         }
         let held = self.launch.take().map(|mut pending| pending.held.take());
@@ -1218,7 +1218,7 @@ impl PaneView {
     /// `for>`), la commande serait avalée par la saisie ouverte. `⌃C` a tenu dans les cinq états sondés. La commande
     /// part ensuite par `launch_in_pane` : la porte de lancement en attente y est traitée une seule fois.
     pub fn reclaim_in_pane(&mut self, command: &str) -> bool {
-        if !self.at_prompt() {
+        if !launch_reaches_program(self.at_prompt(), self.link_down) {
             return false;
         }
         self.backend.send_bytes(b"\x03");
@@ -1339,6 +1339,10 @@ impl PaneView {
     /// Interroge la porte d'envoi : tape la commande quand le pane est prêt, l'abandonne passé le délai.
     /// La porte est retirée dans les deux cas : elle n'est plus interrogée ensuite.
     fn poll_launch(&mut self, now: Instant) {
+        // Rien ne part sur un lien tombé : la porte attend, elle n'est pas consommée.
+        if self.link_down {
+            return;
+        }
         let Some(pending) = &self.launch else {
             return;
         };
@@ -2530,6 +2534,12 @@ fn input_reaches_program(read_only: bool, link_down: bool) -> bool {
     !read_only && !link_down
 }
 
+/// Une commande tapée par IdemA (lancement d'un agent, reprise d'une session ramenée, avec son `^C`) part-elle ? Au prompt
+/// seulement, et jamais sur un lien tombé : comme la saisie, elle n'est ni retenue ni rejouée.
+fn launch_reaches_program(at_prompt: bool, link_down: bool) -> bool {
+    at_prompt && !link_down
+}
+
 /// Écrit ce que l'utilisateur a saisi (ou le rapport de focus) vers le programme du pane, si la vue le permet. Faux : rien
 /// n'est parti.
 fn write_user_input(
@@ -3245,6 +3255,15 @@ mod tests {
         }
         // Le PTY lâché raccroche le shell et sa commande.
         drop(backend);
+    }
+
+    /// Une commande d'IdemA (agent, reprise) suit la même règle que la saisie.
+    #[test]
+    fn a_command_typed_by_idema_needs_a_prompt_and_a_live_link() {
+        assert!(launch_reaches_program(true, false));
+        assert!(!launch_reaches_program(false, false));
+        assert!(!launch_reaches_program(true, true));
+        assert!(!launch_reaches_program(false, true));
     }
 
     /// La porte de la lecture seule et celle du lien tombé, sur un vrai PTY (`cat`, dont le terminal répète ce qu'on lui

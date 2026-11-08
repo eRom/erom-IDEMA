@@ -81,8 +81,8 @@ use crate::machines::key::{
 };
 use crate::machines::lifecycle::{
     RemoteAfterClose, RemoteMenuLine, after_remote_close, close_master, default_remote_agent,
-    idnma_run_command, is_wake_jump, link_stalled, remote_menu_lines, set_extended_keys,
-    settle_server,
+    idnma_run_command, is_wake_jump, link_stalled, list_pinned_windows, release_windows,
+    remote_menu_lines, set_extended_keys, windows_to_unpin,
 };
 use crate::machines::probe::{
     MachineFacts, RemoteFailure, ensure_control_dir, probe, probe_spec, retry_delay,
@@ -2887,18 +2887,19 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Une minuterie de `WAKE_TICK` compare l'horloge murale : un saut de plus de `tick + 10 s` est un réveil du Mac
-    /// (`is_wake_jump`), et toutes les machines se reconnectent tout de suite (spec ssh-tmux §3.2).
+    /// Une minuterie de `WAKE_TICK` compare l'horloge murale à l'horloge monotone : une murale en avance de plus de 10 s sur
+    /// la monotone (qui ne compte pas la veille) est un réveil du Mac (`is_wake_jump`), et toutes les machines se
+    /// reconnectent tout de suite (spec ssh-tmux §3.2). Une minuterie en retard fait avancer les deux horloges autant.
     fn start_wake_clock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self._wake_clock.is_some() {
             return;
         }
-        let mut last = SystemTime::now();
+        let mut last = (SystemTime::now(), Instant::now());
         self._wake_clock = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(WAKE_TICK).await;
-                let now = SystemTime::now();
-                let woke = is_wake_jump(last, now, WAKE_TICK);
+                let now = (SystemTime::now(), Instant::now());
+                let woke = is_wake_jump(last.0, now.0, now.1.saturating_duration_since(last.1));
                 last = now;
                 let alive = this.update_in(cx, |this, window, cx| {
                     if woke {
@@ -2943,6 +2944,9 @@ impl Workspace {
         machine.retry = None;
         machine.attempt = 0;
         machine.refresh_failures = 0;
+        machine.refreshing = false;
+        machine.refresh_again = false;
+        machine.refresh_started = None;
         if was_connected {
             self.set_machine_link(connection, true, cx);
         }
@@ -2979,14 +2983,6 @@ impl Workspace {
         let uid = unsafe { libc::geteuid() };
         // Le même dossier de contrôle que « Tester » des réglages : ils partagent le maître `%C-0`.
         let spec = probe_spec(connection, &self.dir, uid, |name| std::env::var(name).ok());
-        // La session de cette machine que cette instance affiche : son épingle de taille n'est pas périmée.
-        let displayed = match self.selected_name().map(route) {
-            Some(Route::Remote {
-                connection: shown,
-                tmux,
-            }) if shown == connection => Some(tmux),
-            _ => None,
-        };
         let work = cx.background_spawn(async move {
             ensure_control_dir(&spec.control_dir).map_err(|error| {
                 hud::log_event(&format!(
@@ -2996,16 +2992,17 @@ impl Workspace {
                 RemoteFailure::ControlDir
             })?;
             let facts = probe(&spec)?;
-            // Les deux options de serveur permises, et les épingles de taille qu'un IdemA tombé a laissées.
-            settle_server(
-                &TmuxServer::remote(RemoteSpec {
-                    home: facts.home.clone(),
-                    shell: facts.shell.clone(),
-                    ..spec.clone()
-                }),
-                displayed.as_deref(),
-            );
-            Ok((spec, facts))
+            // Les deux options de serveur permises, puis les fenêtres épinglées : celles qu'un IdemA tombé a laissées sont
+            // libérées par `release_stale_pins`, une fois la session affichée connue au moment où la sonde rend (et non
+            // à son départ : on a pu changer de session pendant).
+            let server = TmuxServer::remote(RemoteSpec {
+                home: facts.home.clone(),
+                shell: facts.shell.clone(),
+                ..spec.clone()
+            });
+            set_extended_keys(&server);
+            let pinned = list_pinned_windows(&server);
+            Ok((spec, facts, pinned))
         });
         let connection = connection.to_owned();
         cx.spawn_in(window, async move |this, cx| {
@@ -3021,7 +3018,7 @@ impl Workspace {
     fn on_probed(
         &mut self,
         connection: &str,
-        outcome: Result<(RemoteSpec, MachineFacts), RemoteFailure>,
+        outcome: Result<(RemoteSpec, MachineFacts, String), RemoteFailure>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3031,7 +3028,7 @@ impl Workspace {
         let machine = &mut self.machines[index];
         machine.probing = false;
         match outcome {
-            Ok((spec, facts)) => {
+            Ok((spec, facts, pinned)) => {
                 match machine.pool.as_mut() {
                     Some(pool) => pool.update_facts(facts.home.clone(), facts.shell.clone()),
                     None => {
@@ -3049,6 +3046,7 @@ impl Workspace {
                 machine.refresh_failures = 0;
                 machine.retry = None;
                 hud::log_event(&format!("machine connected machine={connection}"));
+                self.release_stale_pins(connection, &pinned, cx);
                 self.start_machine_poll(connection, window, cx);
                 self.refresh_machine(connection, window, cx);
                 self.resume_machine_views(connection, window, cx);
@@ -3078,6 +3076,46 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    /// Libère les épingles de taille que la machine porte et qu'aucune vue d'IdemA ne tient : celles d'un IdemA tombé.
+    /// Seule est épargnée la fenêtre visible de la session que cette instance affiche à cet instant (la vue la repose à la
+    /// reconnexion) ; une autre fenêtre épinglée de la même session est périmée.
+    fn release_stale_pins(&mut self, connection: &str, listing: &str, cx: &mut Context<Self>) {
+        let spared = match self.selected_name().map(route) {
+            Some(Route::Remote {
+                connection: shown,
+                tmux,
+            }) if shown == connection => self
+                .selected_view()
+                .and_then(|view| view.read(cx).visible_window())
+                .map(|window| (tmux, window)),
+            _ => None,
+        };
+        let stale = windows_to_unpin(
+            listing,
+            spared
+                .as_ref()
+                .map(|(session, window)| (session.as_str(), *window)),
+        );
+        if stale.is_empty() {
+            return;
+        }
+        let Some(index) = self.machine_index(connection) else {
+            return;
+        };
+        let machine = &self.machines[index];
+        let Some(server) = machine.pool.as_ref().map(SlotPool::brief) else {
+            return;
+        };
+        let turn = Arc::clone(&machine.adhoc);
+        cx.background_spawn(async move {
+            let _held = turn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            release_windows(&server, &stale);
+        })
+        .detach();
     }
 
     /// La relecture toutes les `REMOTE_POLL` d'une machine, tant qu'elle est connectée (`refresh_machine` ne fait rien
@@ -3219,6 +3257,10 @@ impl Workspace {
         machine.status = MachineStatus::Connecting;
         machine.poll = None;
         machine.refresh_failures = 0;
+        // Une relecture partie avant la perte ne rendra peut-être jamais : la reconnexion en lance une neuve.
+        machine.refreshing = false;
+        machine.refresh_again = false;
+        machine.refresh_started = None;
         // Plus rien n'arrive à la machine : un client ssh peut rester vivant 30 s après une vraie coupure, la saisie ne doit
         // pas s'y accumuler (`SessionView::set_link_down`).
         self.set_machine_link(connection, true, cx);
@@ -6481,7 +6523,12 @@ impl Workspace {
         let mut entries = Vec::new();
         for line in remote_menu_lines(agents.as_deref(), default_key.as_deref()) {
             entries.push(match line {
-                RemoteMenuLine::Agent { key, text, default } => {
+                RemoteMenuLine::Agent {
+                    key,
+                    text,
+                    default,
+                    runnable,
+                } => {
                     let agent = agents
                         .as_deref()
                         .and_then(|agents| agents.iter().find(|agent| agent.key == key))
@@ -6492,7 +6539,8 @@ impl Workspace {
                         this.new_remote_session(&target, agent.clone(), window, cx);
                     })
                     .logo(logo)
-                    .checked(default);
+                    .checked(default)
+                    .enabled(runnable);
                     if default {
                         item = item.shortcut("⌘T");
                     }
