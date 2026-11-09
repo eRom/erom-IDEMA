@@ -770,3 +770,123 @@ describe('leaving the page', () => {
     expect(mock.disk.text).toBe('ab');
   });
 });
+
+describe('retry after a failed write (connection stays ok)', () => {
+  test('a PUT that failed offline is retried after 5 s, 15 s, then every 60 s, until it succeeds', async () => {
+    const mock = fakeMac('old', 5);
+    let failures = 4;
+    const h = harness({
+      handler: (method, path, body) => {
+        if (method === 'PUT' && failures-- > 0) return OFFLINE;
+        return mock.handler(method, path, body);
+      },
+    });
+    await h.sync.load();
+    h.sync.edit('new');
+    await h.advance(SAVE_DELAY_MS);
+    expect(h.puts().length).toBe(1);
+    await h.advance(4_999);
+    expect(h.puts().length).toBe(1);
+    await h.advance(1);
+    expect(h.puts().length).toBe(2);
+    await h.advance(14_999);
+    expect(h.puts().length).toBe(2);
+    await h.advance(1);
+    expect(h.puts().length).toBe(3);
+    await h.advance(59_999);
+    expect(h.puts().length).toBe(3);
+    await h.advance(1);
+    expect(h.puts().length).toBe(4);
+    await h.advance(60_000);
+    expect(h.puts().length).toBe(5);
+    expect(h.sync.snapshot()).toMatchObject({ state: 'saved', text: 'new' });
+    expect(mock.disk.text).toBe('new');
+    await h.advance(120_000);
+    expect(h.puts().length).toBe(5);
+    expect(h.maxInFlight()).toBe(1);
+  });
+
+  test('a timed-out PUT is retried too, and a disposed engine retries nothing', async () => {
+    const h = harness({ handler: (method) => (method === 'GET' ? mac('old', 5) : TIMEOUT) });
+    await h.sync.load();
+    h.sync.edit('new');
+    await h.advance(SAVE_DELAY_MS);
+    await h.advance(5_000);
+    expect(h.puts().length).toBe(2);
+    h.sync.dispose();
+    await h.advance(120_000);
+    expect(h.puts().length).toBe(2);
+  });
+
+  test('a refused PUT is never retried on its own', async () => {
+    const h = harness({ handler: (method) => (method === 'GET' ? mac('old', 5) : http(500, 'scratchpad_unwritable')) });
+    await h.sync.load();
+    h.sync.edit('a');
+    await h.advance(SAVE_DELAY_MS);
+    await h.advance(120_000);
+    expect(h.puts().length).toBe(1);
+  });
+});
+
+describe('unexpected failures', () => {
+  test('a request that throws surfaces as a refusal with a French reason, and the queue keeps working', async () => {
+    const mock = fakeMac('old', 5);
+    let boom = true;
+    const h = harness({
+      handler: (method, path, body) => {
+        if (method === 'PUT' && boom) throw new Error('network layer exploded');
+        return mock.handler(method, path, body);
+      },
+    });
+    await h.sync.load();
+    h.sync.edit('a');
+    await h.advance(SAVE_DELAY_MS);
+    expect(h.sync.snapshot()).toMatchObject({ state: 'refused', reason: "erreur inattendue dans l'application" });
+    boom = false;
+    h.sync.edit('ab');
+    await h.advance(SAVE_DELAY_MS);
+    expect(h.sync.snapshot()).toMatchObject({ state: 'saved', text: 'ab' });
+    expect(mock.disk.text).toBe('ab');
+  });
+
+  test('a 200 without body on load does not break the queue: cache when there is one, locked otherwise', async () => {
+    const bare = harness({ handler: () => ok(null) });
+    await bare.sync.load();
+    expect(bare.sync.snapshot().state).toBe('locked');
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ text: 'c', modified_at: 1 }));
+    const cached = harness({ handler: () => ok(undefined) });
+    await cached.sync.load();
+    expect(cached.sync.snapshot()).toMatchObject({ state: 'offline', text: 'c' });
+  });
+
+  test('a 200 without body while reconciling a 409 is a failed read, not a crash', async () => {
+    let gets = 0;
+    const h = harness({ handler: (method) => (method === 'GET' ? (gets++ === 0 ? mac('old', 5) : ok(null)) : http(409, 'note_changed')) });
+    await h.sync.load();
+    h.sync.edit('a');
+    await h.advance(SAVE_DELAY_MS);
+    expect(h.sync.snapshot().state).toBe('offline');
+  });
+});
+
+describe('GET timeout', () => {
+  test('every scratchpad read carries the same timeout as the write', async () => {
+    const mock = fakeMac('old', 5);
+    let first = true;
+    const h = harness({
+      handler: (method, path, body) => {
+        if (method === 'PUT' && first) return ((first = false), http(409, 'note_changed'));
+        return mock.handler(method, path, body);
+      },
+    });
+    await h.sync.load(); // lecture du chargement
+    mock.disk.text = 'other';
+    mock.disk.modifiedAt = 9;
+    h.sync.edit('mine');
+    await h.advance(SAVE_DELAY_MS); // 409 puis lecture de réconciliation
+    expect(h.sync.snapshot().state).toBe('conflict');
+    await h.sync.takeMac(); // lecture de reprise
+    expect(h.gets().length).toBe(3);
+    expect(h.gets().map((c) => c.timeoutMs)).toEqual([PUT_TIMEOUT_MS, PUT_TIMEOUT_MS, PUT_TIMEOUT_MS]);
+  });
+});
