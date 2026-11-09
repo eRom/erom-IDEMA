@@ -321,9 +321,11 @@ pub fn request(
         Some(body) => head.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len())),
         None => head.push_str("\r\n"),
     }
-    stream.write_all(head.as_bytes()).unwrap();
+    // Le serveur peut répondre (413) et fermer avant d'avoir lu tout le corps : une écriture ou une fin de lecture
+    // refusée par le système n'est pas un échec tant que la réponse est arrivée.
+    let _ = stream.write_all(head.as_bytes());
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).unwrap();
+    let _ = stream.read_to_end(&mut raw);
     let split = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")

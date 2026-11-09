@@ -215,7 +215,9 @@ pub fn replace_text(
         return Err(ReplaceError::TooLarge);
     }
     toml_write::write_atomically(&target, &rewritten).map_err(io_error)?;
-    Ok(modified_millis(&target).unwrap_or_default())
+    // Une date illisible n'est pas un succès : le téléphone la stockerait en `base` (0) et verrait un faux conflit.
+    modified_millis(&target)
+        .ok_or_else(|| ReplaceError::Io("the note date is unreadable after the write".into()))
 }
 
 #[cfg(test)]

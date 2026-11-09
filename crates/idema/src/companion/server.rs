@@ -28,7 +28,7 @@ use super::fleet::Fleet;
 use super::input::{self, HTTP_WAIT};
 use super::notify::Message;
 use super::push_send::{Delivery, PushSender, endpoint_allowed};
-use super::scratchpad::{self, AppendError};
+use super::scratchpad::{self, AppendError, ReplaceError};
 use super::screen::{self, CaptureError};
 use super::sse::{self, COALESCE};
 use super::timeline::Timeline;
@@ -44,6 +44,8 @@ const KEEP_ALIVE: Duration = Duration::from_secs(20);
 
 /// Un corps de requête dépasse-t-il cette taille, il est refusé (413) : aucune route n'attend davantage.
 const BODY_LIMIT: usize = 64 * 1024;
+/// La borne du corps de `PUT scratchpad` : la note (5 Mo au plus) plus l'échappement JSON de son texte.
+const SCRATCHPAD_BODY_LIMIT: usize = 6 * 1024 * 1024;
 
 const API_PREFIX: &str = "/idema-api/";
 const HEALTH_PATH: &str = "/idema-api/health";
@@ -103,7 +105,12 @@ pub fn router(state: AppState) -> Router {
         .route("/idema-api/sessions/{name}/panes/{pane}/input", post(input))
         .route("/idema-api/sessions/{name}/panes/{pane}/ack", post(ack))
         .route("/idema-api/presence", put(presence))
-        .route("/idema-api/scratchpad", get(scratchpad_read))
+        .route(
+            "/idema-api/scratchpad",
+            get(scratchpad_read)
+                .put(scratchpad_replace)
+                .layer(DefaultBodyLimit::max(SCRATCHPAD_BODY_LIMIT)),
+        )
         .route("/idema-api/scratchpad/append", post(scratchpad_append))
         .route("/idema-api/client-metrics", post(client_metrics))
         .route("/idema-api/push/key", get(push_key))
@@ -723,19 +730,21 @@ async fn client_metrics(body: Bytes) -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `GET scratchpad` : la note en texte, avec sa date de modification (millisecondes Unix, `null` tant qu'elle n'existe
-/// pas). Lecture sur un fil bloquant : la note peut être un lien vers un disque lent.
+/// `GET scratchpad` : la note en texte, sa date de modification (millisecondes Unix, `null` tant qu'elle n'existe pas)
+/// et `editable` (faux si la note n'est pas de l'UTF-8 : le téléphone ne la réécrit pas). Lecture sur un fil
+/// bloquant : la note peut être un lien vers un disque lent.
 async fn scratchpad_read(State(state): State<AppState>) -> Response {
     let path = state.scratchpad.clone();
     let read = tokio::task::spawn_blocking(move || {
         let modified_at = scratchpad::modified_millis(&path);
-        scratchpad::read_note(&path).map(|(text, _editable)| (text, modified_at))
+        scratchpad::read_note(&path).map(|(text, editable)| (text, editable, modified_at))
     })
     .await;
     match read {
-        Ok(Ok((text, modified_at))) => json_reply(
+        Ok(Ok((text, editable, modified_at))) => json_reply(
             StatusCode::OK,
-            serde_json::json!({ "text": text, "modified_at": modified_at }).to_string(),
+            serde_json::json!({ "text": text, "modified_at": modified_at, "editable": editable })
+                .to_string(),
         ),
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::FileTooLarge => {
             error_reply(StatusCode::PAYLOAD_TOO_LARGE, "scratchpad_too_large")
@@ -768,6 +777,48 @@ async fn scratchpad_append(State(state): State<AppState>, body: Bytes) -> Respon
             error_reply(StatusCode::INTERNAL_SERVER_ERROR, failure.error_code())
         }
         Ok(Err(refused)) => error_reply(StatusCode::BAD_REQUEST, refused.error_code()),
+        Err(_) => error_reply(StatusCode::INTERNAL_SERVER_ERROR, "scratchpad_unwritable"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaceBody {
+    text: String,
+    base: Option<u64>,
+    #[serde(default)]
+    force: bool,
+}
+
+/// `PUT scratchpad` : remplace toute la note par `{"text": ...}`. `base` est la date lue au dernier `GET` : si la note a
+/// changé depuis (sauf `force`), 409 avec la date actuelle et rien n'est écrit. Le texte de la note n'est jamais
+/// journalisé.
+async fn scratchpad_replace(State(state): State<AppState>, body: Bytes) -> Response {
+    let Ok(ReplaceBody { text, base, force }) = serde_json::from_slice(&body) else {
+        return error_reply(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    let path = state.scratchpad.clone();
+    let replaced =
+        tokio::task::spawn_blocking(move || scratchpad::replace_text(&path, &text, base, force))
+            .await;
+    match replaced {
+        Ok(Ok(modified_at)) => json_reply(
+            StatusCode::OK,
+            serde_json::json!({ "ok": true, "modified_at": modified_at }).to_string(),
+        ),
+        Ok(Err(ReplaceError::Changed { modified_at })) => json_reply(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "error": "note_changed", "modified_at": modified_at }).to_string(),
+        ),
+        Ok(Err(failure @ ReplaceError::Nul)) => {
+            error_reply(StatusCode::BAD_REQUEST, failure.error_code())
+        }
+        Ok(Err(failure @ ReplaceError::TooLarge)) => {
+            error_reply(StatusCode::PAYLOAD_TOO_LARGE, failure.error_code())
+        }
+        Ok(Err(failure @ ReplaceError::Io(_))) => {
+            error_reply(StatusCode::INTERNAL_SERVER_ERROR, failure.error_code())
+        }
         Err(_) => error_reply(StatusCode::INTERNAL_SERVER_ERROR, "scratchpad_unwritable"),
     }
 }
@@ -2861,6 +2912,7 @@ mod tests {
         assert_hardened(&read, "scratchpad");
         assert_eq!(read.json()["text"], "from the Mac\r\nfrom the phone é\r\n");
         assert!(read.json()["modified_at"].as_u64().unwrap() > 0);
+        assert_eq!(read.json()["editable"], true);
     }
 
     #[test]
@@ -2919,6 +2971,166 @@ mod tests {
             assert_hardened(reply, "refused scratchpad write");
         }
         assert_eq!(std::fs::read_to_string(&note).unwrap(), "kept\n");
+    }
+
+    fn replace(service: &Harness, cookie: &str, body: &str) -> Reply {
+        service.request("PUT", SCRATCHPAD, &[JSON, ("Cookie", cookie)], Some(body))
+    }
+
+    fn note_date(service: &Harness, cookie: &str) -> u64 {
+        let read = service.request("GET", SCRATCHPAD, &[("Cookie", cookie)], None);
+        assert_eq!(read.status, 200, "{}", read.text());
+        read.json()["modified_at"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn the_scratchpad_put_replaces_the_note_and_returns_its_new_date() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+        std::fs::write(&note, "old\n").unwrap();
+        let base = note_date(&service, &phone);
+
+        let body = serde_json::json!({ "text": "a\nb\n", "base": base }).to_string();
+        let reply = replace(&service, &phone, &body);
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        assert_eq!(reply.header("content-type"), Some("application/json"));
+        assert_hardened(&reply, "scratchpad replace");
+        assert_eq!(reply.json()["ok"], true);
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "a\nb\n");
+        assert_eq!(
+            reply.json()["modified_at"].as_u64().unwrap(),
+            note_date(&service, &phone)
+        );
+    }
+
+    #[test]
+    fn the_scratchpad_put_refuses_a_stale_base_with_409_and_writes_nothing() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+        std::fs::write(&note, "mac\n").unwrap();
+        let date = note_date(&service, &phone);
+
+        let stale = serde_json::json!({ "text": "phone\n", "base": date - 1000 }).to_string();
+        let refused = replace(&service, &phone, &stale);
+        assert_eq!(refused.status, 409, "{}", refused.text());
+        assert_eq!(refused.json()["error"], "note_changed");
+        assert_eq!(refused.json()["modified_at"].as_u64(), Some(date));
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "mac\n");
+
+        let forced = serde_json::json!({ "text": "phone\n", "base": date - 1000, "force": true })
+            .to_string();
+        let accepted = replace(&service, &phone, &forced);
+        assert_eq!(accepted.status, 200, "{}", accepted.text());
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "phone\n");
+    }
+
+    #[test]
+    fn the_scratchpad_put_accepts_a_note_bigger_than_the_default_body_limit() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+
+        let big = serde_json::json!({ "text": "x".repeat(1024 * 1024), "base": null }).to_string();
+        let accepted = replace(&service, &phone, &big);
+        assert_eq!(accepted.status, 200, "{}", accepted.text());
+        assert_eq!(std::fs::metadata(&note).unwrap().len(), 1024 * 1024);
+
+        // Un corps qui dépasse la borne de 6 Mo de quelques octets seulement : refusé sans toucher la note.
+        let huge =
+            serde_json::json!({ "text": "x".repeat(6 * 1024 * 1024), "base": null }).to_string();
+        let refused = replace(&service, &phone, &huge);
+        assert_eq!(refused.status, 413, "{}", refused.text());
+        assert_eq!(std::fs::metadata(&note).unwrap().len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn the_scratchpad_put_refuses_a_note_over_the_editor_limit_with_413() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+        std::fs::write(&note, "kept\n").unwrap();
+        let date = note_date(&service, &phone);
+
+        // Sous la borne du corps (6 Mo) mais au-dessus de celle de la note (5 Mo).
+        let body = serde_json::json!({ "text": "x".repeat(5 * 1024 * 1024 + 1), "base": date })
+            .to_string();
+        let refused = replace(&service, &phone, &body);
+        assert_eq!(refused.status, 413, "{}", refused.text());
+        assert_eq!(refused.json()["error"], "scratchpad_too_large");
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "kept\n");
+    }
+
+    #[test]
+    fn the_scratchpad_put_refuses_nul_and_unwritable_notes() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+        std::fs::write(&note, "kept\n").unwrap();
+        let date = note_date(&service, &phone);
+
+        let nul = serde_json::json!({ "text": "a\u{0}b", "base": date }).to_string();
+        let refused = replace(&service, &phone, &nul);
+        assert_eq!(refused.status, 400, "{}", refused.text());
+        assert_eq!(refused.json()["error"], "control_char");
+
+        std::fs::set_permissions(&note, std::os::unix::fs::PermissionsExt::from_mode(0o444))
+            .unwrap();
+        let body = serde_json::json!({ "text": "new", "base": date }).to_string();
+        let refused = replace(&service, &phone, &body);
+        assert_eq!(refused.status, 500, "{}", refused.text());
+        assert_eq!(refused.json()["error"], "scratchpad_unwritable");
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "kept\n");
+    }
+
+    #[test]
+    fn the_scratchpad_put_sits_behind_the_guard() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+        std::fs::write(&note, "kept\n").unwrap();
+        let body = r#"{"text":"intruder","base":null}"#;
+
+        let unpaired = service.request("PUT", SCRATCHPAD, &[JSON], Some(body));
+        assert_eq!(unpaired.status, 401);
+        let text_plain = service.request(
+            "PUT",
+            SCRATCHPAD,
+            &[("Content-Type", "text/plain"), ("Cookie", &phone)],
+            Some(body),
+        );
+        assert_eq!(text_plain.status, 415);
+        let foreign = service.request(
+            "PUT",
+            SCRATCHPAD,
+            &[JSON, ("Cookie", &phone), ("Origin", "https://evil.example")],
+            Some(body),
+        );
+        assert_eq!(foreign.status, 403);
+        let unknown = replace(&service, &phone, r#"{"text":"x","base":null,"extra":1}"#);
+        assert_eq!(unknown.status, 400);
+        assert_eq!(unknown.json()["error"], "bad_request");
+        for reply in [&unpaired, &text_plain, &foreign, &unknown] {
+            assert_hardened(reply, "refused scratchpad replace");
+        }
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "kept\n");
+    }
+
+    #[test]
+    fn the_scratchpad_read_says_whether_the_note_is_editable() {
+        let service = Harness::start(true);
+        let phone = service.pair(IPHONE);
+        let note = service.home.0.join("scratchpad.md");
+
+        std::fs::write(&note, b"\xff").unwrap();
+        let binary = service.request("GET", SCRATCHPAD, &[("Cookie", &phone)], None);
+        assert_eq!(binary.status, 200, "{}", binary.text());
+        assert_eq!(binary.json()["editable"], false);
+
+        std::fs::write(&note, "text\n").unwrap();
+        let text = service.request("GET", SCRATCHPAD, &[("Cookie", &phone)], None);
+        assert_eq!(text.json()["editable"], true);
     }
 
     #[test]
