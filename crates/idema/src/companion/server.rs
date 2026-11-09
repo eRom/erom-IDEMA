@@ -729,7 +729,7 @@ async fn scratchpad_read(State(state): State<AppState>) -> Response {
     let path = state.scratchpad.clone();
     let read = tokio::task::spawn_blocking(move || {
         let modified_at = scratchpad::modified_millis(&path);
-        scratchpad::read(&path).map(|text| (text, modified_at))
+        scratchpad::read_note(&path).map(|(text, _editable)| (text, modified_at))
     })
     .await;
     match read {
