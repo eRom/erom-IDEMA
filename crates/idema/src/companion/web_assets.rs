@@ -102,6 +102,11 @@ const FILES: &[(&str, &[u8], &str)] = &[
         JS,
     ),
     (
+        "/js/notes-sync.js",
+        include_bytes!("../../companion-web/js/notes-sync.js"),
+        JS,
+    ),
+    (
         "/js/notes.js",
         include_bytes!("../../companion-web/js/notes.js"),
         JS,
@@ -444,7 +449,9 @@ mod tests {
 
     /// Le plafond de la page (rulings R21-R22) : la somme des tailles gzip, fichier par fichier, des fichiers de texte
     /// de l'app, soit les octets que le Mac envoie. Lancer avec `-- --nocapture` pour lire la somme.
-    const GZIP_CEILING: usize = 49_152;
+    /// Relevé à 52 Kio (53 248 octets) pour l'éditeur de notes : la marge n'était plus que de 491 octets (spec
+    /// docs/superpowers/specs/2026-11-09-idema-notes-editeur-design.md, amendement A1).
+    const GZIP_CEILING: usize = 53_248;
 
     #[test]
     fn the_gzipped_app_stays_under_the_ceiling() {

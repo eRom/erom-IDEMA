@@ -27,6 +27,7 @@ const APP_FILES = [
   '/js/icons.js',
   '/js/install.js',
   '/js/main.js',
+  '/js/notes-sync.js',
   '/js/notes.js',
   '/js/notify.js',
   '/js/offline.js',
