@@ -96,7 +96,7 @@ describe('every write of the page carries a JSON body', () => {
     const area = /** @type {HTMLTextAreaElement} */ (root.querySelector('textarea'));
     area.value = 'une ligne';
     area.dispatchEvent(new Event('input', { bubbles: true }));
-    /** @type {HTMLElement} */ (root.querySelector('.notes__done')).click();
+    area.dispatchEvent(new Event('blur')); // la perte du focus enregistre tout de suite
     await flush();
     unmount?.();
     expect(writes().map((call) => `${call.method} ${call.path}`)).toEqual(['PUT /idema-api/scratchpad']);

@@ -64,7 +64,6 @@ describe('mountNotes', () => {
   const status = () => root.querySelector('.notes__status')?.textContent;
   const keys = () => [...root.querySelectorAll('.notes__key')].map((k) => /** @type {HTMLButtonElement} */ (k));
   const key = (/** @type {string} */ label) => /** @type {HTMLButtonElement} */ (keys().find((k) => k.textContent === label));
-  const done = () => /** @type {HTMLButtonElement} */ (root.querySelector('.notes__done'));
   /** @param {string} value */
   function type(value) {
     area().value = value;
@@ -189,21 +188,35 @@ describe('mountNotes', () => {
       key('#').dispatchEvent(event);
       expect(event.defaultPrevented).toBe(true);
     }
-    const tap = new Event('pointerdown', { bubbles: true, cancelable: true });
-    done().dispatchEvent(tap);
-    expect(tap.defaultPrevented).toBe(true);
   });
 
-  test('the toolbar and the check button show only while the textarea has the focus', async () => {
+  test('the toolbar shows only while the textarea has the focus, and there is no check button', async () => {
     mount(() => mac('x'));
     await flush();
     expect(root.querySelector('.notes__bar')?.hasAttribute('hidden')).toBe(true);
-    expect(done().hasAttribute('hidden')).toBe(true);
     focus();
     expect(root.querySelector('.notes__bar')?.hasAttribute('hidden')).toBe(false);
-    expect(done().hasAttribute('hidden')).toBe(false);
     area().dispatchEvent(new Event('blur'));
     expect(root.querySelector('.notes__bar')?.hasAttribute('hidden')).toBe(true);
+    // Le ✓ du clavier iOS suffit : aucun bouton rond dans la note.
+    expect(root.querySelector('.notes__done')).toBeNull();
+    expect([...root.querySelectorAll('button')].some((b) => b.textContent === '✓')).toBe(false);
+    expect(root.querySelector('.notes__side')?.children.length).toBe(1);
+  });
+
+  test('focus freezes the page scroll on the document element, blur and unmount release it', async () => {
+    const { unmount } = mount(() => mac('x'));
+    await flush();
+    const html = document.documentElement;
+    expect(html.classList.contains('notes-editing')).toBe(false);
+    focus();
+    expect(html.classList.contains('notes-editing')).toBe(true);
+    area().dispatchEvent(new Event('blur'));
+    expect(html.classList.contains('notes-editing')).toBe(false);
+    focus();
+    expect(html.classList.contains('notes-editing')).toBe(true);
+    unmount();
+    expect(html.classList.contains('notes-editing')).toBe(false);
   });
 
   test('the conflict banner offers both choices', async () => {
@@ -242,20 +255,25 @@ describe('mountNotes', () => {
     expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
   });
 
-  test('the check button blurs the textarea and saves now', async () => {
+  test('losing the focus saves what is pending now, without keepalive', async () => {
     const { calls } = mount(() => mac('x'));
     await flush();
     focus();
     type('xy');
-    let blurred = 0;
-    area().addEventListener('blur', () => blurred++);
-    const origBlur = area().blur.bind(area());
-    area().blur = () => (origBlur(), area().dispatchEvent(new Event('blur')));
-    done().click();
+    expect(calls.filter((c) => c.method === 'PUT')).toEqual([]); // le délai de sauvegarde n'est pas écoulé
+    area().dispatchEvent(new Event('blur'));
     await flush();
-    expect(blurred).toBeGreaterThan(0);
-    expect(calls.filter((c) => c.method === 'PUT').map((c) => c.body.text)).toEqual(['xy']);
+    expect(calls.filter((c) => c.method === 'PUT').map((c) => [c.body.text, c.keepalive])).toEqual([['xy', false]]);
     expect(root.querySelector('.notes__bar')?.hasAttribute('hidden')).toBe(true);
+  });
+
+  test('losing the focus with nothing pending sends nothing', async () => {
+    const { calls } = mount(() => mac('x'));
+    await flush();
+    focus();
+    area().dispatchEvent(new Event('blur'));
+    await flush();
+    expect(calls.filter((c) => c.method === 'PUT')).toEqual([]);
   });
 
   test('hiding the page flushes with keepalive', async () => {
@@ -364,18 +382,17 @@ describe('mountNotes', () => {
     expect(root.querySelector('.notes__banner')?.textContent).toBe('');
   });
 
-  test('the bar and the check button go away when the note turns read-only while focused', async () => {
+  test('the bar goes away when the note turns read-only while focused', async () => {
     let editable = true;
     mount(() => mac('x', 5, editable));
     await flush();
     focus();
-    expect(done().hasAttribute('hidden')).toBe(false);
+    expect(root.querySelector('.notes__bar')?.hasAttribute('hidden')).toBe(false);
     editable = false;
     dispatchEvent(new Event('idema:resume'));
     await flush();
     expect(area().readOnly).toBe(true);
     expect(root.querySelector('.notes__bar')?.hasAttribute('hidden')).toBe(true);
-    expect(done().hasAttribute('hidden')).toBe(true);
   });
 
   test('a locked note shows its banner without an empty editor card, and the editor comes back with the Mac', async () => {

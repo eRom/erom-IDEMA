@@ -82,13 +82,14 @@ p { margin: 0; }
 .notes__status { color: var(--text-3); font-size: 13px; text-align: right; }
 .notes__status--warn { color: var(--modified); }
 .notes__status--error { color: var(--error); }
-.notes__done { flex: none; width: 36px; height: 36px; border: 0; border-radius: 50%; background: var(--accent); color: #fff; font: 600 17px/1 var(--font); }
 .notes__banner { margin-bottom: 8px; padding: 10px 12px; border-radius: var(--radius-card); background: var(--card); color: var(--modified); font-size: 15px; }
 .notes__choices { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .notes__text { flex: 1; min-height: 0; width: 100%; padding: 12px 16px; border: 0; border-radius: var(--radius-card); background: var(--card); color: var(--text); font: 400 16px/1.45 var(--mono); resize: none; }
 .notes__text:focus { outline: none; box-shadow: inset 0 0 0 1.5px var(--accent); }
 /* Pendant la saisie, la note prend la fenêtre visible (au-dessus du clavier et de la capsule) : --vv-top et --vv-h sont posées par notes.js. */
 .notes--typing { position: fixed; top: calc(var(--vv-top, 0px) + var(--safe-top)); left: 0; right: 0; z-index: 4; height: calc(var(--vv-h, 100%) - var(--safe-top)); background: var(--bg); }
+/* Pendant la saisie, la page ne défile plus sous la note fixe (posé par notes.js). */
+.notes-editing, .notes-editing body { overflow: hidden; overscroll-behavior: none; }
 /* La capsule colle au clavier : --kb est la hauteur que le clavier prend dans la fenêtre (posée par notes.js). */
 .notes__bar { position: fixed; left: 8px; right: 8px; bottom: calc(var(--kb, 0px) + 8px); z-index: 5; display: flex; gap: 4px; padding: 4px; border: 1px solid var(--separator); border-radius: var(--radius-card); background: var(--card); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); }
 .notes__key { display: flex; flex: 1; align-items: center; justify-content: center; height: var(--target); padding: 0; border: 0; border-radius: var(--radius-control); background: none; color: var(--text); font: 600 18px/1 var(--mono); }

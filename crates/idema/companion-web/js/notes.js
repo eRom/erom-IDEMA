@@ -21,18 +21,17 @@ const KEYS = /** @type {const} */ ([
 /** @type {import('./router.js').View} */
 export function mountNotes(root, { store, request, timers = realTimers }) {
   const status = el('p', { class: 'notes__status', role: 'status' });
-  const done = el('button', { class: 'notes__done', type: 'button', 'aria-label': 'Terminer', hidden: true, onclick: finish }, '✓');
   const banner = el('div', { class: 'notes__banner', role: 'status', hidden: true });
   const area = el('textarea', { class: 'notes__text', 'aria-label': 'Note', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', autocomplete: 'off', oninput: onInput, onfocus: () => focusChanged(true), onblur: () => focusChanged(false) });
   const bar = el('div', { class: 'notes__bar', hidden: true }, KEYS.map(([label, name, transform, shape]) => el('button', { class: shape ? `notes__key notes__key--${shape}` : 'notes__key', type: 'button', 'aria-label': name, onclick: () => apply(transform) }, label)));
   // La touche ne doit pas voler le focus : sans cela le clavier se ferme au toucher.
-  for (const control of [done, ...bar.children]) for (const type of ['pointerdown', 'mousedown']) control.addEventListener(type, (e) => e.preventDefault());
-  const section = el('section', { class: 'notes' }, el('div', { class: 'notes__top' }, el('h1', null, 'Notes'), el('div', { class: 'notes__side' }, status, done)), banner, area, bar);
+  for (const control of bar.children) for (const type of ['pointerdown', 'mousedown']) control.addEventListener(type, (e) => e.preventDefault());
+  const section = el('section', { class: 'notes' }, el('div', { class: 'notes__top' }, el('h1', null, 'Notes'), el('div', { class: 'notes__side' }, status)), banner, area, bar);
   root.replaceChildren(section);
 
   /** Le contenu du bandeau affiché (son état et sa raison). */
   let shownBanner = '';
-  /** La textarea a le focus (barre et ✓ visibles tant que la note est éditable). */
+  /** La textarea a le focus (barre visible tant que la note est éditable). */
   let focused = false;
   const sync = createNotesSync({ request, timers, storage: safeLocalStorage(), store, onChange: render });
 
@@ -79,14 +78,14 @@ export function mountNotes(root, { store, request, timers = realTimers }) {
     sync.edit(area.value);
   }
 
-  // Barre et ✓ pendant l'édition ; la barre se colle au clavier par la fenêtre visible.
+  // La barre pendant l'édition ; la barre se colle au clavier par la fenêtre visible.
   const viewport = window.visualViewport;
   function placeBar() {
     const gap = viewport ? Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop) : 0;
     bar.style.setProperty('--kb', `${gap}px`);
     fit();
   }
-  /** Pendant la saisie, la note tient dans la fenêtre visible, au-dessus du clavier et de la capsule : sinon la dernière ligne tapée et le ✓ restent cachés. */
+  /** Pendant la saisie, la note tient dans la fenêtre visible, au-dessus du clavier et de la capsule : sinon la dernière ligne tapée reste cachée. */
   function fit() {
     if (viewport && !bar.hidden) {
       section.classList.add('notes--typing');
@@ -101,22 +100,28 @@ export function mountNotes(root, { store, request, timers = realTimers }) {
   /** @param {boolean} on */
   function showBar(on) {
     on &&= !area.readOnly;
-    bar.hidden = done.hidden = !on;
+    bar.hidden = !on;
     area.style.paddingBottom = on && !viewport ? `${bar.offsetHeight + 16}px` : ''; // avec la fenêtre visible, la note s'arrête au-dessus de la capsule
     placeBar();
   }
   /** @param {boolean} on */
   function focusChanged(on) {
     focused = on;
+    // Pendant la saisie, la page ne défile plus : iOS la fait glisser en ouvrant le clavier, et la capsule fixe se décale.
+    document.documentElement.classList.toggle('notes-editing', on);
     showBar(on);
+    if (on) follow(performance.now());
+    else void sync.flushNow(); // le ✓ du clavier iOS ferme la saisie : le texte part tout de suite
+  }
+  /** iOS anime le clavier sans toujours prévenir à la fin : la barre suit la fenêtre visible image par image pendant 1 s. @param {number} start */
+  function follow(start) {
+    if (!focused) return;
+    if (scrollY) scrollTo(0, 0);
+    placeBar();
+    if (performance.now() - start < 1000) requestAnimationFrame(() => follow(start));
   }
   viewport?.addEventListener('resize', placeBar);
   viewport?.addEventListener('scroll', placeBar);
-
-  function finish() {
-    area.blur();
-    void sync.flushNow();
-  }
 
   /** @param {(s: import('./edits.js').EditState) => import('./edits.js').EditState} transform */
   function apply(transform) {
@@ -162,5 +167,6 @@ export function mountNotes(root, { store, request, timers = realTimers }) {
     document.removeEventListener('visibilitychange', hide);
     viewport?.removeEventListener('resize', placeBar);
     viewport?.removeEventListener('scroll', placeBar);
+    document.documentElement.classList.remove('notes-editing');
   };
 }
