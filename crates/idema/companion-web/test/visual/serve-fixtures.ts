@@ -9,6 +9,7 @@
 //   unpaired  l'API rend 401 `unpaired` (sauf `health` et `pair`) : l'écran d'appairage ;
 //   offline   l'API rend 503, les fichiers sont servis : le bandeau « hors ligne » sur la flotte en cache ;
 //   down      tout rend 503, fichiers compris : seule la copie du service worker répond.
+// GET /__mac-edit simule une écriture du Mac dans la note (la `base` du téléphone devient périmée : PUT rend 409).
 // GET /__rejected liste les écritures refusées en 415 et celles acceptées (sans `Content-Type: application/json`, comme le garde du Mac).
 // GET /__quit arrête le serveur. Les instants des fixtures sont ramenés à maintenant (la flotte enregistrée il y a
 // des jours se lit « il y a 3 min »), en gardant les écarts entre eux.
@@ -72,6 +73,8 @@ function timelineNow() {
   };
 }
 let note: string = SCRATCHPAD.text;
+/** La date de modification de la note : elle avance à chaque écriture, du téléphone ou de `GET /__mac-edit`. */
+let noteAt = Date.now() - 5 * 60_000;
 
 type Mode = 'paired' | 'unpaired' | 'offline' | 'down';
 let mode: Mode = 'paired';
@@ -159,10 +162,21 @@ async function api(route: string, request: Request): Promise<Response> {
   if (route === '/fleet') return json(200, fleetNow());
   if (route === '/timeline') return json(200, timelineNow());
   if (route === '/events') return events();
-  if (route === '/scratchpad') return json(200, { text: note, modified_at: Date.now() - 5 * 60_000 });
+  if (route === '/scratchpad' && request.method === 'GET') return json(200, { text: note, modified_at: noteAt, editable: true });
+  if (route === '/scratchpad' && request.method === 'PUT') {
+    // Comme le Mac : sans `force`, une `base` périmée rend 409 avec la date actuelle et rien n'est écrit ; le texte reçu perd ses `\r`.
+    const body = (await request.json().catch(() => null)) as { text?: unknown; base?: unknown; force?: unknown } | null;
+    if (!body || typeof body.text !== 'string') return json(400, { error: 'bad_request' });
+    if (body.text.includes('\0')) return json(400, { error: 'control_char' });
+    if (body.force !== true && body.base !== noteAt) return json(409, { error: 'note_changed', modified_at: noteAt });
+    note = body.text.replace(/\r/g, '');
+    noteAt = Math.max(Date.now(), noteAt + 1);
+    return json(200, { ok: true, modified_at: noteAt });
+  }
   if (route === '/scratchpad/append' && request.method === 'POST') {
     const { line } = (await request.json()) as { line: string };
     note += `\n${line}`;
+    noteAt = Math.max(Date.now(), noteAt + 1);
     return json(200, { ok: true });
   }
   if (route === '/push/key') return json(200, { key: 'BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8U' });
@@ -184,6 +198,12 @@ const server = Bun.serve({
       return json(200, { bye: true });
     }
     if (pathname === '/__rejected') return json(200, { rejected, accepted });
+    // Le Mac (ou un agent) écrit dans la note pendant que le téléphone a un brouillon : le conflit des captures.
+    if (pathname === '/__mac-edit') {
+      note += '\nécrit sur le Mac';
+      noteAt = Math.max(Date.now(), noteAt + 1);
+      return json(200, { modified_at: noteAt });
+    }
     const wanted = /^\/__mode\/(paired|unpaired|offline|down)$/.exec(pathname);
     if (wanted) {
       mode = wanted[1] as Mode;
