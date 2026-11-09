@@ -9,26 +9,31 @@ import { ageFr, realTimers } from './time.js';
 
 const UNREADABLE = 'Note illisible en UTF-8 : modifiez-la sur le Mac.';
 const AGE_REFRESH_MS = 30_000;
-/** Les cinq touches de la barre, dans l'ordre. */
+/** Les cinq touches de la barre, dans l'ordre ; la dernière colonne est la forme du glyphe (le style optique de app.css). */
 const KEYS = /** @type {const} */ ([
-  ['#', 'Dièse', insertHash],
-  ['-', 'Puce', addDash],
-  ['⇤', 'Désindenter', outdent],
-  ['⇥', 'Indenter', indent],
-  ['```', 'Bloc de code', insertFence],
+  ['#', 'Dièse', insertHash, ''],
+  ['-', 'Puce', addDash, ''],
+  ['⇤', 'Désindenter', outdent, 'arrow'],
+  ['⇥', 'Indenter', indent, 'arrow'],
+  ['```', 'Bloc de code', insertFence, 'fence'],
 ]);
 
 /** @type {import('./router.js').View} */
 export function mountNotes(root, { store, request, timers = realTimers }) {
   const status = el('p', { class: 'notes__status', role: 'status' });
   const done = el('button', { class: 'notes__done', type: 'button', 'aria-label': 'Terminer', hidden: true, onclick: finish }, '✓');
-  const banner = el('div', { class: 'notes__banner', hidden: true });
-  const area = el('textarea', { class: 'notes__text', 'aria-label': 'Note', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', autocomplete: 'off', oninput: onInput, onfocus: () => showBar(true), onblur: () => showBar(false) });
-  const bar = el('div', { class: 'notes__bar', hidden: true }, KEYS.map(([label, name, transform]) => el('button', { class: 'notes__key', type: 'button', 'aria-label': name, onclick: () => apply(transform) }, label)));
+  const banner = el('div', { class: 'notes__banner', role: 'status', hidden: true });
+  const area = el('textarea', { class: 'notes__text', 'aria-label': 'Note', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', autocomplete: 'off', oninput: onInput, onfocus: () => focusChanged(true), onblur: () => focusChanged(false) });
+  const bar = el('div', { class: 'notes__bar', hidden: true }, KEYS.map(([label, name, transform, shape]) => el('button', { class: shape ? `notes__key notes__key--${shape}` : 'notes__key', type: 'button', 'aria-label': name, onclick: () => apply(transform) }, label)));
   // La touche ne doit pas voler le focus : sans cela le clavier se ferme au toucher.
   for (const control of [done, ...bar.children]) for (const type of ['pointerdown', 'mousedown']) control.addEventListener(type, (e) => e.preventDefault());
-  root.replaceChildren(el('section', { class: 'notes' }, el('div', { class: 'notes__top' }, el('h1', null, 'Notes'), el('div', { class: 'notes__side' }, status, done)), banner, area, bar));
+  const section = el('section', { class: 'notes' }, el('div', { class: 'notes__top' }, el('h1', null, 'Notes'), el('div', { class: 'notes__side' }, status, done)), banner, area, bar);
+  root.replaceChildren(section);
 
+  /** Le contenu du bandeau affiché (son état et sa raison). */
+  let shownBanner = '';
+  /** La textarea a le focus (barre et ✓ visibles tant que la note est éditable). */
+  let focused = false;
   const sync = createNotesSync({ request, timers, storage: safeLocalStorage(), store, onChange: render });
 
   function render() {
@@ -36,6 +41,8 @@ export function mountNotes(root, { store, request, timers = realTimers }) {
     // Le moteur ne change son texte que si rien n'a été tapé depuis le début de la lecture (chargement, reprise, reprise de la note du Mac) : l'écran le suit.
     if (state !== 'loading' && state !== 'locked' && area.value !== text.replace(/\r\n?/g, '\n')) showText(text);
     area.readOnly = state === 'loading' || state === 'locked' || state === 'readonly';
+    area.hidden = state === 'locked'; // pas de grande carte vide sous le bandeau
+    showBar(focused); // la note a pu passer en lecture seule pendant la saisie
     let words = '';
     let tone = '';
     if (state === 'saved') words = savedAt === null ? 'Enregistré' : `Enregistré · il y a ${ageFr(savedAt, Date.now())}`;
@@ -45,15 +52,20 @@ export function mountNotes(root, { store, request, timers = realTimers }) {
     status.textContent = words;
     status.className = tone ? `notes__status notes__status--${tone}` : 'notes__status';
     const note = state === 'locked' ? reason : state === 'readonly' ? (reason ?? UNREADABLE) : '';
-    banner.hidden = state !== 'conflict' && !note;
-    banner.replaceChildren(
-      ...(state === 'conflict'
-        ? [
-            el('p', null, 'La note a changé sur le Mac'),
-            el('div', { class: 'notes__choices' }, el('button', { class: 'btn btn--primary', type: 'button', onclick: () => void sync.overwrite() }, 'Écraser avec mon brouillon'), el('button', { class: 'btn', type: 'button', onclick: () => void sync.takeMac() }, 'Reprendre la note du Mac')),
-          ]
-        : note ? [el('p', null, note)] : []),
-    );
+    // Le bandeau ne se reconstruit que si son contenu change : le tick de 30 s ne doit pas voler un bouton sous le doigt.
+    const content = state === 'conflict' ? 'conflict' : note ? `note:${note}` : '';
+    banner.hidden = content === '';
+    if (content !== shownBanner) {
+      shownBanner = content;
+      banner.replaceChildren(
+        ...(state === 'conflict'
+          ? [
+              el('p', null, 'La note a changé sur le Mac'),
+              el('div', { class: 'notes__choices' }, el('button', { class: 'btn', type: 'button', onclick: () => void sync.takeMac() }, 'Reprendre la note du Mac'), el('button', { class: 'btn', type: 'button', onclick: () => void sync.overwrite() }, 'Écraser avec mon brouillon')),
+            ]
+          : note ? [el('p', null, note)] : []),
+      );
+    }
   }
 
   /** Pose le texte de la note ; le curseur reste là où il était, ramené dans le nouveau texte. @param {string} text */
@@ -72,13 +84,31 @@ export function mountNotes(root, { store, request, timers = realTimers }) {
   function placeBar() {
     const gap = viewport ? Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop) : 0;
     bar.style.setProperty('--kb', `${gap}px`);
+    fit();
+  }
+  /** Pendant la saisie, la note tient dans la fenêtre visible, au-dessus du clavier et de la capsule : sinon la dernière ligne tapée et le ✓ restent cachés. */
+  function fit() {
+    if (viewport && !bar.hidden) {
+      section.classList.add('notes--typing');
+      section.style.setProperty('--vv-top', `${viewport.offsetTop}px`);
+      section.style.setProperty('--vv-h', `${Math.max(0, viewport.height - bar.offsetHeight - 16)}px`);
+    } else {
+      section.classList.remove('notes--typing');
+      section.style.removeProperty('--vv-top');
+      section.style.removeProperty('--vv-h');
+    }
   }
   /** @param {boolean} on */
   function showBar(on) {
     on &&= !area.readOnly;
     bar.hidden = done.hidden = !on;
-    area.style.paddingBottom = on ? `${bar.offsetHeight + 16}px` : '';
-    if (on) placeBar();
+    area.style.paddingBottom = on && !viewport ? `${bar.offsetHeight + 16}px` : ''; // avec la fenêtre visible, la note s'arrête au-dessus de la capsule
+    placeBar();
+  }
+  /** @param {boolean} on */
+  function focusChanged(on) {
+    focused = on;
+    showBar(on);
   }
   viewport?.addEventListener('resize', placeBar);
   viewport?.addEventListener('scroll', placeBar);

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { DRAFT_KEY } from '../js/notes-sync.js';
 import { mountNotes } from '../js/notes.js';
 import { createStore } from '../js/store.js';
 
@@ -38,10 +39,12 @@ describe('mountNotes', () => {
     const calls = [];
     /** @type {(() => void)[]} */
     const queue = [];
+    /** @type {(() => void)[]} */
+    const intervals = [];
     const timers = /** @type {any} */ ({
       setTimeout: (/** @type {() => void} */ fn) => queue.push(fn),
       clearTimeout: () => {},
-      setInterval: () => 0,
+      setInterval: (/** @type {() => void} */ fn) => intervals.push(fn),
       clearInterval: () => {},
     });
     const request = async (/** @type {string} */ method, /** @type {string} */ path, /** @type {any} */ body, /** @type {boolean} */ keepalive = false) => (calls.push({ method, path, body, keepalive }), handler(method, path, body, keepalive));
@@ -52,7 +55,9 @@ describe('mountNotes', () => {
       for (const fn of queue.splice(0)) fn();
       await flush();
     };
-    return { store, calls, unmount, fire };
+    /** Un tour de la minuterie d'âge (30 s). */
+    const tick = () => intervals.forEach((fn) => fn());
+    return { store, calls, unmount, fire, tick };
   }
 
   const area = () => /** @type {HTMLTextAreaElement} */ (root.querySelector('textarea'));
@@ -213,25 +218,28 @@ describe('mountNotes', () => {
     await fire();
     expect(root.textContent).toContain('La note a changé sur le Mac');
     const buttons = [...root.querySelectorAll('.notes__banner button')];
-    expect(buttons.map((b) => b.textContent)).toEqual(['Écraser avec mon brouillon', 'Reprendre la note du Mac']);
-    /** @type {HTMLElement} */ (buttons[0]).click();
+    expect(buttons.map((b) => b.textContent)).toEqual(['Reprendre la note du Mac', 'Écraser avec mon brouillon']);
+    expect(buttons.some((b) => b.className.includes('primary'))).toBe(false); // aucun choix n'est mis en avant
+    /** @type {HTMLElement} */ (buttons[1]).click();
     await flush();
     expect(calls.some((c) => c.method === 'PUT' && c.body.force === true && c.body.text === 'mon brouillon')).toBe(true);
     expect(root.textContent).not.toContain('La note a changé sur le Mac');
   });
 
   test('taking the Mac note replaces the screen and drops the draft', async () => {
-    let conflict = true;
-    const { fire } = mount((method) => (method === 'PUT' ? { kind: 'http', status: 409, error: 'note_changed' } : mac(conflict ? 'ailleurs' : 'x', conflict ? 7 : 5)));
+    let typed = false; // le Mac ne porte l'autre note qu'une fois le brouillon tapé
+    const { fire } = mount((method) => (method === 'PUT' ? { kind: 'http', status: 409, error: 'note_changed' } : mac(typed ? 'ailleurs' : 'x', typed ? 7 : 5)));
     await flush();
     type('mon brouillon');
+    typed = true;
     await fire();
     expect(area().value).toBe('mon brouillon');
-    conflict = true;
-    /** @type {HTMLElement} */ (root.querySelectorAll('.notes__banner button')[1]).click();
+    expect(localStorage.getItem(DRAFT_KEY)).not.toBeNull();
+    /** @type {HTMLElement} */ (root.querySelectorAll('.notes__banner button')[0]).click();
     await flush();
     expect(area().value).toBe('ailleurs');
     expect(root.textContent).not.toContain('La note a changé sur le Mac');
+    expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
   });
 
   test('the check button blurs the textarea and saves now', async () => {
@@ -330,5 +338,97 @@ describe('mountNotes', () => {
     dispatchEvent(new Event('idema:resume'));
     await flush();
     expect(area().value).toBe('trois et moi');
+  });
+
+  test('the 30 s age tick keeps the banner buttons alive, and the banner is a status region', async () => {
+    const { fire, tick } = mount((method) => (method === 'PUT' ? { kind: 'http', status: 409, error: 'note_changed' } : mac('ailleurs', 7)));
+    await flush();
+    type('mon brouillon');
+    await fire();
+    const button = root.querySelector('.notes__banner button');
+    expect(button).not.toBeNull();
+    tick();
+    expect(root.querySelector('.notes__banner button')).toBe(button);
+    expect(root.querySelector('.notes__banner')?.getAttribute('role')).toBe('status');
+  });
+
+  test('the banner text follows a change of reason', async () => {
+    const note = { text: 'x', editable: false };
+    mount(() => mac(note.text, 5, note.editable));
+    await flush();
+    expect(root.querySelector('.notes__banner')?.textContent).toBe('Note illisible en UTF-8 : modifiez-la sur le Mac.');
+    note.editable = true;
+    dispatchEvent(new Event('idema:resume'));
+    await flush();
+    expect(root.querySelector('.notes__banner')?.hasAttribute('hidden')).toBe(true);
+    expect(root.querySelector('.notes__banner')?.textContent).toBe('');
+  });
+
+  test('the bar and the check button go away when the note turns read-only while focused', async () => {
+    let editable = true;
+    mount(() => mac('x', 5, editable));
+    await flush();
+    focus();
+    expect(done().hasAttribute('hidden')).toBe(false);
+    editable = false;
+    dispatchEvent(new Event('idema:resume'));
+    await flush();
+    expect(area().readOnly).toBe(true);
+    expect(root.querySelector('.notes__bar')?.hasAttribute('hidden')).toBe(true);
+    expect(done().hasAttribute('hidden')).toBe(true);
+  });
+
+  test('a locked note shows its banner without an empty editor card, and the editor comes back with the Mac', async () => {
+    let up = false;
+    const { store } = mount(() => (up ? mac('revenu') : { kind: 'offline' }));
+    await flush();
+    expect(root.textContent).toContain("Le Mac ne répond pas : la note s'ouvrira à son retour.");
+    expect(area().hidden).toBe(true);
+    up = true;
+    store.setConnection('offline');
+    store.setConnection('ok');
+    await flush();
+    expect(area().hidden).toBe(false);
+    expect(area().value).toBe('revenu');
+  });
+
+  describe('keyboard geometry (visualViewport)', () => {
+    /** @type {EventTarget & {height: number, offsetTop: number}} */
+    let viewport;
+    const section = () => /** @type {HTMLElement} */ (root.querySelector('.notes'));
+    const room = () => parseFloat(section().style.getPropertyValue('--vv-h'));
+    beforeEach(() => {
+      viewport = Object.assign(new EventTarget(), { height: 400, offsetTop: 0 });
+      Object.defineProperty(window, 'visualViewport', { value: viewport, configurable: true });
+    });
+    afterEach(() => void Reflect.deleteProperty(window, 'visualViewport'));
+
+    test('while the textarea has the focus the editor is sized to the visible viewport, and released on blur', async () => {
+      mount(() => mac('x'));
+      await flush();
+      expect(section().classList.contains('notes--typing')).toBe(false);
+      focus();
+      expect(section().classList.contains('notes--typing')).toBe(true);
+      const first = room();
+      expect(first).toBeGreaterThan(0);
+      expect(first).toBeLessThanOrEqual(400);
+      viewport.height = 300;
+      viewport.dispatchEvent(new Event('resize'));
+      expect(first - room()).toBe(100);
+      viewport.offsetTop = 40;
+      viewport.dispatchEvent(new Event('scroll'));
+      expect(section().style.getPropertyValue('--vv-top')).toBe('40px');
+      area().dispatchEvent(new Event('blur'));
+      expect(section().classList.contains('notes--typing')).toBe(false);
+      expect(section().style.getPropertyValue('--vv-h')).toBe('');
+    });
+
+    test('a resize while not focused leaves the layout alone', async () => {
+      mount(() => mac('x'));
+      await flush();
+      viewport.height = 300;
+      viewport.dispatchEvent(new Event('resize'));
+      expect(section().classList.contains('notes--typing')).toBe(false);
+    });
   });
 });
