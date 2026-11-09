@@ -1,5 +1,5 @@
-//! Le Scratchpad vu du téléphone : lire `scratchpad.md` et y ajouter une ligne. Le volet du Mac relit le disque et le
-//! disque gagne (`scratchpad/store.rs`) : on n'a donc rien à lui signaler.
+//! Le Scratchpad vu du téléphone : lire `scratchpad.md`, y ajouter une ligne ou remplacer toute la note. Le volet du Mac
+//! relit le disque et le disque gagne (`scratchpad/store.rs`) : on n'a donc rien à lui signaler.
 
 use std::io::{self, Read};
 use std::path::Path;
