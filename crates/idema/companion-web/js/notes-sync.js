@@ -180,11 +180,7 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
    */
   async function reconcile(sent) {
     const res = await call('GET', '/scratchpad');
-    if (res.kind !== 'ok') {
-      remember(sent);
-      persistDraft();
-      return setState('offline');
-    }
+    if (res.kind !== 'ok') return setState('offline');
     const macRaw = String(res.data.text ?? '');
     const macAt = asBase(res.data.modified_at);
     if (isOwn(norm(macRaw), sent, text)) return adoptOwn(macRaw, macAt) ? undefined : doSend();
@@ -203,12 +199,7 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
     persistDraft();
     const res = await call('PUT', '/scratchpad', body, keepalive, PUT_TIMEOUT_MS);
     if (res.kind === 'ok') return onSaved(sent, asBase(res.data?.modified_at));
-    if (res.kind !== 'http') {
-      // Hors ligne ou délai : le Mac a peut-être écrit, le 409 suivant reconnaîtra ce texte.
-      remember(sent);
-      persistDraft();
-      return setState('offline');
-    }
+    if (res.kind !== 'http') return setState('offline'); // hors ligne ou délai : le Mac a peut-être écrit, le 409 suivant reconnaîtra ce texte
     if (res.status === 409) return reconcile(sent);
     return setState('refused', res.status === 413 ? 'note trop grosse (5 Mo au plus)' : (REFUSALS[res.error] ?? "le Mac a refusé l'enregistrement"));
   }

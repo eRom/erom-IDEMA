@@ -449,9 +449,10 @@ mod tests {
 
     /// Le plafond de la page (rulings R21-R22) : la somme des tailles gzip, fichier par fichier, des fichiers de texte
     /// de l'app, soit les octets que le Mac envoie. Lancer avec `-- --nocapture` pour lire la somme.
-    /// Relevé à 52 Kio (53 248 octets) pour l'éditeur de notes : la marge n'était plus que de 491 octets (spec
-    /// docs/superpowers/specs/2026-11-09-idema-notes-editeur-design.md, amendement A1).
-    const GZIP_CEILING: usize = 53_248;
+    /// Relevé à 56 Kio (57 344 octets) pour l'éditeur de notes : le moteur de sauvegarde, la barre d'outils et le
+    /// brouillon hors ligne ont rempli les 52 Kio de l'amendement A1 (spec
+    /// docs/superpowers/specs/2026-11-09-idema-notes-editeur-design.md, ruling M8 du registre du chantier).
+    const GZIP_CEILING: usize = 57_344;
 
     #[test]
     fn the_gzipped_app_stays_under_the_ceiling() {

@@ -84,20 +84,23 @@ describe('every write of the page carries a JSON body', () => {
     expectJsonWrites(1);
   });
 
-  test('a line added to the note', async () => {
+  test('the note saved from the Notes screen is a PUT with a JSON body', async () => {
     const root = document.createElement('div');
     document.body.replaceChildren(root);
     const store = createStore(localStorage);
     const unmount = mountNotes(root, /** @type {any} */ ({
       store,
-      request: (/** @type {string} */ method, /** @type {string} */ path, /** @type {unknown} */ body) => api(method, path, body),
+      request: (/** @type {string} */ method, /** @type {string} */ path, /** @type {unknown} */ body, /** @type {boolean} */ keepalive, /** @type {number} */ timeoutMs) => api(method, path, body, timeoutMs, keepalive),
     }));
     await flush();
-    /** @type {HTMLInputElement} */ (root.querySelector('.notes__input')).value = 'une ligne';
-    /** @type {HTMLElement} */ (root.querySelector('.notes__form .btn')).click();
+    const area = /** @type {HTMLTextAreaElement} */ (root.querySelector('textarea'));
+    area.value = 'une ligne';
+    area.dispatchEvent(new Event('input', { bubbles: true }));
+    /** @type {HTMLElement} */ (root.querySelector('.notes__done')).click();
     await flush();
     unmount?.();
-    expect(writes().map((call) => call.path)).toEqual(['/idema-api/scratchpad/append']);
+    expect(writes().map((call) => `${call.method} ${call.path}`)).toEqual(['PUT /idema-api/scratchpad']);
+    expect(JSON.parse(/** @type {string} */ (writes()[0].body)).text).toBe('une ligne');
     expectJsonWrites(1);
   });
 

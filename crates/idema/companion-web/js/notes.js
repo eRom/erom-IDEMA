@@ -1,69 +1,140 @@
 // @ts-check
-// L'onglet Notes : le scratchpad du Mac tel quel, et une ligne à lui ajouter.
+// L'onglet Notes : le scratchpad du Mac, toujours éditable, enregistré tout seul (le moteur est dans notes-sync.js).
 
-import { el, linkify } from './dom.js';
-import { ageFr } from './time.js';
+import { el } from './dom.js';
+import { addDash, indent, insertFence, insertHash, outdent } from './edits.js';
+import { createNotesSync } from './notes-sync.js';
+import { safeLocalStorage } from './store.js';
+import { ageFr, realTimers } from './time.js';
 
-/**
- * Ce que le Mac accepte : 1 à 2 000 octets, sans caractère de contrôle (la tabulation en est un). Refusé ici, en français.
- * @param {string} raw
- * @returns {{ok: true, line: string} | {ok: false, error: string}}
- */
-export function validateLine(raw) {
-  const line = raw.trim();
-  if (line === '') return { ok: false, error: '' };
-  if (/[\u0000-\u001f\u007f-\u009f]/.test(line)) return { ok: false, error: 'La ligne contient une tabulation ou un caractère de contrôle : retirez-le puis réessayez.' };
-  const bytes = new TextEncoder().encode(line).length;
-  return bytes > 2000 ? { ok: false, error: `Ligne trop longue : ${bytes} octets sur 2 000 au plus.` } : { ok: true, line };
-}
+const UNREADABLE = 'Note illisible en UTF-8 : modifiez-la sur le Mac.';
+const AGE_REFRESH_MS = 30_000;
+/** Les cinq touches de la barre, dans l'ordre. */
+const KEYS = /** @type {const} */ ([
+  ['#', 'Dièse', insertHash],
+  ['-', 'Puce', addDash],
+  ['⇤', 'Désindenter', outdent],
+  ['⇥', 'Indenter', indent],
+  ['```', 'Bloc de code', insertFence],
+]);
 
 /** @type {import('./router.js').View} */
-export function mountNotes(root, { store, request }) {
-  let alive = true;
-  const text = el('div', { class: 'notes__text' });
-  const meta = el('p', { class: 'muted notes__meta' });
-  const status = el('p', { class: 'status', role: 'status' });
-  const input = el('input', { class: 'notes__input', type: 'text', placeholder: 'Ajouter une ligne', enterkeyhint: 'send', autocomplete: 'off', 'aria-label': 'Nouvelle ligne' });
-  const add = el('button', { class: 'btn btn--primary', type: 'button', onclick: () => void send() }, 'Ajouter');
-  const form = el('form', { class: 'notes__form', onsubmit: (/** @type {Event} */ e) => (e.preventDefault(), void send()) }, input, add);
-  root.replaceChildren(el('section', { class: 'notes' }, el('h1', null, 'Notes'), meta, text, status, form));
-  // Pas d'ajout tant que le Mac ne répond pas : la ligne resterait dans le champ.
-  const syncButton = () => void (add.disabled = store.state.connection !== 'ok');
+export function mountNotes(root, { store, request, timers = realTimers }) {
+  const status = el('p', { class: 'notes__status', role: 'status' });
+  const done = el('button', { class: 'notes__done', type: 'button', 'aria-label': 'Terminer', hidden: true, onclick: finish }, '✓');
+  const banner = el('div', { class: 'notes__banner', hidden: true });
+  const area = el('textarea', { class: 'notes__text', 'aria-label': 'Note', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false', autocomplete: 'off', oninput: onInput, onfocus: () => showBar(true), onblur: () => showBar(false) });
+  const bar = el('div', { class: 'notes__bar', hidden: true }, KEYS.map(([label, name, transform]) => el('button', { class: 'notes__key', type: 'button', 'aria-label': name, onclick: () => apply(transform) }, label)));
+  // La touche ne doit pas voler le focus : sans cela le clavier se ferme au toucher.
+  for (const control of [done, ...bar.children]) for (const type of ['pointerdown', 'mousedown']) control.addEventListener(type, (e) => e.preventDefault());
+  root.replaceChildren(el('section', { class: 'notes' }, el('div', { class: 'notes__top' }, el('h1', null, 'Notes'), el('div', { class: 'notes__side' }, status, done)), banner, area, bar));
 
-  /** @param {boolean} [scroll] vers le bas : au premier affichage et après un ajout, jamais à la reprise */
-  async function load(scroll = false) {
-    const reply = await request('GET', '/scratchpad');
-    if (!alive) return;
-    if (reply.kind !== 'ok') return void (meta.textContent = 'Le Mac ne répond pas : la note affichée peut être ancienne.');
-    const { text: note = '', modified_at: at } = reply.data;
-    meta.textContent = note === '' ? 'La note est vide.' : at ? `Modifiée il y a ${ageFr(at, Date.now())}` : '';
-    text.replaceChildren(...linkify(note));
-    if (scroll) text.scrollTop = text.scrollHeight;
+  /** Romain a tapé depuis le montage (ou repris la note du Mac) : plus aucune réponse ne réécrit l'écran. */
+  let typed = false;
+  const sync = createNotesSync({ request, timers, storage: safeLocalStorage(), store, onChange: render });
+
+  function render() {
+    const { state, text, savedAt, reason } = sync.snapshot();
+    // L'écran suit la note tant que rien n'a été tapé (premier chargement, reprise) ; après, il est maître.
+    if (!typed && state !== 'loading' && state !== 'locked' && area.value !== text) area.value = text;
+    area.readOnly = state === 'loading' || state === 'locked' || state === 'readonly';
+    let words = '';
+    let tone = '';
+    if (state === 'saved') words = savedAt === null ? 'Enregistré' : `Enregistré · il y a ${ageFr(savedAt, Date.now())}`;
+    else if (state === 'saving') words = 'Enregistrement…';
+    else if (state === 'offline') [words, tone] = ['● Pas enregistré · Mac injoignable', 'warn'];
+    else if (state === 'refused') [words, tone] = [`● Refusé : ${reason}`, 'error'];
+    status.textContent = words;
+    status.className = tone ? `notes__status notes__status--${tone}` : 'notes__status';
+    const note = state === 'locked' ? reason : state === 'readonly' ? (reason ?? UNREADABLE) : '';
+    banner.hidden = state !== 'conflict' && !note;
+    banner.replaceChildren(
+      ...(state === 'conflict'
+        ? [
+            el('p', null, 'La note a changé sur le Mac'),
+            el('div', { class: 'notes__choices' }, el('button', { class: 'btn btn--primary', type: 'button', onclick: () => void sync.overwrite() }, 'Écraser avec mon brouillon'), el('button', { class: 'btn', type: 'button', onclick: () => void takeMac() }, 'Reprendre la note du Mac')),
+          ]
+        : note ? [el('p', null, note)] : []),
+    );
   }
 
-  async function send() {
-    if (add.disabled) return;
-    const checked = validateLine(input.value);
-    status.textContent = checked.ok ? '' : checked.error;
-    if (!checked.ok) return;
-    add.disabled = true;
-    const reply = await request('POST', '/scratchpad/append', { line: checked.line });
-    if (!alive) return;
-    syncButton();
-    if (reply.kind === 'timeout') {
-      // Le Mac a peut-être écrit la ligne : on la garde dans le champ et on relit la note pour qu'on puisse voir.
-      status.textContent = 'Le Mac ne répond pas : vérifiez la note avant de réessayer.';
-      return void load();
+  async function takeMac() {
+    await sync.takeMac();
+    const { state, text } = sync.snapshot();
+    if (state === 'conflict') return; // hors ligne, ou Romain a tapé entre-temps : le brouillon reste
+    area.value = text;
+    typed = false;
+  }
+
+  function onInput() {
+    typed = true;
+    sync.edit(area.value);
+  }
+
+  // Barre et ✓ pendant l'édition ; la barre se colle au clavier par la fenêtre visible.
+  const viewport = window.visualViewport;
+  function placeBar() {
+    const gap = viewport ? Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop) : 0;
+    bar.style.setProperty('--kb', `${gap}px`);
+  }
+  /** @param {boolean} on */
+  function showBar(on) {
+    on &&= !area.readOnly;
+    bar.hidden = done.hidden = !on;
+    area.style.paddingBottom = on ? `${bar.offsetHeight + 16}px` : '';
+    if (on) placeBar();
+  }
+  viewport?.addEventListener('resize', placeBar);
+  viewport?.addEventListener('scroll', placeBar);
+
+  function finish() {
+    area.blur();
+    void sync.flushNow();
+  }
+
+  /** @param {(s: import('./edits.js').EditState) => import('./edits.js').EditState} transform */
+  function apply(transform) {
+    const { value, selectionStart: start, selectionEnd: end } = area;
+    const next = transform({ text: value, start, end });
+    if (next.text !== value) {
+      // Seule la plage qui change est remplacée : l'annulation d'iOS garde un pas par touche.
+      let from = 0;
+      while (from < value.length && from < next.text.length && value[from] === next.text[from]) from++;
+      let tail = 0;
+      while (tail < value.length - from && tail < next.text.length - from && value[value.length - 1 - tail] === next.text[next.text.length - 1 - tail]) tail++;
+      const insert = next.text.slice(from, next.text.length - tail);
+      area.setSelectionRange(from, value.length - tail);
+      let used = false;
+      if (typeof document.execCommand === 'function') {
+        try {
+          used = insert === '' ? document.execCommand('delete') : document.execCommand('insertText', false, insert);
+        } catch {
+          // Refusé par le navigateur : repli ci-dessous.
+        }
+      }
+      if (!used) {
+        area.setRangeText(insert, from, value.length - tail, 'end');
+        area.dispatchEvent(new Event('input', { bubbles: true })); // execCommand en émet un, setRangeText non
+      }
     }
-    if (reply.kind !== 'ok') return void (status.textContent = `${reply.kind === 'http' ? 'Le Mac a refusé la ligne' : 'Mac injoignable'} : elle n'a pas été ajoutée.`);
-    input.value = '';
-    await load(true);
+    area.setSelectionRange(next.start, next.end);
   }
 
-  syncButton();
-  const unsubscribe = store.subscribe(syncButton);
-  const resume = () => void load();
-  void load(true);
+  const resume = () => void sync.load();
+  const hide = () => document.visibilityState === 'hidden' && void sync.flushNow(true);
   addEventListener('idema:resume', resume);
-  return () => ((alive = false), unsubscribe(), removeEventListener('idema:resume', resume));
+  document.addEventListener('visibilitychange', hide);
+  const tick = timers.setInterval(render, AGE_REFRESH_MS);
+  render();
+  void sync.load();
+  return () => {
+    // Quitter l'onglet : le texte non enregistré part (keepalive) avant que le moteur ne se taise.
+    void sync.flushNow(true);
+    sync.dispose();
+    timers.clearInterval(tick);
+    removeEventListener('idema:resume', resume);
+    document.removeEventListener('visibilitychange', hide);
+    viewport?.removeEventListener('resize', placeBar);
+    viewport?.removeEventListener('scroll', placeBar);
+  };
 }
