@@ -698,3 +698,52 @@ describe('dispose', () => {
     expect(h.puts().length).toBe(1);
   });
 });
+
+describe('leaving the page', () => {
+  test('flushNow(true) then dispose() right away still sends the keepalive PUT, and its late reply leaves the storage alone', async () => {
+    const mock = fakeMac('old', 5);
+    const gate = deferred();
+    const h = harness({ handler: async (method, path, body) => (method === 'PUT' ? (await gate.promise, mock.handler(method, path, body)) : mock.handler(method, path, body)) });
+    await h.sync.load();
+    h.sync.edit('typed');
+    void h.sync.flushNow(true);
+    h.sync.dispose();
+    expect(h.puts().map((c) => [c.body.text, c.keepalive])).toEqual([['typed', true]]);
+    const before = localStorage.getItem(DRAFT_KEY);
+    const cacheBefore = localStorage.getItem(CACHE_KEY);
+    gate.resolve(null);
+    await flush();
+    expect(mock.disk.text).toBe('typed');
+    expect(localStorage.getItem(DRAFT_KEY)).toBe(before);
+    expect(localStorage.getItem(CACHE_KEY)).toBe(cacheBefore);
+    expect(h.puts().length).toBe(1);
+  });
+
+  test('a PUT still in flight when the instance dies is recognised by the next one: saved, not conflict', async () => {
+    const mock = fakeMac('old', 5);
+    const gate = deferred();
+    let slow = true;
+    const a = harness({
+      handler: async (method, path, body) => {
+        if (method === 'PUT' && slow) {
+          slow = false;
+          await gate.promise;
+        }
+        return mock.handler(method, path, body);
+      },
+    });
+    await a.sync.load();
+    a.sync.edit('a');
+    await a.advance(SAVE_DELAY_MS);
+    a.sync.edit('ab');
+    a.sync.dispose();
+    gate.resolve(null);
+    await flush();
+    expect(mock.disk.text).toBe('a');
+    const b = harness({ handler: mock.handler });
+    await b.sync.load();
+    expect(b.states).not.toContain('conflict');
+    expect(b.sync.snapshot()).toMatchObject({ state: 'saved', text: 'ab' });
+    expect(mock.disk.text).toBe('ab');
+  });
+});

@@ -121,7 +121,7 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
     if (alive) onChange?.();
   }
   function arm() {
-    if (timer === null) timer = timers.setTimeout(onTimer, SAVE_DELAY_MS);
+    if (alive && timer === null) timer = timers.setTimeout(onTimer, SAVE_DELAY_MS);
   }
   function clearTimer() {
     if (timer !== null) timers.clearTimeout(timer);
@@ -132,10 +132,11 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
   let tail = /** @type {Promise<void>} */ (Promise.resolve());
   /** Travaux en cours ou en attente. */
   let jobs = 0;
-  /** @param {() => Promise<void>} job */
-  function serial(job) {
-    jobs++;
-    tail = tail.then(() => (alive ? job() : undefined)).catch(() => {}).then(() => void jobs--);
+  /** @param {() => Promise<void>} job @param {boolean} [now] démarre dans l'appel même si rien n'est en cours (keepalive : `dispose()` suit) */
+  function serial(job, now = false) {
+    const idle = jobs++ === 0;
+    const run = now && idle ? job() : tail.then(() => (alive ? job() : undefined));
+    tail = run.catch(() => {}).then(() => void jobs--);
     return tail;
   }
 
@@ -198,6 +199,8 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
     const body = force ? { text: sent, base: savedAt, force: true } : { text: sent, base: savedAt };
     if (keepalive && new TextEncoder().encode(JSON.stringify(body)).length > KEEPALIVE_MAX_BYTES) return arm(); // trop gros : un envoi normal suit
     if (state !== 'offline') setState('saving');
+    remember(sent); // retenu avant l'envoi : si la page meurt en vol, le montage suivant le reconnaîtra
+    persistDraft();
     const res = await call('PUT', '/scratchpad', body, keepalive, PUT_TIMEOUT_MS);
     if (res.kind === 'ok') return onSaved(sent, asBase(res.data?.modified_at));
     if (res.kind !== 'http') {
@@ -275,7 +278,7 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
     if (!draft || !sendable(false)) return Promise.resolve();
     if (keepalive && jobs > 0) return Promise.resolve(); // le brouillon suffit, le minuteur reste
     clearTimer();
-    return keepalive ? serial(() => doSend({ keepalive: true })) : sendIfDirty(false);
+    return keepalive ? serial(() => doSend({ keepalive: true }), true) : sendIfDirty(false);
   }
 
   function load() {
