@@ -29,14 +29,12 @@ export function mountNotes(root, { store, request, timers = realTimers }) {
   for (const control of [done, ...bar.children]) for (const type of ['pointerdown', 'mousedown']) control.addEventListener(type, (e) => e.preventDefault());
   root.replaceChildren(el('section', { class: 'notes' }, el('div', { class: 'notes__top' }, el('h1', null, 'Notes'), el('div', { class: 'notes__side' }, status, done)), banner, area, bar));
 
-  /** Romain a tapé depuis le montage (ou repris la note du Mac) : plus aucune réponse ne réécrit l'écran. */
-  let typed = false;
   const sync = createNotesSync({ request, timers, storage: safeLocalStorage(), store, onChange: render });
 
   function render() {
     const { state, text, savedAt, reason } = sync.snapshot();
-    // L'écran suit la note tant que rien n'a été tapé (premier chargement, reprise) ; après, il est maître.
-    if (!typed && state !== 'loading' && state !== 'locked' && area.value !== text) area.value = text;
+    // Le moteur ne change son texte que si rien n'a été tapé depuis le début de la lecture (chargement, reprise, reprise de la note du Mac) : l'écran le suit.
+    if (state !== 'loading' && state !== 'locked' && area.value !== text.replace(/\r\n?/g, '\n')) showText(text);
     area.readOnly = state === 'loading' || state === 'locked' || state === 'readonly';
     let words = '';
     let tone = '';
@@ -52,22 +50,20 @@ export function mountNotes(root, { store, request, timers = realTimers }) {
       ...(state === 'conflict'
         ? [
             el('p', null, 'La note a changé sur le Mac'),
-            el('div', { class: 'notes__choices' }, el('button', { class: 'btn btn--primary', type: 'button', onclick: () => void sync.overwrite() }, 'Écraser avec mon brouillon'), el('button', { class: 'btn', type: 'button', onclick: () => void takeMac() }, 'Reprendre la note du Mac')),
+            el('div', { class: 'notes__choices' }, el('button', { class: 'btn btn--primary', type: 'button', onclick: () => void sync.overwrite() }, 'Écraser avec mon brouillon'), el('button', { class: 'btn', type: 'button', onclick: () => void sync.takeMac() }, 'Reprendre la note du Mac')),
           ]
         : note ? [el('p', null, note)] : []),
     );
   }
 
-  async function takeMac() {
-    await sync.takeMac();
-    const { state, text } = sync.snapshot();
-    if (state === 'conflict') return; // hors ligne, ou Romain a tapé entre-temps : le brouillon reste
+  /** Pose le texte de la note ; le curseur reste là où il était, ramené dans le nouveau texte. @param {string} text */
+  function showText(text) {
+    const { selectionStart, selectionEnd } = area;
     area.value = text;
-    typed = false;
+    if (document.activeElement === area) area.setSelectionRange(Math.min(selectionStart, area.value.length), Math.min(selectionEnd, area.value.length));
   }
 
   function onInput() {
-    typed = true;
     sync.edit(area.value);
   }
 

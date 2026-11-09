@@ -183,16 +183,39 @@ describe('load', () => {
     expect(h.sync.snapshot().text).toBe('mine');
   });
 
-  test('a GET result never replaces the text once edit() was called, even without a draft', async () => {
-    const mock = fakeMac('old', 5);
+  test('with nothing pending, a GET during which nothing was typed shows the newer Mac note, and the next keystroke saves without conflict', async () => {
+    const mock = fakeMac('monday', 5);
     const h = harness({ handler: mock.handler });
     await h.sync.load();
-    h.sync.edit('typed');
+    h.sync.edit('monday + phone');
     await h.advance(SAVE_DELAY_MS);
     expect(h.draft()).toBeNull();
-    mock.disk.text = 'other';
+    mock.disk.text = 'tuesday rewrite on the Mac';
+    mock.disk.modifiedAt = 100;
     await h.sync.load();
+    expect(h.sync.snapshot()).toMatchObject({ state: 'saved', text: 'tuesday rewrite on the Mac', savedAt: 100 });
+    h.sync.edit('tuesday rewrite on the Mac!');
+    await h.advance(SAVE_DELAY_MS);
+    expect(h.sync.snapshot()).toMatchObject({ state: 'saved', text: 'tuesday rewrite on the Mac!' });
+    expect(mock.disk.text).toBe('tuesday rewrite on the Mac!');
+  });
+
+  test('a GET returning after a keystroke made during that GET never overwrites the text', async () => {
+    const mock = fakeMac('old', 5);
+    const slow = deferred();
+    let slowNext = false;
+    const h = harness({ handler: (method, path, body) => (method === 'GET' && slowNext ? slow.promise : mock.handler(method, path, body)) });
+    await h.sync.load();
+    mock.disk.text = 'other';
+    mock.disk.modifiedAt = 9;
+    slowNext = true;
+    const loading = h.sync.load();
+    await h.advance(0);
+    h.sync.edit('typed');
+    slow.resolve(mac('other', 9));
+    await loading;
     expect(h.sync.snapshot().text).toBe('typed');
+    expect(mock.disk.text).toBe('other'); // jamais écrasée sans choix : le 409 mène au conflit
   });
 });
 

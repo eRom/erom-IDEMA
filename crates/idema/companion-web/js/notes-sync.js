@@ -51,8 +51,6 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
   let savedAt = /** @type {number | null} */ (null);
   /** Non nul tant que `text` n'est pas sur le disque (miroir du stockage, qui peut refuser). */
   let draft = /** @type {{text: string, base: number | null} | null} */ (null);
-  /** `edit()` a été appelé depuis le montage. */
-  let touched = false;
   /** Numéro de la dernière frappe. */
   let rev = 0;
   let alive = true;
@@ -223,6 +221,7 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
       savedAt = pending.base;
       if (state === 'loading' || state === 'locked') setState('saving');
     }
+    const seen = rev;
     const res = await call('GET', '/scratchpad');
     if (res.kind === 'ok') {
       const { mac, macAt, editable } = adopt(res);
@@ -231,12 +230,10 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
         if (!editable) return setState('readonly');
         return doSend();
       }
-      if (!touched) {
-        text = mac;
+      if (seen === rev) {
+        text = mac; // rien tapé pendant la lecture (un brouillon naît à la frappe) : la note du Mac fait foi, même si l'écran en montrait une plus ancienne
         savedAt = macAt;
-      } else if (norm(text) === norm(mac)) {
-        savedAt = macAt;
-      } // sinon la base reste périmée : le 409 plutôt que d'écraser le Mac
+      }
       return setState(editable ? 'saved' : 'readonly');
     }
     if (res.kind === 'http' && res.status === 413) return setState('readonly', TOO_BIG_ON_PHONE);
@@ -294,7 +291,6 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
     /** @param {string} next */
     edit(next) {
       if (state === 'loading' || state === 'locked' || state === 'readonly') return;
-      touched = true;
       rev++;
       text = next;
       setDraft();

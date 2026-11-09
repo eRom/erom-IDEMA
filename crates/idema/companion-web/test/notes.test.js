@@ -309,19 +309,26 @@ describe('mountNotes', () => {
     expect(area().selectionStart).toBe(3);
   });
 
-  test('reading again on resume refreshes an untouched screen but never one being typed in', async () => {
+  test('reading again on resume shows the newer Mac note, even after typing once it was saved; a pending draft is never replaced', async () => {
     let note = 'un';
-    const { calls } = mount(() => mac(note));
+    const { fire } = mount((method) => (method === 'PUT' ? ok({ modified_at: 9 }) : mac(note)));
     await flush();
     note = 'deux';
     dispatchEvent(new Event('idema:resume'));
     await flush();
     expect(area().value).toBe('deux');
     type('deux et moi');
+    await fire(); // enregistré : plus de brouillon
     note = 'trois';
+    area().setSelectionRange(2, 2);
     dispatchEvent(new Event('idema:resume'));
     await flush();
-    expect(area().value).toBe('deux et moi');
-    expect(calls.filter((c) => c.method === 'GET').length).toBe(3);
+    expect(area().value).toBe('trois');
+    expect(area().selectionStart).toBeLessThanOrEqual('trois'.length);
+    type('trois et moi'); // brouillon en attente
+    note = 'quatre';
+    dispatchEvent(new Event('idema:resume'));
+    await flush();
+    expect(area().value).toBe('trois et moi');
   });
 });
