@@ -22,6 +22,7 @@ const APP_FILES = [
   '/js/api.js',
   '/js/choices.js',
   '/js/dom.js',
+  '/js/edits.js',
   '/js/fleet.js',
   '/js/icons.js',
   '/js/install.js',

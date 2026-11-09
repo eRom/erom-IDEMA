@@ -77,6 +77,11 @@ const FILES: &[(&str, &[u8], &str)] = &[
         JS,
     ),
     (
+        "/js/edits.js",
+        include_bytes!("../../companion-web/js/edits.js"),
+        JS,
+    ),
+    (
         "/js/fleet.js",
         include_bytes!("../../companion-web/js/fleet.js"),
         JS,
