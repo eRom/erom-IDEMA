@@ -7,11 +7,13 @@ import { el } from './dom.js';
 import { icon } from './icons.js';
 import { isStandalone, renderInstall } from './install.js';
 import { bannerText, createRetry } from './offline.js';
+import { createDraftFlusher } from './notes-sync.js';
 import { mountActivationCard } from './notify.js';
 import { renderPairing } from './pairing.js';
 import { createPresence } from './presence.js';
 import { createPushController, syncBadge as realSyncBadge } from './push.js';
 import { startRouter, viewFor } from './router.js';
+import { safeLocalStorage } from './store.js';
 import { realTimers } from './time.js';
 
 const METRIC_MAX_MS = 600_000;
@@ -33,6 +35,7 @@ const TABS = /** @type {const} */ ([
  * @param {import('./time.js').Timers} [deps.timers]
  * @param {ReturnType<typeof createPushController>} [deps.push] les notifications (par défaut, celles du navigateur)
  * @param {typeof realSyncBadge} [deps.syncBadge]
+ * @param {Storage} [deps.storage] le stockage du brouillon de la note (celui du navigateur par défaut)
  */
 export function createShell({
   root,
@@ -42,6 +45,7 @@ export function createShell({
   timers = realTimers,
   push: injectedPush,
   syncBadge = realSyncBadge,
+  storage = safeLocalStorage(),
 }) {
   /** @type {HTMLElement | null} */
   let banner = null;
@@ -91,6 +95,9 @@ export function createShell({
   let badgedFleet = store.state.fleet;
   const presence = createPresence((body, keepalive) => void request('PUT', '/presence', body, keepalive), undefined, timers);
   const retry = createRetry(() => void refreshFleet(), undefined, timers);
+  // Le brouillon d'une note ne part que par un moteur : celui de l'onglet Notes, ou, partout ailleurs, celui-ci (sans écran).
+  const draftFlusher = createDraftFlusher({ request, timers, storage, store });
+  let notesOpen = false;
 
   function closeStream() {
     stream?.close();
@@ -163,6 +170,9 @@ export function createShell({
     unmountView?.();
     unmountView = undefined;
     view.replaceChildren();
+    // Un seul moteur de note à la fois : celui sans écran s'arrête avant que l'onglet ne monte, et reprend s'il reste un brouillon en le quittant.
+    notesOpen = route.name === 'notes';
+    if (notesOpen) draftFlusher.stop();
     // La session s'empile au-dessus de la flotte : plein écran, sans barre d'onglets.
     tabBar.hidden = notice.hidden = route.name === 'session';
     for (const tab of tabBar.querySelectorAll('button')) {
@@ -171,6 +181,7 @@ export function createShell({
     const mount = viewFor(route.name);
     if (mount) unmountView = mount(view, { route, store, request, push, timers });
     presence.setTarget(route.name === 'session' ? { session: route.session, pane: route.pane } : null);
+    if (!notesOpen) draftFlusher.kick();
   }
 
   function teardownApp() {
@@ -178,6 +189,8 @@ export function createShell({
     stopRouter = null;
     unmountView?.();
     unmountView = undefined;
+    draftFlusher.stop();
+    notesOpen = false;
     retry.stop();
     stopStreamRetry();
     closeStream();
@@ -251,6 +264,7 @@ export function createShell({
     closeStream();
     stopStreamRetry();
     dispatchEvent(new Event('idema:resume'));
+    if (!notesOpen) draftFlusher.kick(true);
     void push.refresh();
     if (await refreshFleet()) sendMetric('resume_ready', performance.now() - started);
   }
@@ -271,8 +285,11 @@ export function createShell({
   }
 
   document.addEventListener('visibilitychange', onVisibility);
+  let previousConnection = store.state.connection;
   const unsubscribe = store.subscribe((state) => {
     renderBanner();
+    if (state.connection === 'ok' && previousConnection !== 'ok' && shown === 'app' && !notesOpen) draftFlusher.kick();
+    previousConnection = state.connection;
     if (state.fleet && state.fleet !== badgedFleet) {
       badgedFleet = state.fleet;
       void syncBadge(state.fleet.badge);

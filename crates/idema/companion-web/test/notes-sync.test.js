@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { CACHE_KEY, createNotesSync, DRAFT_KEY, KEEPALIVE_MAX_BYTES, PUT_TIMEOUT_MS, SAVE_DELAY_MS } from '../js/notes-sync.js';
+import { CACHE_KEY, createDraftFlusher, createNotesSync, DRAFT_KEY, KEEPALIVE_MAX_BYTES, PUT_TIMEOUT_MS, SAVE_DELAY_MS } from '../js/notes-sync.js';
 import { createStore } from '../js/store.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -888,5 +888,81 @@ describe('GET timeout', () => {
     await h.sync.takeMac(); // lecture de reprise
     expect(h.gets().length).toBe(3);
     expect(h.gets().map((c) => c.timeoutMs)).toEqual([PUT_TIMEOUT_MS, PUT_TIMEOUT_MS, PUT_TIMEOUT_MS]);
+  });
+});
+
+describe('draft flusher (no Notes view mounted)', () => {
+  /** Un flusher dont le réseau et les minuteries sont à la main. @param {(method: string, path: string, body: any) => any} handler */
+  function flusherHarness(handler) {
+    /** @type {{method: string, path: string, body: any}[]} */
+    const calls = [];
+    const request = async (/** @type {string} */ method, /** @type {string} */ path, /** @type {any} */ body) => (calls.push({ method, path, body }), handler(method, path, body));
+    const timers = /** @type {any} */ ({ setTimeout: () => 1, clearTimeout() {}, setInterval: () => 0, clearInterval() {} });
+    const flusher = createDraftFlusher({ request: /** @type {any} */ (request), timers, storage: localStorage });
+    return { flusher, calls, puts: () => calls.filter((c) => c.method === 'PUT') };
+  }
+
+  test('a stored draft goes out, then the engine is gone', async () => {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify({ text: 'late', base: 5 }));
+    const mock = fakeMac('old', 5);
+    const h = flusherHarness(mock.handler);
+    h.flusher.kick();
+    await flush();
+    expect(mock.disk.text).toBe('late');
+    expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
+    const before = h.calls.length;
+    h.flusher.kick(true); // plus de brouillon : rien ne repart
+    await flush();
+    expect(h.calls.length).toBe(before);
+  });
+
+  test('no draft, no request', async () => {
+    const h = flusherHarness(() => mac('old'));
+    h.flusher.kick();
+    h.flusher.kick(true);
+    await flush();
+    expect(h.calls).toEqual([]);
+  });
+
+  test('kicking twice never runs two engines; a resume reloads the one that waits offline', async () => {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify({ text: 'late', base: 5 }));
+    const mock = fakeMac('old', 5);
+    let up = false;
+    const h = flusherHarness((method, path, body) => (up ? mock.handler(method, path, body) : OFFLINE));
+    h.flusher.kick();
+    await flush();
+    h.flusher.kick(); // même moteur, pas de seconde lecture
+    await flush();
+    expect(h.calls.filter((c) => c.method === 'GET').length).toBe(1);
+    up = true;
+    h.flusher.kick(true);
+    await flush();
+    expect(mock.disk.text).toBe('late');
+  });
+
+  test('stop() silences it: a late reply neither sends nor touches the storage', async () => {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify({ text: 'late', base: 5 }));
+    const slow = deferred();
+    const h = flusherHarness((method) => (method === 'GET' ? slow.promise : ok({ ok: true, modified_at: 6 })));
+    h.flusher.kick();
+    await flush();
+    h.flusher.stop();
+    const stored = localStorage.getItem(DRAFT_KEY);
+    slow.resolve(mac('old', 5));
+    await flush();
+    expect(h.puts()).toEqual([]);
+    expect(localStorage.getItem(DRAFT_KEY)).toBe(stored);
+  });
+
+  test('a conflict ends the flusher without touching the draft, which stays for the Notes view', async () => {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify({ text: 'late', base: 5 }));
+    const h = flusherHarness((method) => (method === 'GET' ? mac('elsewhere', 9) : http(409, 'note_changed')));
+    h.flusher.kick();
+    await flush();
+    expect(JSON.parse(localStorage.getItem(DRAFT_KEY) ?? 'null')).toMatchObject({ text: 'late' });
+    h.flusher.kick(); // le moteur est fini : un nouveau coup repart d'une lecture neuve, sans jamais écraser
+    await flush();
+    expect(h.calls.every((c) => !c.body?.force)).toBe(true);
+    expect(JSON.parse(localStorage.getItem(DRAFT_KEY) ?? 'null')).toMatchObject({ text: 'late' });
   });
 });

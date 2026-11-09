@@ -368,3 +368,50 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
     },
   };
 }
+
+/** Les états où un moteur sans écran n'a plus rien à tenter seul (le brouillon, s'il reste, attend l'onglet Notes). */
+const SETTLED = new Set(['saved', 'conflict', 'refused', 'readonly', 'locked']);
+
+/**
+ * Envoie le brouillon enregistré quand l'onglet Notes n'est pas monté (le moteur ne vit autrement que dans cet onglet) :
+ * un moteur sans écran, jamais deux à la fois, supprimé dès qu'il a fini. À arrêter (`stop`) avant que Notes ne monte.
+ * @param {{request: import('./push.js').Request, timers?: import('./time.js').Timers, storage: Storage, store?: Parameters<typeof createNotesSync>[0]['store']}} deps
+ */
+export function createDraftFlusher({ request, timers = realTimers, storage, store }) {
+  /** @type {ReturnType<typeof createNotesSync> | null} */
+  let engine = null;
+  function hasDraft() {
+    try {
+      return typeof JSON.parse(storage.getItem(DRAFT_KEY) ?? 'null')?.text === 'string';
+    } catch {
+      return false;
+    }
+  }
+  function stop() {
+    const running = engine;
+    engine = null;
+    running?.dispose();
+  }
+  return {
+    /** Lance le moteur s'il y a un brouillon ; s'il tourne déjà, `reload` le fait relire (retour au premier plan). @param {boolean} [reload] */
+    kick(reload = false) {
+      if (engine) {
+        if (reload) void engine.load();
+        return;
+      }
+      if (!hasDraft()) return;
+      const mine = createNotesSync({
+        request,
+        timers,
+        storage,
+        store,
+        onChange: () => {
+          if (engine === mine && SETTLED.has(mine.snapshot().state)) stop();
+        },
+      });
+      engine = mine;
+      void mine.load();
+    },
+    stop,
+  };
+}

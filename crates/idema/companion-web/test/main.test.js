@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { DRAFT_KEY } from '../js/notes-sync.js';
+import { mountNotes } from '../js/notes.js';
+import { registerView } from '../js/router.js';
 import { createShell } from '../js/shell.js';
 import { createStore } from '../js/store.js';
 
@@ -455,5 +458,122 @@ describe('notifications in the frame', () => {
     const app = await boot({ push: createPushController({ request: async () => ({ kind: 'ok', data: { subscribed: false } }), env }) });
     await app.start();
     expect(app.root.querySelector('.notice')?.textContent).toContain('Activer les notifications');
+  });
+});
+
+describe('a stored note draft outside the Notes tab', () => {
+  /** Un Mac qui garde la note, derrière la fausse api de la flotte ; `hold` met la lecture de la note en attente. */
+  function withScratchpad() {
+    const inner = fakeApi();
+    const disk = { text: 'old', at: 5 };
+    /** @type {{method: string, body: any}[]} */
+    const pad = [];
+    /** @type {((result: any) => void)[]} */
+    const held = [];
+    const state = { hold: false };
+    /** @type {import('../js/api.js').api} */
+    const api = (method, path, body, timeout, keepalive, headers) => {
+      if (path !== '/scratchpad') return inner.api(method, path, body, timeout, keepalive, headers);
+      pad.push({ method, body });
+      if (method === 'GET') {
+        const reply = { kind: /** @type {const} */ ('ok'), data: { text: disk.text, modified_at: disk.at, editable: true } };
+        return state.hold ? new Promise((resolve) => held.push(() => resolve(/** @type {any} */ (reply)))) : Promise.resolve(/** @type {any} */ (reply));
+      }
+      const put = /** @type {{text: string, base: number}} */ (body);
+      if (put.base !== disk.at) return Promise.resolve({ kind: /** @type {const} */ ('http'), status: 409, error: 'note_changed' });
+      disk.text = put.text;
+      disk.at += 1;
+      return Promise.resolve({ kind: /** @type {const} */ ('ok'), data: { ok: true, modified_at: disk.at } });
+    };
+    return { api, disk, pad, held, state, puts: () => pad.filter((c) => c.method === 'PUT'), gets: () => pad.filter((c) => c.method === 'GET') };
+  }
+  const putDraft = (/** @type {string} */ text) => localStorage.setItem(DRAFT_KEY, JSON.stringify({ text, base: 5 }));
+
+  beforeEach(() => registerView('notes', () => {}));
+  afterEach(() => registerView('notes', () => {}));
+
+  test('the app starting on the fleet sends the draft, once, and clears it', async () => {
+    const mac = withScratchpad();
+    const app = await boot({ api: mac.api });
+    putDraft('late draft');
+    await app.start();
+    expect(mac.puts().map((c) => /** @type {any} */ (c.body))).toEqual([{ text: 'late draft', base: 5 }]);
+    expect(mac.disk.text).toBe('late draft');
+    expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
+  });
+
+  test('no draft means no request to the note at all', async () => {
+    const mac = withScratchpad();
+    const app = await boot({ api: mac.api });
+    await app.start();
+    expect(mac.pad).toEqual([]);
+  });
+
+  test('a resume sends a draft that is still waiting', async () => {
+    const mac = withScratchpad();
+    const app = await boot({ api: mac.api });
+    await app.start();
+    putDraft('typed elsewhere');
+    setVisibility('hidden');
+    setVisibility('visible');
+    await flush();
+    expect(mac.puts().map((c) => /** @type {any} */ (c.body).text)).toEqual(['typed elsewhere']);
+  });
+
+  test('the connection coming back sends a draft that waited offline', async () => {
+    const mac = withScratchpad();
+    const app = await boot({ api: mac.api });
+    await app.start();
+    app.store.setConnection('offline');
+    putDraft('typed while offline');
+    app.store.setConnection('ok');
+    await flush();
+    expect(mac.puts().map((c) => /** @type {any} */ (c.body).text)).toEqual(['typed while offline']);
+  });
+
+  test('with the Notes tab mounted no second engine starts: the view owns the draft', async () => {
+    registerView('notes', mountNotes);
+    const mac = withScratchpad();
+    const app = await boot({ api: mac.api });
+    putDraft('late draft');
+    location.hash = '#/notes';
+    await app.start();
+    expect(mac.gets().length).toBe(1);
+    expect(mac.puts().map((c) => /** @type {any} */ (c.body).text)).toEqual(['late draft']);
+  });
+
+  test('opening Notes while the background engine waits on the Mac hands over: one write, the late reply changes nothing', async () => {
+    registerView('notes', mountNotes);
+    const mac = withScratchpad();
+    mac.state.hold = true;
+    const app = await boot({ api: mac.api });
+    putDraft('late draft');
+    await app.start(); // le moteur sans écran attend la lecture
+    expect(mac.gets().length).toBe(1);
+    location.hash = '#/notes';
+    await flush(); // l'onglet monte : sa propre lecture est aussi en attente
+    expect(mac.gets().length).toBe(2);
+    const [first, second] = mac.held;
+    second(null);
+    await flush();
+    expect(mac.puts().map((c) => /** @type {any} */ (c.body).text)).toEqual(['late draft']);
+    const stored = localStorage.getItem(DRAFT_KEY);
+    first(null); // la réponse tardive du moteur arrêté
+    await flush();
+    expect(mac.puts().length).toBe(1);
+    expect(localStorage.getItem(DRAFT_KEY)).toBe(stored);
+  });
+
+  test('leaving the Notes tab with a draft that did not go out starts the background engine', async () => {
+    registerView('notes', () => {});
+    const mac = withScratchpad();
+    const app = await boot({ api: mac.api });
+    location.hash = '#/notes';
+    await app.start();
+    putDraft('left behind');
+    location.hash = '#/';
+    await flush();
+    await flush(); // le changement de fragment, puis la lecture et l'envoi
+    expect(mac.puts().map((c) => /** @type {any} */ (c.body).text)).toEqual(['left behind']);
   });
 });
