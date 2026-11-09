@@ -537,6 +537,14 @@ fn ideation_section(
                 ),
         )
         .child(block)
+        // Filet entre les bouillons et ce qui suit (Projets ou machines), à égale distance des deux.
+        .child(
+            div()
+                .mt(theme.px(10.))
+                .mx(theme.px(8.))
+                .h(px(1.))
+                .bg(white(SEPARATOR)),
+        )
 }
 
 /// Le chevron d'un en-tête de machine, qui plie ou déplie.
