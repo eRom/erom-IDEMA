@@ -167,9 +167,9 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
   /** Un moteur démonté n'émet plus rien. @type {import('./push.js').Request} */
   const call = (method, path, body, keepalive, timeoutMs) => (alive ? request(method, path, body, keepalive, timeoutMs) : Promise.resolve({ kind: 'offline' }));
 
-  /** Lit la note du Mac ; une réponse 200 sans corps est une lecture ratée. */
+  /** Lit la note du Mac (délai par défaut : hors ligne, l'état doit tomber vite) ; une réponse 200 sans corps est une lecture ratée. */
   async function readMac() {
-    const res = await call('GET', '/scratchpad', undefined, false, PUT_TIMEOUT_MS);
+    const res = await call('GET', '/scratchpad');
     return res.kind === 'ok' && !res.data ? { kind: /** @type {const} */ ('offline') } : res;
   }
 
@@ -273,7 +273,10 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
       return setState(editable ? 'saved' : 'readonly');
     }
     if (res.kind === 'http' && res.status === 413) return setState('readonly', TOO_BIG_ON_PHONE);
-    if (draft) return setState('offline');
+    if (draft) {
+      scheduleRetry();
+      return setState('offline');
+    }
     if (state === 'loading' || state === 'locked') {
       const cached = readCache();
       if (!cached) return setState('locked', LOCKED_REASON);
@@ -309,15 +312,30 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
     return serial(doLoad);
   }
 
+  /** Un seul envoi de retour en attente à la fois : il part dès que le travail en cours est fini. */
+  let reconnectQueued = false;
+  /** La connexion revient : le délai de reprise repart de zéro et ce qui attendait le Mac part tout de suite. */
+  function onReconnect() {
+    clearRetry();
+    if (reconnectQueued) return;
+    reconnectQueued = true;
+    void serial(async () => {
+      reconnectQueued = false;
+      if (state === 'locked' || (state === 'offline' && !draft)) return doLoad();
+      if (draft && sendable(false)) {
+        clearTimer();
+        return doSend();
+      }
+    });
+  }
+
   const unsubscribe = store
     ? (() => {
         let previous = store.state.connection;
         return store.subscribe((next) => {
           const was = previous;
           previous = next.connection;
-          if (!alive || next.connection !== 'ok' || was === 'ok') return;
-          if (state === 'locked') void load();
-          else if (state === 'offline') void (draft ? flushNow() : load());
+          if (alive && next.connection === 'ok' && was !== 'ok') onReconnect();
         });
       })()
     : () => {};

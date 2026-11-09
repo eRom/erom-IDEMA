@@ -72,6 +72,8 @@ function harness({ handler, storage = localStorage, store }) {
   }
   const puts = () => calls.filter((c) => c.method === 'PUT');
   const gets = () => calls.filter((c) => c.method === 'GET');
+  /** Une réponse qui n'arrive qu'après `ms` de temps simulé (un Mac qui ne répond pas). @param {number} ms @param {any} value */
+  const later = (ms, value) => new Promise((resolve) => timers.setTimeout(() => resolve(value), ms));
   const storedDraft = () => JSON.parse(storage.getItem(DRAFT_KEY) ?? 'null');
   /** Le brouillon stocké sans la liste des envois à vérifier. */
   const draft = () => {
@@ -79,7 +81,7 @@ function harness({ handler, storage = localStorage, store }) {
     return stored && { text: stored.text, base: stored.base };
   };
   const cache = () => JSON.parse(storage.getItem(CACHE_KEY) ?? 'null');
-  return { sync, calls, puts, gets, states, advance, draft, storedDraft, cache, maxInFlight: () => maxInFlight };
+  return { sync, calls, puts, gets, later, states, advance, draft, storedDraft, cache, maxInFlight: () => maxInFlight };
 }
 
 /** Un Mac qui garde la note : GET la rend, PUT l'écrit (409 si la base n'est pas la sienne). */
@@ -869,8 +871,8 @@ describe('unexpected failures', () => {
   });
 });
 
-describe('GET timeout', () => {
-  test('every scratchpad read carries the same timeout as the write', async () => {
+describe('GET timeout and offline status', () => {
+  test('scratchpad reads keep the default request timeout, only the write gets the long one', async () => {
     const mock = fakeMac('old', 5);
     let first = true;
     const h = harness({
@@ -887,7 +889,130 @@ describe('GET timeout', () => {
     expect(h.sync.snapshot().state).toBe('conflict');
     await h.sync.takeMac(); // lecture de reprise
     expect(h.gets().length).toBe(3);
-    expect(h.gets().map((c) => c.timeoutMs)).toEqual([PUT_TIMEOUT_MS, PUT_TIMEOUT_MS, PUT_TIMEOUT_MS]);
+    expect(h.gets().map((c) => c.timeoutMs)).toEqual([undefined, undefined, undefined]);
+    expect(h.puts()[0]?.timeoutMs).toBe(PUT_TIMEOUT_MS);
+  });
+
+  test('with a pending draft and a Mac that never answers, the status says offline once the default timeout (4 s) is over', async () => {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify({ text: 'typed offline', base: 5 }));
+    /** @type {any} */
+    let h = null;
+    h = harness({ handler: (method, _path, _body, _keepalive, timeoutMs) => (method === 'GET' ? h.later(timeoutMs ?? 4000, TIMEOUT) : TIMEOUT) });
+    void h.sync.load();
+    await flush(); // la lecture part à t = 0
+    await h.advance(1000);
+    expect(h.sync.snapshot()).toMatchObject({ state: 'saving', text: 'typed offline' });
+    await h.advance(3000);
+    expect(h.sync.snapshot()).toMatchObject({ state: 'offline', text: 'typed offline' });
+    expect(h.draft()).toEqual({ text: 'typed offline', base: 5 });
+  });
+
+  test('a load that ends offline with a draft retries the send on its own (5 s), connection or not', async () => {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify({ text: 'late', base: 5 }));
+    const mock = fakeMac('old', 5);
+    let up = false;
+    const h = harness({ handler: (method, path, body) => (up ? mock.handler(method, path, body) : OFFLINE) });
+    await h.sync.load();
+    expect(h.sync.snapshot().state).toBe('offline');
+    up = true;
+    await h.advance(4_999);
+    expect(h.puts().length).toBe(0);
+    await h.advance(1);
+    expect(mock.disk.text).toBe('late');
+    expect(h.sync.snapshot().state).toBe('saved');
+  });
+});
+
+describe('the connection coming back sends a pending draft at once', () => {
+  test('while the opening read is still in flight, the draft goes out right after it, not after a backoff', async () => {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify({ text: 'late', base: 5 }));
+    const store = createStore(localStorage);
+    store.setConnection('offline');
+    const mock = fakeMac('old', 5);
+    let up = false;
+    /** @type {any} */
+    let h = null;
+    h = harness({
+      store,
+      handler: (method, path, body, _keepalive, timeoutMs) => {
+        if (up) return mock.handler(method, path, body);
+        return method === 'GET' ? h.later(timeoutMs ?? 4000, TIMEOUT) : OFFLINE;
+      },
+    });
+    void h.sync.load();
+    await flush(); // la lecture part à t = 0
+    await h.advance(1000);
+    up = true;
+    store.setConnection('ok'); // la lecture est encore en vol (état « saving »)
+    await h.advance(3000); // la lecture tombe à 4 s : le brouillon part dans la foulée
+    expect(mock.disk.text).toBe('late');
+    expect(h.sync.snapshot().state).toBe('saved');
+    expect(h.puts().length).toBe(1);
+    expect(h.maxInFlight()).toBe(1);
+  });
+
+  test('the backoff restarts from 5 s after a reconnection', async () => {
+    const store = createStore(localStorage);
+    const h = harness({ store, handler: (method) => (method === 'GET' ? mac('old', 5) : OFFLINE) });
+    await h.sync.load();
+    h.sync.edit('new');
+    await h.advance(SAVE_DELAY_MS); // 1er échec, reprise à 5 s
+    await h.advance(5_000); // 2e échec, reprise à 15 s
+    await h.advance(15_000); // 3e échec, reprise à 60 s
+    expect(h.puts().length).toBe(3);
+    store.setConnection('offline');
+    store.setConnection('ok'); // envoi immédiat, qui échoue encore
+    await h.advance(0);
+    expect(h.puts().length).toBe(4);
+    await h.advance(4_999);
+    expect(h.puts().length).toBe(4);
+    await h.advance(1); // la reprise repart de 5 s, pas de 60 s
+    expect(h.puts().length).toBe(5);
+  });
+
+  test('a send in flight when the connection flaps is followed by exactly one resend', async () => {
+    const store = createStore(localStorage);
+    const mock = fakeMac('old', 5);
+    const slow = deferred();
+    let first = true;
+    const h = harness({
+      store,
+      handler: (method, path, body) => {
+        if (method === 'PUT' && first) return ((first = false), slow.promise);
+        return mock.handler(method, path, body);
+      },
+    });
+    await h.sync.load();
+    h.sync.edit('new');
+    await h.advance(SAVE_DELAY_MS); // PUT en vol
+    expect(h.puts().length).toBe(1);
+    store.setConnection('offline');
+    store.setConnection('ok');
+    store.setConnection('offline');
+    store.setConnection('ok');
+    await flush();
+    expect(h.puts().length).toBe(1); // jamais deux PUT en vol
+    slow.resolve(OFFLINE);
+    await flush();
+    expect(h.puts().length).toBe(2); // un seul renvoi, tout de suite
+    expect(mock.disk.text).toBe('new');
+    expect(h.sync.snapshot().state).toBe('saved');
+    expect(h.maxInFlight()).toBe(1);
+  });
+
+  test('a conflict or a refusal is not sent again by a reconnection', async () => {
+    const store = createStore(localStorage);
+    const h = harness({ store, handler: (method) => (method === 'GET' ? mac('elsewhere', 9) : http(409, 'note_changed')) });
+    await h.sync.load();
+    h.sync.edit('mine');
+    await h.advance(SAVE_DELAY_MS);
+    expect(h.sync.snapshot().state).toBe('conflict');
+    const before = h.puts().length;
+    store.setConnection('offline');
+    store.setConnection('ok');
+    await h.advance(0);
+    expect(h.puts().length).toBe(before);
+    expect(h.sync.snapshot().state).toBe('conflict');
   });
 });
 
@@ -938,6 +1063,33 @@ describe('draft flusher (no Notes view mounted)', () => {
     h.flusher.kick(true);
     await flush();
     expect(mock.disk.text).toBe('late');
+  });
+
+  test('the connection coming back while its opening read is in flight sends the draft once that read fails', async () => {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify({ text: 'late', base: 5 }));
+    const store = createStore(localStorage);
+    store.setConnection('offline');
+    const mock = fakeMac('old', 5);
+    const slowRead = deferred();
+    let up = false;
+    /** @type {{method: string}[]} */
+    const calls = [];
+    const request = async (/** @type {string} */ method, /** @type {string} */ path, /** @type {any} */ body) => {
+      calls.push({ method });
+      if (up) return mock.handler(method, path, body);
+      return method === 'GET' ? slowRead.promise : OFFLINE;
+    };
+    const timers = /** @type {any} */ ({ setTimeout: () => 1, clearTimeout() {}, setInterval: () => 0, clearInterval() {} });
+    const flusher = createDraftFlusher({ request: /** @type {any} */ (request), timers, storage: localStorage, store });
+    flusher.kick();
+    await flush();
+    up = true;
+    store.setConnection('ok');
+    slowRead.resolve(OFFLINE);
+    await flush();
+    expect(mock.disk.text).toBe('late');
+    expect(calls.filter((c) => c.method === 'PUT').length).toBe(1);
+    expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
   });
 
   test('stop() silences it: a late reply neither sends nor touches the storage', async () => {
