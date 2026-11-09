@@ -662,6 +662,8 @@ fn local_header(
     };
     machine_header(theme, "local-machine", LOCAL_MACHINE.to_owned(), cx)
         .child(machine_chevron(theme, !collapsed))
+        // Toujours connectée : la pastille n'est là que pour aligner Localhost sur les machines distantes.
+        .child(connection_dot(theme, true))
         .child(
             div()
                 .flex_1()
