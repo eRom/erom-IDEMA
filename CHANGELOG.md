@@ -4,6 +4,12 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-09
+
+### Modifié
+
+- Compagnon iPhone : l'onglet Notes devient un vrai éditeur du Scratchpad. Toute la note se modifie en texte brut (supprimer, insérer au milieu, coller), avec un enregistrement automatique après une courte pause. Une barre collée au clavier ajoute `#`, `-`, retrait, indentation et un bloc de code. Sans le Mac, la frappe reste sur le téléphone et part seule à son retour, même si l'onglet Notes est fermé. Si la note a changé sur le Mac entre-temps, rien n'est écrasé : un bandeau propose de reprendre la note du Mac ou d'écraser avec le brouillon.
+
 ## [0.6.0] - 2026-11-08
 
 ### Ajouté

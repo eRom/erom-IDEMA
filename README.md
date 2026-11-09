@@ -179,6 +179,8 @@ IdemA peut vous prévenir sur l'iPhone quand un agent attend, et vous laisser lu
 
 Un Mac en veille, ou IdemA fermé, n'envoie aucune notification.
 
+L'onglet **Notes** édite le Scratchpad depuis l'iPhone, en texte brut, avec une barre collée au clavier (`#`, `-`, retrait, indentation, bloc de code). La note s'enregistre seule ; sans le Mac, la frappe attend sur le téléphone et part à son retour. Si la note a changé sur le Mac entre-temps, un bandeau demande quelle version garder.
+
 | Liste des compagnons | Panneau du compagnon | Notifications |
 | :---: | :---: | :---: |
 | ![Liste des compagnons](assets/screenshots/compagnon-list.png) | ![Panneau du compagnon](assets/screenshots/compagnon-pane.png) | ![Notifications](assets/screenshots/compagnon-notif.png) |
