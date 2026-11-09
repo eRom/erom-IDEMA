@@ -56,11 +56,17 @@ export const indent = (s) => mapLines(s, () => ({ head: '  ', cut: 0 }));
 /** `⇤` : jusqu'à deux espaces (jamais de tabulation) retirés devant chaque ligne touchée. @param {EditState} s */
 export const outdent = (s) => mapLines(s, (line) => ({ head: '', cut: /^ {1,2}/.exec(line)?.[0].length ?? 0 }));
 
-/** ```` ``` ```` : un bloc de code sur ses propres lignes, le curseur à l'intérieur. @param {EditState} s */
+/**
+ * ```` ``` ```` : un bloc de code sur ses propres lignes. Sans sélection, le curseur est à l'intérieur ; avec une
+ * sélection, elle est enveloppée et le curseur se pose juste après la clôture.
+ * @param {EditState} s
+ */
 export function insertFence(s) {
   const before = s.text.slice(0, s.start);
   const after = s.text.slice(s.end);
   const lead = before && !before.endsWith('\n') ? '\n' : '';
   const tail = after && !after.startsWith('\n') ? '\n' : '';
-  return replaceSelection(s, lead + FENCE + tail, lead.length + 4);
+  if (s.end === s.start) return replaceSelection(s, lead + FENCE + tail, lead.length + 4);
+  const block = `${lead}\`\`\`\n${s.text.slice(s.start, s.end)}\n\`\`\``;
+  return replaceSelection(s, block + tail, block.length);
 }

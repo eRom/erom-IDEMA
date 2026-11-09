@@ -31,3 +31,9 @@ test('``` inserts a fenced block on its own lines with the caret inside', () => 
   expect(insertFence(st('a\n\nb', 2))).toEqual(st('a\n```\n\n```\nb', 6));
   expect(insertFence(st('ab', 0))).toEqual(st('```\n\n```\nab', 4));
 });
+test('``` with a selection wraps it in a fence, the caret right after the closing fence', () => {
+  expect(insertFence(st('foo bar baz', 4, 7))).toEqual(st('foo \n```\nbar\n```\n baz', 16));
+  expect(insertFence(st('bar', 0, 3))).toEqual(st('```\nbar\n```', 11));
+  // Plusieurs lignes, sélection déjà sur ses propres lignes : aucun saut de ligne en plus.
+  expect(insertFence(st('keep\nselected\ncode\nkeep', 5, 18))).toEqual(st('keep\n```\nselected\ncode\n```\nkeep', 26));
+});
