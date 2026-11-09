@@ -72,9 +72,14 @@ function harness({ handler, storage = localStorage, store }) {
   }
   const puts = () => calls.filter((c) => c.method === 'PUT');
   const gets = () => calls.filter((c) => c.method === 'GET');
-  const draft = () => JSON.parse(storage.getItem(DRAFT_KEY) ?? 'null');
+  const storedDraft = () => JSON.parse(storage.getItem(DRAFT_KEY) ?? 'null');
+  /** Le brouillon stocké sans la liste des envois à vérifier. */
+  const draft = () => {
+    const stored = storedDraft();
+    return stored && { text: stored.text, base: stored.base };
+  };
   const cache = () => JSON.parse(storage.getItem(CACHE_KEY) ?? 'null');
-  return { sync, calls, puts, gets, states, advance, draft, cache, maxInFlight: () => maxInFlight };
+  return { sync, calls, puts, gets, states, advance, draft, storedDraft, cache, maxInFlight: () => maxInFlight };
 }
 
 /** Un Mac qui garde la note : GET la rend, PUT l'écrit (409 si la base n'est pas la sienne). */
@@ -461,6 +466,11 @@ describe('silent reconciliation (no false conflict)', () => {
     expect(h.draft()).toEqual({ text: 'ab', base: 5 });
     slow.resolve(ok({ ok: true, modified_at: 11 }));
     await flush();
+    // Le keepalive refusé n'a pas désarmé le minuteur : la suite part quand même, en envoi normal.
+    await h.advance(SAVE_DELAY_MS);
+    expect(h.puts().map((c) => c.body)).toEqual([{ text: 'a', base: 5 }, { text: 'ab', base: 11 }]);
+    expect(h.puts()[1].keepalive).toBe(false);
+    expect(h.sync.snapshot().state).toBe('saved');
   });
 });
 
@@ -479,6 +489,11 @@ describe('flushNow keepalive', () => {
     await h.sync.flushNow(true);
     expect(h.puts().length).toBe(1);
     expect(h.draft()?.text).toBe(big);
+    // Trop gros pour un keepalive : un envoi normal suit, il ne reste pas en « Enregistrement… ».
+    await h.advance(SAVE_DELAY_MS);
+    expect(h.puts().length).toBe(2);
+    expect(h.puts()[1].keepalive).toBe(false);
+    expect(h.sync.snapshot().state).toBe('saved');
   });
 
   test('flushNow(false) sends a big note normally', async () => {
@@ -551,5 +566,135 @@ describe('store connection', () => {
     await h.advance(5000);
     expect(h.puts().length).toBe(0);
     expect(h.draft()).toEqual({ text: 'x', base: 5 });
+  });
+});
+
+describe('texts sent without a sure answer', () => {
+  test('PUT a times out though the Mac wrote it, then typing ab and resending: no conflict', async () => {
+    const mock = fakeMac('old', 5);
+    const release = deferred();
+    let first = true;
+    const h = harness({
+      handler: async (method, path, body) => {
+        if (method === 'PUT' && first) {
+          first = false;
+          mock.handler(method, path, body); // le Mac écrit « a », la réponse se perd
+          await release.promise;
+          return TIMEOUT;
+        }
+        return mock.handler(method, path, body);
+      },
+    });
+    await h.sync.load();
+    h.sync.edit('a');
+    await h.advance(SAVE_DELAY_MS);
+    h.sync.edit('ab');
+    await h.advance(SAVE_DELAY_MS);
+    release.resolve(null);
+    await flush();
+    await h.advance(SAVE_DELAY_MS);
+    await h.sync.flushNow();
+    expect(h.states).not.toContain('conflict');
+    expect(h.sync.snapshot()).toMatchObject({ state: 'saved', text: 'ab' });
+    expect(mock.disk.text).toBe('ab');
+    expect(h.draft()).toBeNull();
+  });
+
+  test('the unconfirmed text is stored with the draft, so a new instance recognises it', async () => {
+    const mock = fakeMac('old', 5);
+    let lost = false;
+    const h1 = harness({ handler: (method, path, body) => (lost && method === 'PUT' ? (mock.handler(method, path, body), TIMEOUT) : mock.handler(method, path, body)) });
+    await h1.sync.load();
+    h1.sync.edit('a');
+    lost = true;
+    await h1.advance(SAVE_DELAY_MS);
+    h1.sync.edit('ab');
+    expect(h1.storedDraft()).toMatchObject({ text: 'ab', sent: ['a'] });
+    h1.sync.dispose();
+    const h2 = harness({ handler: mock.handler });
+    await h2.sync.load();
+    expect(h2.states).not.toContain('conflict');
+    expect(h2.sync.snapshot()).toMatchObject({ state: 'saved', text: 'ab' });
+    expect(mock.disk.text).toBe('ab');
+  });
+
+  test('reopening and typing during the load GET, while the Mac holds the phone own text: no conflict', async () => {
+    const mock = fakeMac('x', 6);
+    localStorage.setItem(DRAFT_KEY, JSON.stringify({ text: 'x', base: 5 }));
+    const gate = deferred();
+    let firstGet = true;
+    const h = harness({
+      handler: async (method, path, body) => {
+        if (method === 'GET' && firstGet) {
+          firstGet = false;
+          await gate.promise;
+        }
+        return mock.handler(method, path, body);
+      },
+    });
+    const loading = h.sync.load();
+    await flush();
+    h.sync.edit('xy');
+    gate.resolve(null);
+    await loading;
+    await h.advance(SAVE_DELAY_MS);
+    expect(h.states).not.toContain('conflict');
+    expect(h.sync.snapshot()).toMatchObject({ state: 'saved', text: 'xy' });
+    expect(mock.disk.text).toBe('xy');
+  });
+});
+
+describe('dispose', () => {
+  test('a late reply of a disposed engine never touches the storage of the next one', async () => {
+    const mock = fakeMac('old', 5);
+    const gate = deferred();
+    let slow = true;
+    const a = harness({
+      handler: async (method, path, body) => {
+        if (method === 'PUT' && slow) {
+          slow = false;
+          await gate.promise;
+        }
+        return mock.handler(method, path, body);
+      },
+    });
+    await a.sync.load();
+    a.sync.edit('a');
+    await a.advance(SAVE_DELAY_MS);
+    a.sync.dispose();
+    const b = harness({ handler: (method, path, body) => (method === 'GET' ? new Promise(() => {}) : mock.handler(method, path, body)) });
+    void b.sync.load();
+    await flush();
+    b.sync.edit('ab');
+    expect(b.draft()).toEqual({ text: 'ab', base: 5 });
+    gate.resolve(null);
+    await flush();
+    expect(b.draft()).toEqual({ text: 'ab', base: 5 });
+    expect(a.cache()).toEqual({ text: 'old', modified_at: 5 });
+    expect(a.puts().length).toBe(1);
+  });
+
+  test('a disposed engine sends nothing more from its queue', async () => {
+    const mock = fakeMac('old', 5);
+    const gate = deferred();
+    let slow = true;
+    const h = harness({
+      handler: async (method, path, body) => {
+        if (method === 'PUT' && slow) {
+          slow = false;
+          await gate.promise;
+        }
+        return mock.handler(method, path, body);
+      },
+    });
+    await h.sync.load();
+    h.sync.edit('a');
+    await h.advance(SAVE_DELAY_MS);
+    h.sync.edit('ab');
+    void h.sync.flushNow();
+    h.sync.dispose();
+    gate.resolve(null);
+    await flush();
+    expect(h.puts().length).toBe(1);
   });
 });

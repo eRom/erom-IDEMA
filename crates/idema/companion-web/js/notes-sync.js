@@ -1,6 +1,5 @@
 // @ts-check
-// Le moteur de sauvegarde de l'éditeur de notes : écriture différée, brouillon hors ligne, cache, base et conflit.
-// Sans DOM. Règle d'or : le texte tapé n'est jamais remplacé par une réponse du Mac, sauf `takeMac`.
+// Le moteur de sauvegarde de l'éditeur de notes (sans DOM) : le texte tapé n'est jamais remplacé par une réponse du Mac, sauf `takeMac`.
 
 import { realTimers } from './time.js';
 
@@ -17,9 +16,9 @@ export const SAVE_DELAY_MS = 800;
 export const PUT_TIMEOUT_MS = 15_000;
 export const KEEPALIVE_MAX_BYTES = 64 * 1024;
 const STORAGE_PREFIX = 'idema.notes.';
-/** `{text, base}` : le texte tapé pas encore écrit, et le modified_at du disque dont il est parti. */
+/** `{text, base, sent}` : le texte pas encore écrit, le modified_at dont il part, les envois à vérifier. */
 export const DRAFT_KEY = STORAGE_PREFIX + 'draft';
-/** `{text, modified_at}` : la dernière note connue du Mac, pour ouvrir sans lui. */
+/** `{text, modified_at}` : la dernière note connue du Mac. */
 export const CACHE_KEY = STORAGE_PREFIX + 'cache';
 
 const LOCKED_REASON = "Le Mac ne répond pas : la note s'ouvrira à son retour.";
@@ -50,21 +49,25 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
   let reason = /** @type {string | undefined} */ (undefined);
   let text = '';
   let savedAt = /** @type {number | null} */ (null);
-  /** Le brouillon : non nul tant que `text` n'est pas sur le disque. Miroir mémoire du stockage (qui peut refuser). */
+  /** Non nul tant que `text` n'est pas sur le disque (miroir du stockage, qui peut refuser). */
   let draft = /** @type {{text: string, base: number | null} | null} */ (null);
-  /** `edit()` a été appelé depuis le montage : plus aucune réponse du Mac ne remplace `text` (sauf `takeMac`). */
+  /** `edit()` a été appelé depuis le montage. */
   let touched = false;
-  /** Numéro de la dernière frappe, pour qu'une action asynchrone sache si on a tapé pendant qu'elle attendait. */
+  /** Numéro de la dernière frappe. */
   let rev = 0;
   let alive = true;
   let timer = /** @type {any} */ (null);
+  /** Textes envoyés sans réponse sûre (hors ligne, délai) : le Mac les a peut-être écrits. */
+  let unconfirmed = /** @type {string[]} */ ([]);
 
-  /** @param {string} key @param {unknown} value */
+  /** Plus d'écriture après `dispose()` : le montage suivant est seul maître du stockage. @param {string} key @param {unknown} value */
   function save(key, value) {
+    if (!alive) return false;
     try {
       storage.setItem(key, JSON.stringify(value));
+      return true;
     } catch {
-      // Stockage plein ou refusé : le brouillon reste en mémoire et l'envoi continue.
+      return false; // stockage plein ou refusé : le brouillon reste en mémoire et l'envoi continue
     }
   }
   /** @param {string} key */
@@ -77,7 +80,9 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
   }
   function readDraft() {
     const stored = readJson(DRAFT_KEY);
-    return stored && typeof stored.text === 'string' ? { text: /** @type {string} */ (stored.text), base: asBase(stored.base) } : null;
+    if (!stored || typeof stored.text !== 'string') return null;
+    const sent = Array.isArray(stored.sent) ? stored.sent.filter((/** @type {unknown} */ t) => typeof t === 'string') : [];
+    return { text: /** @type {string} */ (stored.text), base: asBase(stored.base), sent: /** @type {string[]} */ (sent) };
   }
   function readCache() {
     const stored = readJson(CACHE_KEY);
@@ -85,12 +90,23 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
   }
   /** @param {string} t @param {number | null} modifiedAt */
   const writeCache = (t, modifiedAt) => save(CACHE_KEY, { text: t, modified_at: modifiedAt });
+  function persistDraft() {
+    if (draft && !save(DRAFT_KEY, { ...draft, sent: unconfirmed })) save(DRAFT_KEY, draft); // sans les envois à vérifier si la place manque
+  }
   function setDraft() {
     draft = { text, base: savedAt };
-    save(DRAFT_KEY, draft);
+    persistDraft();
   }
+  /** @param {string} t */
+  function remember(t) {
+    unconfirmed = [...unconfirmed.filter((u) => norm(u) !== norm(t)), t].slice(-3);
+  }
+  /** @param {string} macText @param {...string} more */
+  const isOwn = (macText, ...more) => [...unconfirmed, ...more].some((t) => norm(t) === macText);
   function dropDraft() {
     draft = null;
+    unconfirmed = [];
+    if (!alive) return;
     try {
       storage.removeItem(DRAFT_KEY);
     } catch {
@@ -104,61 +120,92 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
     reason = why;
     if (alive) onChange?.();
   }
+  function arm() {
+    if (timer === null) timer = timers.setTimeout(onTimer, SAVE_DELAY_MS);
+  }
   function clearTimer() {
     if (timer !== null) timers.clearTimeout(timer);
     timer = null;
   }
 
-  // Un seul travail réseau à la fois (chargement, PUT, reprise) : sinon deux PUT se doublent et se prennent pour un conflit.
+  // Un seul travail réseau à la fois : deux PUT en vol se prendraient pour un conflit.
   let tail = /** @type {Promise<void>} */ (Promise.resolve());
-  /** Travaux en cours ou en attente : un keepalive de page qui se cache ne double pas un envoi en vol. */
+  /** Travaux en cours ou en attente. */
   let jobs = 0;
   /** @param {() => Promise<void>} job */
   function serial(job) {
     jobs++;
-    tail = tail.then(job).catch(() => {}).then(() => void jobs--);
+    tail = tail.then(() => (alive ? job() : undefined)).catch(() => {}).then(() => void jobs--);
     return tail;
   }
 
-  /** Le Mac a écrit `sent` : la base avance, le cache suit, le brouillon part s'il n'y a rien de plus récent. @param {string} sent @param {number | null} modifiedAt */
+  /** Un moteur démonté n'émet plus rien. @type {import('./push.js').Request} */
+  const call = (method, path, body, keepalive, timeoutMs) => (alive ? request(method, path, body, keepalive, timeoutMs) : Promise.resolve({ kind: 'offline' }));
+
+  /** Le Mac a écrit `sent` : la base avance ; le brouillon reste s'il y a plus récent. @param {string} sent @param {number | null} modifiedAt */
   function onSaved(sent, modifiedAt) {
     savedAt = modifiedAt;
     writeCache(sent, modifiedAt);
+    unconfirmed = [];
     if (norm(text) === norm(sent)) {
       dropDraft();
       setState('saved');
     } else {
-      setDraft(); // frappé pendant l'envoi : le brouillon repart de la nouvelle base
+      setDraft();
+      arm();
       setState('saving');
     }
   }
 
+  /** Le Mac porte un de nos textes : sa base, sans bandeau. Vrai si c'est le courant. @param {string} macText @param {number | null} macAt */
+  function adoptOwn(macText, macAt) {
+    savedAt = macAt;
+    writeCache(macText, macAt);
+    if (norm(text) === norm(macText)) {
+      dropDraft();
+      setState('saved');
+      return true;
+    }
+    unconfirmed = [];
+    setDraft();
+    setState('saving');
+    return false;
+  }
+
   /**
-   * Un 409 : la base n'est plus celle du Mac. Si le Mac a déjà notre texte (réponse perdue, délai dépassé), on prend
-   * sa base sans rien dire ; sinon, conflit. Hors ligne, on ne sait pas : le brouillon attend.
+   * Un 409 : si le Mac porte déjà un de nos textes (réponse perdue), on reprend sa base et on renvoie le courant ; sinon conflit.
    * @param {string} sent
+   * @returns {Promise<void>}
    */
   async function reconcile(sent) {
-    const res = await request('GET', '/scratchpad');
-    if (res.kind !== 'ok') return setState('offline');
-    const macText = norm(String(res.data.text ?? ''));
+    const res = await call('GET', '/scratchpad');
+    if (res.kind !== 'ok') {
+      remember(sent);
+      persistDraft();
+      return setState('offline');
+    }
+    const macRaw = String(res.data.text ?? '');
     const macAt = asBase(res.data.modified_at);
-    if (macText === norm(sent)) return onSaved(sent, macAt);
-    if (macText === norm(text)) return onSaved(text, macAt);
-    writeCache(String(res.data.text ?? ''), macAt);
+    if (isOwn(norm(macRaw), sent, text)) return adoptOwn(macRaw, macAt) ? undefined : doSend();
+    writeCache(macRaw, macAt);
     clearTimer();
     setState('conflict');
   }
 
-  /** @param {{force?: boolean, keepalive?: boolean}} [options] */
+  /** @param {{force?: boolean, keepalive?: boolean}} [options] @returns {Promise<void>} */
   async function doSend({ force = false, keepalive = false } = {}) {
     const sent = text;
     const body = force ? { text: sent, base: savedAt, force: true } : { text: sent, base: savedAt };
-    if (keepalive && new TextEncoder().encode(JSON.stringify(body)).length > KEEPALIVE_MAX_BYTES) return; // le brouillon suffit
+    if (keepalive && new TextEncoder().encode(JSON.stringify(body)).length > KEEPALIVE_MAX_BYTES) return arm(); // trop gros : un envoi normal suit
     if (state !== 'offline') setState('saving');
-    const res = await request('PUT', '/scratchpad', body, keepalive, PUT_TIMEOUT_MS);
+    const res = await call('PUT', '/scratchpad', body, keepalive, PUT_TIMEOUT_MS);
     if (res.kind === 'ok') return onSaved(sent, asBase(res.data?.modified_at));
-    if (res.kind !== 'http') return setState('offline'); // hors ligne, délai (le Mac a peut-être écrit : le 409 suivant le dira), non appairé
+    if (res.kind !== 'http') {
+      // Hors ligne ou délai : le Mac a peut-être écrit, le 409 suivant reconnaîtra ce texte.
+      remember(sent);
+      persistDraft();
+      return setState('offline');
+    }
     if (res.status === 409) return reconcile(sent);
     return setState('refused', res.status === 413 ? 'note trop grosse (5 Mo au plus)' : (REFUSALS[res.error] ?? "le Mac a refusé l'enregistrement"));
   }
@@ -172,31 +219,30 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
   }
 
   async function doLoad() {
-    const pending = draft ?? readDraft();
+    const stored = draft ? null : readDraft();
+    const pending = draft ?? stored;
     if (pending) {
-      draft = pending;
+      if (stored) unconfirmed = stored.sent;
+      draft = { text: pending.text, base: pending.base };
+      remember(pending.text);
       text = pending.text;
       savedAt = pending.base;
       if (state === 'loading' || state === 'locked') setState('saving');
     }
-    const res = await request('GET', '/scratchpad');
+    const res = await call('GET', '/scratchpad');
     if (res.kind === 'ok') {
       const { mac, macAt, editable } = adopt(res);
       if (draft) {
-        if (norm(mac) === norm(draft.text)) {
-          savedAt = macAt;
-          dropDraft();
-          return setState(editable ? 'saved' : 'readonly');
-        }
+        if (isOwn(norm(mac), draft.text) && adoptOwn(mac, macAt)) return editable ? undefined : setState('readonly');
         if (!editable) return setState('readonly');
-        return doSend(); // la base du brouillon décide : un Mac qui a bougé répondra 409
+        return doSend();
       }
       if (!touched) {
         text = mac;
         savedAt = macAt;
       } else if (norm(text) === norm(mac)) {
         savedAt = macAt;
-      } // sinon la base périmée reste : la prochaine écriture sera refusée (409) plutôt que d'écraser le Mac
+      } // sinon la base reste périmée : le 409 plutôt que d'écraser le Mac
       return setState(editable ? 'saved' : 'readonly');
     }
     if (res.kind === 'http' && res.status === 413) return setState('readonly', TOO_BIG_ON_PHONE);
@@ -208,28 +254,28 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
       savedAt = cached.modified_at;
       return setState('offline');
     }
-    // Un éditeur qui marche déjà ne se verrouille pas pour une reprise ratée.
   }
 
   /** Les états où une frappe part toute seule. @param {boolean} afterEdit */
   const sendable = (afterEdit) => state === 'saved' || state === 'saving' || state === 'offline' || (afterEdit && state === 'refused');
 
+  /** @param {boolean} afterEdit */
+  const sendIfDirty = (afterEdit) =>
+    serial(async () => {
+      if (draft && sendable(afterEdit)) await doSend();
+    });
+
   function onTimer() {
     timer = null;
-    void serial(async () => {
-      if (draft && sendable(true)) await doSend();
-    });
+    void sendIfDirty(true);
   }
 
   /** @param {boolean} [keepalive] */
   function flushNow(keepalive = false) {
-    clearTimer();
     if (!draft || !sendable(false)) return Promise.resolve();
-    // Un keepalive part de la page qui se cache : s'il y a déjà un travail en vol, le brouillon suffit.
-    if (keepalive) return jobs > 0 ? Promise.resolve() : serial(() => doSend({ keepalive: true }));
-    return serial(async () => {
-      if (draft && sendable(false)) await doSend();
-    });
+    if (keepalive && jobs > 0) return Promise.resolve(); // le brouillon suffit, le minuteur reste
+    clearTimer();
+    return keepalive ? serial(() => doSend({ keepalive: true })) : sendIfDirty(false);
   }
 
   function load() {
@@ -258,7 +304,7 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
       rev++;
       text = next;
       setDraft();
-      if (state === 'conflict') return; // le brouillon se met à jour, rien ne part avant le choix de Romain
+      if (state === 'conflict') return; // rien ne part avant le choix de Romain
       if (state === 'saved') setState('saving');
       clearTimer();
       timer = timers.setTimeout(onTimer, SAVE_DELAY_MS);
@@ -275,8 +321,8 @@ export function createNotesSync({ request, timers = realTimers, storage, onChang
       return serial(async () => {
         clearTimer();
         const seen = rev;
-        const res = await request('GET', '/scratchpad');
-        if (res.kind !== 'ok' || seen !== rev) return; // rien tapé ne doit se perdre pendant l'attente
+        const res = await call('GET', '/scratchpad');
+        if (res.kind !== 'ok' || seen !== rev) return; // rien de tapé ne se perd
         const { mac, macAt, editable } = adopt(res);
         text = mac;
         savedAt = macAt;
