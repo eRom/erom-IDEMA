@@ -4,6 +4,12 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-11
+
+### Corrigé
+
+- Compagnon iPhone : les bordures du champ de saisie de Claude Code tiennent sur une seule ligne, au lieu de s'étaler sur plusieurs lignes quand le terminal du Mac est large. Le nom de session reste à droite comme sur le Mac. Les tableaux, la prose et le mode sans retour à la ligne s'affichent comme avant.
+
 ## [0.6.1] - 2026-11-09
 
 ### Modifié
