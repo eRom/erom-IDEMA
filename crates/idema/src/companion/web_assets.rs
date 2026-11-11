@@ -451,8 +451,9 @@ mod tests {
     /// de l'app, soit les octets que le Mac envoie. Lancer avec `-- --nocapture` pour lire la somme.
     /// Relevé à 56 Kio (57 344 octets) pour l'éditeur de notes : le moteur de sauvegarde, la barre d'outils et le
     /// brouillon hors ligne ne tenaient plus dans les 48 Kio d'origine (spec
-    /// docs/superpowers/specs/2026-11-09-idema-notes-editeur-design.md).
-    const GZIP_CEILING: usize = 57_344;
+    /// docs/superpowers/specs/2026-11-09-idema-notes-editeur-design.md). Relevé à 60 Kio (61 440 octets) en 0.6.3 :
+    /// le rendu des bordures du champ de saisie (0.6.2) portait la page à 57 502 octets.
+    const GZIP_CEILING: usize = 61_440;
 
     #[test]
     fn the_gzipped_app_stays_under_the_ceiling() {
