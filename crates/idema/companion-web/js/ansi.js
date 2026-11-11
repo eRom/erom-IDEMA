@@ -169,16 +169,19 @@ function segmentNode(seg, text, extraClass = '') {
  */
 function ruleNode(segments) {
   const rule = el('span', { class: 'term__rule' });
+  // Dans un conteneur flex, un nœud texte fait uniquement de blancs n'est pas rendu : tout enfant est donc un élément.
+  /** @param {string | HTMLElement} node */
+  const push = (node) => rule.append(typeof node === 'string' ? el('span', {}, node) : node);
   segments.forEach((seg, index) => {
     // Les blancs de fin de ligne ne comptent que sur le dernier segment.
     const shrinkable = index === segments.length - 1 ? new RegExp(`${RULE_RUN.source}|\\s+$`, 'g') : RULE_RUN_GLOBAL;
     let at = 0;
     for (const match of seg.text.matchAll(shrinkable)) {
-      if (match.index > at) rule.append(segmentNode(seg, seg.text.slice(at, match.index)));
-      rule.append(segmentNode(seg, match[0], 'term__rule-run'));
+      if (match.index > at) push(segmentNode(seg, seg.text.slice(at, match.index)));
+      push(segmentNode(seg, match[0], 'term__rule-run'));
       at = match.index + match[0].length;
     }
-    if (at < seg.text.length) rule.append(segmentNode(seg, seg.text.slice(at)));
+    if (at < seg.text.length) push(segmentNode(seg, seg.text.slice(at)));
   });
   return rule;
 }

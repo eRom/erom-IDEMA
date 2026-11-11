@@ -175,6 +175,14 @@ describe('renderScreen, rule lines', () => {
     expect(run.textContent).toBe('─'.repeat(40));
   });
 
+  test('every child of a rule is an element, whitespace-only segments included', () => {
+    const text = `${ESC}[2m${'─'.repeat(300)}${ESC}[0m   ${ESC}[36mlabel${ESC}[0m ${ESC}[2m─${ESC}[0m`;
+    const rule = /** @type {HTMLElement} */ (render(text).querySelector('.term__rule'));
+    expect(rule).not.toBeNull();
+    expect([...rule.childNodes].every((node) => node.nodeType === 1)).toBe(true);
+    expect(rule.textContent).toBe('─'.repeat(300) + '   label ─');
+  });
+
   test('lines that are not input-box rules keep the plain rendering', () => {
     const table = `├${'─'.repeat(20)}┼${'─'.repeat(20)}┤`;
     const box = `╭${'─'.repeat(30)}╮`;
