@@ -38,7 +38,7 @@ pub const SIDEBAR_WIDTH: f32 = 248.;
 pub const TITLE_BAND: f32 = 52.;
 /// Bord de la pastille de repos : 32 % dans la maquette. Une pastille n'est pas un texte, le plancher de 55 % ne s'y applique pas.
 const DOT_IDLE: f32 = 0.32;
-/// Anneau de la pastille de connexion d'une machine non connectée : blanc 30 % dans la maquette.
+/// Icône de connexion d'une machine non connectée : blanc 30 %, comme l'anneau de la maquette.
 const CONNECTION_OFF: f32 = 0.30;
 /// Opacité du halo de la pastille « en cours » : `rgba(48,209,88,0.16)` dans la maquette.
 const RUNNING_HALO: f32 = 0.16;
@@ -670,8 +670,8 @@ fn local_header(
     };
     machine_header(theme, "local-machine", LOCAL_MACHINE.to_owned(), cx)
         .child(machine_chevron(theme, !collapsed))
-        // Toujours connectée : la pastille n'est là que pour aligner Localhost sur les machines distantes.
-        .child(connection_dot(theme, true))
+        // Toujours connectée : l'icône n'est là que pour aligner Localhost sur les machines distantes.
+        .child(connection_icon(theme, true))
         .child(
             div()
                 .flex_1()
@@ -682,14 +682,18 @@ fn local_header(
         .children(right)
 }
 
-/// La pastille de connexion de 7 px : pleine `#30D158` connectée, anneau blanc 30 % sinon.
-fn connection_dot(theme: &Theme, connected: bool) -> Div {
-    let dot = div().flex_none().size(theme.px(7.)).rounded_full();
-    if connected {
-        dot.bg(color(RUNNING))
-    } else {
-        dot.border(px(1.5)).border_color(white(CONNECTION_OFF))
-    }
+/// L'icône de connexion d'une machine, 16 px : un écran `#30D158` connectée, grisé sinon. Une icône plutôt qu'une
+/// pastille, pour ne pas se confondre avec les pastilles d'état des sessions juste en dessous.
+fn connection_icon(theme: &Theme, connected: bool) -> impl IntoElement {
+    svg()
+        .flex_none()
+        .path(Icon::Computer.path())
+        .size(theme.px(16.))
+        .text_color(if connected {
+            color(RUNNING)
+        } else {
+            white(CONNECTION_OFF)
+        })
 }
 
 /// La ligne d'une machine en échec : sa cause, avec une majuscule, puis « Réessayer ».
@@ -833,7 +837,7 @@ fn machine_section(
     };
     let header = machine_header(&theme, ("machine", index), connection.clone(), cx)
         .child(machine_chevron(&theme, !collapsed))
-        .child(connection_dot(
+        .child(connection_icon(
             &theme,
             machine.status == MachineStatus::Connected && !machine.link_stalled,
         ))

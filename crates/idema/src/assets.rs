@@ -99,10 +99,12 @@ pub enum Icon {
     ContentCopy,
     /// Ligne « Compagnon » de la barre latérale de « Personnaliser » (graisse 300).
     Smartphone,
+    /// État de connexion d'une machine dans la barre latérale : vert connectée, grisée sinon (trait 1,5).
+    Computer,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 58] = [
+    pub const ALL: [Icon; 59] = [
         Icon::Add,
         Icon::AddBold,
         Icon::Check,
@@ -161,6 +163,7 @@ impl Icon {
         Icon::Warning,
         Icon::ContentCopy,
         Icon::Smartphone,
+        Icon::Computer,
     ];
 
     /// Chemin à donner à `svg().path(...)`. Les icônes d'IdemA vivent sous `icons/idema/` : les chemins
@@ -225,6 +228,7 @@ impl Icon {
             Self::Warning => "icons/idema/warning.svg",
             Self::ContentCopy => "icons/idema/content_copy.svg",
             Self::Smartphone => "icons/idema/smartphone.svg",
+            Self::Computer => "icons/idema/computer.svg",
         }
     }
 
@@ -288,6 +292,7 @@ impl Icon {
             Self::Warning => include_bytes!("../assets/icons/warning.svg"),
             Self::ContentCopy => include_bytes!("../assets/icons/content_copy.svg"),
             Self::Smartphone => include_bytes!("../assets/icons/smartphone.svg"),
+            Self::Computer => include_bytes!("../assets/icons/computer.svg"),
         }
     }
 }
