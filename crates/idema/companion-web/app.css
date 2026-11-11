@@ -114,6 +114,10 @@ p { margin: 0; }
 .term { flex: 1; min-height: 0; padding: 4px 12px 12px; overflow: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; background: var(--screen-bg); font: 400 12.5px/1.55 var(--mono); }
 .term__text { margin: 0; color: var(--screen-text); font: inherit; overflow-wrap: anywhere; white-space: pre-wrap; }
 .term--nowrap .term__text { width: max-content; min-width: 100%; overflow-wrap: normal; white-space: pre; }
+/* Un filet (cadre de saisie) tient sur une rangée : seules ses longues suites de traits rétrécissent, l'étiquette reste à droite. */
+.term__rule { display: inline-flex; width: 100%; overflow: hidden; vertical-align: top; white-space: pre; overflow-wrap: normal; }
+.term__rule-run { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+.term--nowrap .term__rule { display: inline; }
 .term__more { display: block; min-height: var(--target); margin: 4px auto; padding: 0 16px; border: 0; border-radius: var(--radius-control); background: var(--press); color: var(--accent-text); font: 600 15px/1 var(--font); }
 .sgr-b { font-weight: 700; }
 .sgr-d { opacity: 0.6; }

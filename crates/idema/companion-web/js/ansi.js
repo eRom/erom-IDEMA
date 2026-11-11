@@ -127,29 +127,75 @@ export function parseSgr(text) {
 
 const CLASSES = /** @type {const} */ ([['bold', 'sgr-b'], ['dim', 'sgr-d'], ['italic', 'sgr-i'], ['underline', 'sgr-u']]);
 
+// Une ligne de filet (le cadre de saisie de Claude Code, large comme le terminal du Mac) doit tenir sur une rangée du
+// téléphone. Un filet est une suite d'au moins 16 traits horizontaux : en dessous, c'est un tiret de prose.
+const RULE_RUN = /[─━═]{16,}/;
+const RULE_RUN_GLOBAL = new RegExp(RULE_RUN.source, 'g');
+// Tout autre caractère de tracé (barres, coins, jonctions) signe un tableau ou une boîte : ceux-là gardent leur rendu.
+const OTHER_BOX_DRAWING = /[│-╏║-╿]/;
+// Au-delà de 40 caractères hors filet, la ligne est du texte qui porte un filet, pas un filet qui porte une étiquette.
+const RULE_LABEL_MAX = 40;
+
+/** Vrai si la ligne n'est qu'un filet, avec au plus une courte étiquette. @param {Segment[]} segments */
+function isRuleLine(segments) {
+  const text = segments.map((seg) => seg.text).join('');
+  return RULE_RUN.test(text) && !OTHER_BOX_DRAWING.test(text) && text.replace(RULE_RUN_GLOBAL, '').trim().length <= RULE_LABEL_MAX;
+}
+
 /**
- * Les lignes en un `<pre>`. Les couleurs passent par le CSSOM (la CSP refuse l'attribut `style` écrit en HTML), les
- * attributs par des classes ; le texte sans style reste un nœud texte nu.
+ * Le nœud d'un segment : un nœud texte nu sans style, sinon un `<span>`. Les couleurs passent par le CSSOM (la CSP
+ * refuse l'attribut `style` écrit en HTML), les attributs par des classes. `extraClass` force le `<span>`.
+ * @param {Style} seg @param {string} text @param {string} [extraClass]
+ * @returns {string | HTMLElement}
+ */
+function segmentNode(seg, text, extraClass = '') {
+  /** @type {string[]} */
+  const classes = CLASSES.filter(([key]) => seg[key]).map(([, name]) => name);
+  if (extraClass) classes.push(extraClass);
+  // Inversé : les couleurs s'échangent, le défaut du texte devient le fond et inversement.
+  const fg = seg.inverse ? (seg.bg ?? 'var(--screen-bg)') : seg.fg;
+  const bg = seg.inverse ? (seg.fg ?? 'var(--screen-text)') : seg.bg;
+  if (!fg && !bg && !classes.length) return text;
+  const span = el('span', { class: classes.join(' ') }, text);
+  if (fg) span.style.color = fg;
+  if (bg) span.style.backgroundColor = bg;
+  return span;
+}
+
+/**
+ * Une ligne de filet en un seul `<span>` : les longues suites de traits et les blancs de fin sont les seuls morceaux
+ * qui rétrécissent (CSS), l'étiquette et le reste gardent leur largeur. Le texte total ne change pas.
+ * @param {Segment[]} segments
+ */
+function ruleNode(segments) {
+  const rule = el('span', { class: 'term__rule' });
+  segments.forEach((seg, index) => {
+    // Les blancs de fin de ligne ne comptent que sur le dernier segment.
+    const shrinkable = index === segments.length - 1 ? new RegExp(`${RULE_RUN.source}|\\s+$`, 'g') : RULE_RUN_GLOBAL;
+    let at = 0;
+    for (const match of seg.text.matchAll(shrinkable)) {
+      if (match.index > at) rule.append(segmentNode(seg, seg.text.slice(at, match.index)));
+      rule.append(segmentNode(seg, match[0], 'term__rule-run'));
+      at = match.index + match[0].length;
+    }
+    if (at < seg.text.length) rule.append(segmentNode(seg, seg.text.slice(at)));
+  });
+  return rule;
+}
+
+/**
+ * Les lignes en un `<pre>`. Le texte sans style reste un nœud texte nu ; une ligne de filet est enveloppée à part.
  * @param {Segment[][]} lines
  */
 export function renderScreen(lines) {
   const pre = el('pre', { class: 'term__text' });
   lines.forEach((segments, index) => {
     if (index > 0) pre.append('\n');
-    for (const seg of segments) {
-      const classes = CLASSES.filter(([key]) => seg[key]).map(([, name]) => name);
-      // Inversé : les couleurs s'échangent, le défaut du texte devient le fond et inversement.
-      const fg = seg.inverse ? (seg.bg ?? 'var(--screen-bg)') : seg.fg;
-      const bg = seg.inverse ? (seg.fg ?? 'var(--screen-text)') : seg.bg;
-      if (!fg && !bg && !classes.length) {
-        pre.append(seg.text);
-        continue;
-      }
-      const span = el('span', { class: classes.join(' ') }, seg.text);
-      if (fg) span.style.color = fg;
-      if (bg) span.style.backgroundColor = bg;
-      pre.append(span);
+    if (isRuleLine(segments)) {
+      pre.append(ruleNode(segments));
+      return;
     }
+    for (const seg of segments) pre.append(segmentNode(seg, seg.text));
   });
   return pre;
 }

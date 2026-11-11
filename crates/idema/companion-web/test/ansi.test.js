@@ -141,3 +141,58 @@ describe('renderScreen', () => {
     expect(renderScreen(parseSgr('a\n\nb')).textContent).toBe('a\n\nb');
   });
 });
+
+describe('renderScreen, rule lines', () => {
+  /** @param {string} text */
+  const render = (text) => renderScreen(parseSgr(text));
+
+  test('a bottom rule renders as one .term__rule whose run holds every character', () => {
+    const pre = render('─'.repeat(329));
+    expect(pre.querySelectorAll('.term__rule').length).toBe(1);
+    const runs = pre.querySelectorAll('.term__rule-run');
+    expect(runs.length).toBe(1);
+    expect(runs[0].textContent).toBe('─'.repeat(329));
+  });
+
+  test('a top rule keeps its label and its single tail character outside the shrinking run', () => {
+    const pre = render('─'.repeat(312) + ' some-label-1234 ' + '─');
+    const runs = pre.querySelectorAll('.term__rule-run');
+    expect(runs.length).toBe(1);
+    expect(runs[0].textContent).toBe('─'.repeat(312));
+    expect(pre.querySelectorAll('.term__rule').length).toBe(1);
+    expect(pre.textContent).toBe('─'.repeat(312) + ' some-label-1234 ' + '─');
+  });
+
+  test('trailing whitespace of a rule line goes into a shrinking run', () => {
+    const runs = render('─'.repeat(20) + '   ').querySelectorAll('.term__rule-run');
+    expect([...runs].map((r) => r.textContent)).toEqual(['─'.repeat(20), '   ']);
+  });
+
+  test('a rule wrapped in colour and dim keeps both on its run', () => {
+    const run = /** @type {HTMLElement} */ (render(`${ESC}[2;38;2;1;2;3m${'─'.repeat(40)}${ESC}[0m`).querySelector('.term__rule-run'));
+    expect(run.classList.contains('sgr-d')).toBe(true);
+    expect(run.style.color).not.toBe('');
+    expect(run.textContent).toBe('─'.repeat(40));
+  });
+
+  test('lines that are not input-box rules keep the plain rendering', () => {
+    const table = `├${'─'.repeat(20)}┼${'─'.repeat(20)}┤`;
+    const box = `╭${'─'.repeat(30)}╮`;
+    const prose = 'a ──── b';
+    const longText = '─'.repeat(30) + ' ' + 'x'.repeat(41);
+    for (const line of [table, box, prose, longText]) {
+      const pre = render(line);
+      expect(pre.querySelector('.term__rule')).toBeNull();
+      expect(pre.querySelector('.term__rule-run')).toBeNull();
+      expect(pre.textContent).toBe(line);
+    }
+  });
+
+  test('the text content is the plain text of the input, line feeds around the rule included', () => {
+    const plain = ['some prose', '─'.repeat(100) + ' label ' + '─', '', `├${'─'.repeat(20)}┼${'─'.repeat(20)}┤`, 'more prose', '─'.repeat(100)].join('\n');
+    const withEscapes = plain.replace('some prose', `${ESC}[1msome prose${ESC}[0m`).replace(' label ', ` ${ESC}[36mlabel${ESC}[0m `);
+    const pre = render(withEscapes);
+    expect(pre.textContent).toBe(plain);
+    expect(pre.querySelectorAll('.term__rule').length).toBe(2);
+  });
+});
