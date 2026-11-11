@@ -4,6 +4,12 @@ Les évolutions notables d'IdemA sont consignées ici. Le format suit [Keep a Ch
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-11-11
+
+### Modifié
+
+- Barre latérale : l'état de connexion de Localhost et de chaque machine distante s'affiche par une icône d'écran, verte quand la machine est connectée, grisée sinon, au lieu d'une pastille qui se confondait avec celles des sessions.
+
 ## [0.6.2] - 2026-11-11
 
 ### Corrigé
