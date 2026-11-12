@@ -286,7 +286,7 @@ pub fn probe_http(port: u16, timeout: Duration) -> bool {
     ]
     .into_iter()
     .any(|address| match connect_before(&address, deadline) {
-        Some(stream) => answers_http(stream, deadline),
+        Some(stream) => answers_http(stream, &address, deadline),
         None => false,
     })
 }
@@ -305,11 +305,15 @@ fn connect_before(address: &SocketAddr, deadline: Instant) -> Option<TcpStream> 
 }
 
 /// Envoie `HEAD /` et lit le début de la réponse avant l'échéance : vrai si elle commence par `HTTP/`.
-fn answers_http(mut stream: TcpStream, deadline: Instant) -> bool {
+/// L'en-tête `Host` est obligatoire en pratique : sans lui, Bun.serve passe l'URL relative `"/"` au gestionnaire,
+/// et le serveur MCP local de Claude Code imprime une `TypeError: Invalid URL` par-dessus son interface.
+fn answers_http(mut stream: TcpStream, address: &SocketAddr, deadline: Instant) -> bool {
+    // `SocketAddr` s'affiche `127.0.0.1:port` ou `[::1]:port`, la forme attendue par `Host`.
+    let request = format!("HEAD / HTTP/1.0\r\nHost: {address}\r\n\r\n");
     if stream
         .set_write_timeout(Some(time_left(deadline).max(Duration::from_millis(1))))
         .is_err()
-        || stream.write_all(b"HEAD / HTTP/1.0\r\n\r\n").is_err()
+        || stream.write_all(request.as_bytes()).is_err()
     {
         return false;
     }
@@ -827,6 +831,26 @@ mod tests {
         );
         drop(release);
         holder.join().unwrap();
+    }
+
+    /// Un serveur qui exige l'en-tête `Host` (comme Bun.serve, dont l'URL devient `"/"` sans lui et fait planter
+    /// le serveur MCP local de Claude Code) : il raccroche sans répondre à une requête qui n'en porte pas.
+    #[test]
+    fn the_http_probe_sends_a_host_header() {
+        let http = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = http.local_addr().unwrap().port();
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = http.accept() {
+                let mut request = [0u8; 256];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]).to_string();
+                let expected = format!("\r\nHost: 127.0.0.1:{port}\r\n");
+                if request.contains(&expected) {
+                    let _ = stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n");
+                }
+            }
+        });
+        assert!(probe_http(port, HTTP_PROBE_TIMEOUT));
     }
 
     #[test]
