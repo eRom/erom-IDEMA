@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use super::create::{
     CREATE_BODY, CreateError, create_query, created_slug, created_url, new_idempotency_key,
-    org_query, outcome_line, post_line, requested_line, type_slug,
+    org_query, outcome_line, post_error, post_line, requested_line, type_slug, unopened_line,
 };
 use super::model::{ArtifactKind, PAGE_SIZE, classify, query_string};
 use super::{ApiError, ListQuery};
@@ -33,6 +33,8 @@ const CAPTURE_SCRIPT: &str = include_str!("capture.js");
 /// Cadence du sondage de la capture, et durée au-delà de laquelle on renonce.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
+/// L'attente avant de relire l'adresse d'un artifact tout juste créé (un GET, jamais le POST).
+const FRAME_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// L'état de la page, lu par sondage : la capture est-elle faite, sur quel chemin et sous quel titre (un défi
 /// Cloudflare s'y reconnaît) la page est-elle ? `org` est le paramètre capturé, que Rust met dans la requête.
@@ -178,11 +180,15 @@ impl ArtifactsSource {
     ) {
         cx.spawn(async move |this, cx| {
             // `Page` n'a pas de titre de type : il n'y a rien à créer.
-            let title = kind.type_title().unwrap_or("Pages");
-            hud::log_event(&requested_line(title));
-            let result = match kind.type_title() {
-                Some(title) => Self::create_artifact(&this, title, cx).await,
-                None => Err(CreateError::TypeNotFound),
+            let (title, result) = match kind.type_title() {
+                Some(title) => {
+                    hud::log_event(&requested_line(title));
+                    (title, Self::create_artifact(&this, title, cx).await)
+                }
+                None => {
+                    hud::log_event(&requested_line("Pages"));
+                    ("Pages", Err(CreateError::TypeNotFound))
+                }
             };
             hud::log_event(&outcome_line(title, &result));
             // `call` oublie déjà la page sur une erreur de transport ; un 4xx ou un corps illisible sont jugés ici.
@@ -210,11 +216,32 @@ impl ArtifactsSource {
             create_query(&org, &new_idempotency_key())
         );
         hud::log_event(&post_line(title));
-        let created = Self::call(this, "POST", &create_path, Some(CREATE_BODY), cx).await?;
+        let created = Self::call(this, "POST", &create_path, Some(CREATE_BODY), cx)
+            .await
+            .map_err(post_error)?;
         let artifact = created_slug(&outcome(created)?)?;
 
+        // L'artifact existe : on ne rejoue jamais le POST. L'adresse se relit une fois de plus après une seconde, puis
+        // l'échec dit que l'artifact est créé mais pas ouvert (un nouveau clic en créerait un second, invisible).
         let frame_path = format!("/api/frame/{artifact}?{}", org_query(&org));
-        let frame = Self::call(this, "GET", &frame_path, None, cx).await?;
+        let mut address = Self::frame_address(this, &frame_path, cx).await;
+        if address.is_err() {
+            cx.background_executor().timer(FRAME_RETRY_DELAY).await;
+            address = Self::frame_address(this, &frame_path, cx).await;
+        }
+        address.map_err(|error| {
+            hud::log_event(&unopened_line(title, &artifact, &error));
+            CreateError::Unopened(error)
+        })
+    }
+
+    /// Lit `GET /api/frame/<uuid>` et en tire l'adresse du nouvel artifact.
+    async fn frame_address(
+        this: &WeakEntity<Self>,
+        frame_path: &str,
+        cx: &mut AsyncApp,
+    ) -> Result<String, ApiError> {
+        let frame = Self::call(this, "GET", frame_path, None, cx).await?;
         created_url(&outcome(frame)?)
     }
 
@@ -462,110 +489,6 @@ async fn probe(source: &WeakEntity<ArtifactsSource>, cx: &mut AsyncApp) {
         Err(error) => hud::log_event(&format!(
             "artifacts probe offset={PAGE_SIZE} error={error:?}"
         )),
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// La sonde de la création (`IDEMA_ARTIFACTS_CREATE_PROBE=1`) : crée UN Doc vide sur le compte, par la page cachée.
-
-/// Lance la sonde de création. Le résultat va au journal, lignes `artifacts create probe ...` : jamais une valeur
-/// d'en-tête, de cookie ou d'`org`, seulement des noms de clés et des formes de valeurs (hors adresse d'artifact).
-pub fn run_create_probe(window: AnyWindowHandle, cx: &mut App) {
-    let source = cx.new(|_| ArtifactsSource::new(window));
-    cx.spawn(async move |cx| {
-        let weak = source.downgrade();
-        create_probe(&weak, cx).await;
-        drop(source);
-    })
-    .detach();
-}
-
-async fn create_probe(source: &WeakEntity<ArtifactsSource>, cx: &mut AsyncApp) {
-    use super::create::{artifact_address, summarize_create, value_shape};
-
-    let (_session, org) = match ArtifactsSource::ready(source, cx).await {
-        Ok(ready) => ready,
-        Err(error) => {
-            hud::log_event(&format!("artifacts create probe error={error:?}"));
-            return;
-        }
-    };
-
-    let types_path = format!("/api/frame/types?{}", org_query(&org));
-    let types = match ArtifactsSource::call(source, "GET", &types_path, None, cx).await {
-        Ok(raw) => raw,
-        Err(error) => {
-            hud::log_event(&format!("artifacts create probe types_error={error:?}"));
-            return;
-        }
-    };
-    let slug = match type_slug(&types.body, "Docs") {
-        Ok(slug) => slug,
-        Err(error) => {
-            let reason = match error {
-                CreateError::TypeNotFound => "type_not_found",
-                CreateError::Api(_) => "types_unreadable",
-            };
-            hud::log_event(&format!(
-                "artifacts create probe types_status={} error={reason}",
-                types.status
-            ));
-            return;
-        }
-    };
-
-    let create_path = format!(
-        "/api/frame/types/{slug}/create?{}",
-        create_query(&org, &new_idempotency_key())
-    );
-    let created =
-        match ArtifactsSource::call(source, "POST", &create_path, Some(CREATE_BODY), cx).await {
-            Ok(raw) => raw,
-            Err(error) => {
-                hud::log_event(&format!(
-                    "artifacts create probe types_status={} create_error={error:?}",
-                    types.status
-                ));
-                return;
-            }
-        };
-    let summary = summarize_create(&created.body);
-    hud::log_event(&format!(
-        "artifacts create probe types_status={} create_status={} keys={} candidates={} headers={}",
-        types.status,
-        created.status,
-        summary.keys.join(","),
-        summary.candidates.join(","),
-        created.headers.join(","),
-    ));
-
-    let mut address = summary.address;
-    // Pas d'adresse dans la réponse : l'app web interroge ensuite `GET /api/frame/<slug>` et lit `viewerPath`.
-    if address.is_none()
-        && let Ok(uuid) = created_slug(&created.body)
-    {
-        let path = "slug";
-        let frame_path = format!("/api/frame/{uuid}?{}", org_query(&org));
-        match ArtifactsSource::call(source, "GET", &frame_path, None, cx).await {
-            Ok(frame) => {
-                let value = serde_json::from_str::<Value>(&frame.body).ok();
-                let viewer_path = value.as_ref().and_then(|v| v.get("viewerPath"));
-                hud::log_event(&format!(
-                    "artifacts create probe frame_from={path} frame_status={} viewer_path={}",
-                    frame.status,
-                    viewer_path.map_or_else(|| "absent".to_owned(), value_shape),
-                ));
-                address = viewer_path
-                    .and_then(Value::as_str)
-                    .and_then(artifact_address);
-            }
-            Err(error) => hud::log_event(&format!(
-                "artifacts create probe frame_from={path} frame_error={error:?}"
-            )),
-        }
-    }
-    if let Some(address) = address {
-        hud::log_event(&format!("artifacts create probe url={address}"));
     }
 }
 

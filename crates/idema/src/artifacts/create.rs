@@ -15,8 +15,12 @@ use super::model::{ArtifactKind, classify};
 pub enum CreateError {
     /// Aucun type du catalogue ne porte ce titre.
     TypeNotFound,
-    /// L'API n'a pas répondu comme attendu.
+    /// L'API n'a pas répondu comme attendu : rien n'a été créé.
     Api(ApiError),
+    /// Le POST a réussi (l'artifact existe) mais son adresse n'a pas pu être lue, même après un second essai.
+    Unopened(ApiError),
+    /// Le POST lui-même s'est perdu (délai, page injoignable) : l'artifact existe peut-être.
+    Uncertain,
 }
 
 impl From<ApiError> for CreateError {
@@ -37,7 +41,8 @@ struct TypeEntry {
     title: String,
 }
 
-/// Le `slug` du type dont le titre est `title` (sans casse, rogné) dans le corps de `GET /api/frame/types`.
+/// Le `slug` du type dont le titre est `title` (sans casse, rogné) dans le corps de `GET /api/frame/types`. Il entre tel
+/// quel dans le chemin du POST : s'il n'a pas la forme d'un UUID, le type est tenu pour introuvable.
 pub fn type_slug(types_body: &str, title: &str) -> Result<String, CreateError> {
     let body: TypesBody =
         serde_json::from_str(types_body).map_err(|_| CreateError::Api(ApiError::Unreadable))?;
@@ -46,6 +51,7 @@ pub fn type_slug(types_body: &str, title: &str) -> Result<String, CreateError> {
         .into_iter()
         .find(|entry| entry.title.trim().eq_ignore_ascii_case(wanted))
         .map(|entry| entry.slug)
+        .filter(|slug| is_uuid(slug))
         .ok_or(CreateError::TypeNotFound)
 }
 
@@ -90,7 +96,6 @@ fn uuid_v4_from(mut bytes: [u8; 16]) -> String {
 }
 
 const ADDRESS_PREFIX: &str = "https://claude.ai/artifact/";
-const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 fn is_uuid(text: &str) -> bool {
     let parts: Vec<&str> = text.split('-').collect();
@@ -99,11 +104,6 @@ fn is_uuid(text: &str) -> bool {
             .iter()
             .zip([8, 4, 4, 4, 12])
             .all(|(part, len)| part.len() == len && part.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
-/// Un identifiant d'adresse d'artifact : 22 caractères base58.
-fn is_base58_22(text: &str) -> bool {
-    text.len() == 22 && text.chars().all(|c| BASE58.contains(c))
 }
 
 /// L'adresse d'un artifact contenue dans une chaîne : `https://claude.ai/artifact/<id>` telle quelle, ou un chemin
@@ -121,81 +121,6 @@ pub fn artifact_address(text: &str) -> Option<String> {
     (!id.is_empty()).then(|| format!("{ADDRESS_PREFIX}{id}"))
 }
 
-/// La forme d'une valeur, pour le journal : jamais la valeur, sauf une adresse d'artifact (`https://claude.ai/artifact/...`).
-pub fn value_shape(value: &Value) -> String {
-    match value {
-        Value::String(text) => {
-            if text.starts_with(ADDRESS_PREFIX) {
-                artifact_address(text).unwrap_or_else(|| "other".to_owned())
-            } else if text.starts_with("/artifact/") {
-                "/artifact/<id>".to_owned()
-            } else if is_uuid(text) {
-                "uuid".to_owned()
-            } else if is_base58_22(text) {
-                "base58-22".to_owned()
-            } else {
-                "other".to_owned()
-            }
-        }
-        Value::Object(_) => "object".to_owned(),
-        Value::Array(_) => "array".to_owned(),
-        Value::Number(_) => "number".to_owned(),
-        Value::Bool(_) => "bool".to_owned(),
-        Value::Null => "null".to_owned(),
-    }
-}
-
-/// Ce que la sonde retient d'une réponse de création.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct CreateSummary {
-    /// Les clés du premier niveau, dans l'ordre du corps.
-    pub keys: Vec<String>,
-    /// `chemin=forme` des chaînes qui pourraient porter l'identité de l'artifact (un niveau d'objet en dessous).
-    pub candidates: Vec<String>,
-    /// L'adresse `https://claude.ai/artifact/<id>` si une valeur la porte.
-    pub address: Option<String>,
-    /// Le premier UUID rencontré (chemin, valeur) : l'identité à interroger par `GET /api/frame/<uuid>`.
-    pub uuid: Option<(String, String)>,
-}
-
-/// Lit une réponse de création : clés, candidats, adresse, UUID. Un corps illisible rend un résumé vide.
-pub fn summarize_create(body: &str) -> CreateSummary {
-    let Ok(Value::Object(root)) = serde_json::from_str::<Value>(body) else {
-        return CreateSummary::default();
-    };
-    let mut summary = CreateSummary {
-        keys: root.keys().cloned().collect(),
-        ..CreateSummary::default()
-    };
-    for (key, value) in &root {
-        visit(key, value, 0, &mut summary);
-    }
-    summary
-}
-
-fn visit(path: &str, value: &Value, depth: usize, summary: &mut CreateSummary) {
-    match value {
-        Value::String(text) => {
-            let shape = value_shape(value);
-            if shape != "other" {
-                summary.candidates.push(format!("{path}={shape}"));
-            }
-            if summary.address.is_none() {
-                summary.address = artifact_address(text);
-            }
-            if summary.uuid.is_none() && is_uuid(text) {
-                summary.uuid = Some((path.to_owned(), text.clone()));
-            }
-        }
-        Value::Object(map) if depth < 1 => {
-            for (key, inner) in map {
-                visit(&format!("{path}.{key}"), inner, depth + 1, summary);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Le `slug` de premier niveau de la réponse de création : l'UUID du nouvel artifact (le `slug` de `type` est celui du
 /// type, on ne le lit pas). Absent ou pas un UUID : réponse illisible.
 pub fn created_slug(create_body: &str) -> Result<String, CreateError> {
@@ -211,27 +136,52 @@ pub fn created_slug(create_body: &str) -> Result<String, CreateError> {
 
 /// L'adresse du nouvel artifact, lue dans la réponse de `GET /api/frame/<slug>` : `viewerPath` (`/artifact/<id>`)
 /// complété par l'hôte, comme l'app web.
-pub fn created_url(frame_body: &str) -> Result<String, CreateError> {
-    let unreadable = || CreateError::Api(ApiError::Unreadable);
-    let value: Value = serde_json::from_str(frame_body).map_err(|_| unreadable())?;
+pub fn created_url(frame_body: &str) -> Result<String, ApiError> {
+    let value: Value = serde_json::from_str(frame_body).map_err(|_| ApiError::Unreadable)?;
     value
         .get("viewerPath")
         .and_then(Value::as_str)
         .filter(|path| path.starts_with("/artifact/"))
         .and_then(artifact_address)
-        .ok_or_else(unreadable)
+        .ok_or(ApiError::Unreadable)
 }
 
-/// Le motif d'un échec de création, tel que la galerie le dit (spec §3.6).
+/// Le motif court d'une erreur d'API, sans détail interne (le détail va au journal de la source, jamais à l'écran).
+pub fn api_detail(error: &ApiError) -> String {
+    match error {
+        ApiError::SignedOut => "non connecté".to_owned(),
+        ApiError::Http(code) => format!("HTTP {code}"),
+        ApiError::Unreadable => "réponse illisible".to_owned(),
+        ApiError::Unavailable(_) => "claude.ai injoignable".to_owned(),
+    }
+}
+
+/// Le texte d'un échec de création, tel que la galerie le dit (spec §3.4). Trois formes : « Création impossible » (rien
+/// n'a été créé), « Artifact créé, mais impossible de l'ouvrir » (l'artifact existe) et « Création incertaine » (le POST
+/// a pu aboutir).
 pub fn reason(error: &CreateError) -> String {
-    let detail = match error {
-        CreateError::TypeNotFound => "type introuvable".to_owned(),
-        CreateError::Api(ApiError::SignedOut) => "non connecté".to_owned(),
-        CreateError::Api(ApiError::Http(code)) => format!("HTTP {code}"),
-        CreateError::Api(ApiError::Unreadable) => "réponse illisible".to_owned(),
-        CreateError::Api(ApiError::Unavailable(_)) => "claude.ai injoignable".to_owned(),
-    };
-    format!("Création impossible : {detail}")
+    match error {
+        CreateError::TypeNotFound => "Création impossible : type introuvable".to_owned(),
+        CreateError::Api(error) => format!("Création impossible : {}", api_detail(error)),
+        CreateError::Unopened(error) => {
+            format!(
+                "Artifact créé, mais impossible de l'ouvrir : {}",
+                api_detail(error)
+            )
+        }
+        CreateError::Uncertain => {
+            "Création incertaine : vérifie claude.ai avant de réessayer".to_owned()
+        }
+    }
+}
+
+/// L'erreur d'un POST de création. Une réponse reçue (HTTP, déconnexion, corps illisible) dit que rien n'a été créé ;
+/// un délai ou une page injoignable laisse la création incertaine : la requête a pu partir et aboutir.
+pub fn post_error(error: ApiError) -> CreateError {
+    match error {
+        ApiError::Unavailable(_) => CreateError::Uncertain,
+        other => CreateError::Api(other),
+    }
 }
 
 /// Où en est la création côté galerie : une seule à la fois, l'échec reste affiché jusqu'à ce qu'on l'efface.
@@ -294,6 +244,14 @@ pub fn post_line(title: &str) -> String {
     format!("artifacts create post type={title}")
 }
 
+/// L'artifact existe mais son adresse n'a pas pu être lue : son UUID peut figurer au journal, avec le motif court.
+pub fn unopened_line(title: &str, artifact: &str, error: &ApiError) -> String {
+    format!(
+        "artifacts create unopened type={title} artifact={artifact} reason={}",
+        api_detail(error)
+    )
+}
+
 pub fn outcome_line(title: &str, result: &Result<String, CreateError>) -> String {
     match result {
         Ok(url) => format!("artifacts create ok type={title} url={url}"),
@@ -308,18 +266,38 @@ pub fn outcome_line(title: &str, result: &Result<String, CreateError>) -> String
 mod tests {
     use super::*;
 
-    const TYPES: &str =
-        r#"{"types":[{"slug":"doc-1","title":"Docs"},{"slug":"sheet-2","title":"Sheets"}]}"#;
+    const DOC_SLUG: &str = "9a1c1e0b-7a6f-4e0d-a952-713c1f8e2d4b";
+    const SHEET_SLUG: &str = "1c1e0b9a-6f7a-4d0e-952a-3c1f8e2d4b71";
+    const TYPES: &str = r#"{"types":[{"slug":"9a1c1e0b-7a6f-4e0d-a952-713c1f8e2d4b","title":"Docs"},{"slug":"1c1e0b9a-6f7a-4d0e-952a-3c1f8e2d4b71","title":"Sheets"}]}"#;
 
     #[test]
     fn type_slug_picks_the_slug_of_the_matching_title() {
-        assert_eq!(type_slug(TYPES, "Sheets"), Ok("sheet-2".to_owned()));
-        assert_eq!(type_slug(TYPES, "Docs"), Ok("doc-1".to_owned()));
+        assert_eq!(type_slug(TYPES, "Sheets"), Ok(SHEET_SLUG.to_owned()));
+        assert_eq!(type_slug(TYPES, "Docs"), Ok(DOC_SLUG.to_owned()));
     }
 
     #[test]
     fn type_slug_matches_without_case() {
-        assert_eq!(type_slug(TYPES, "  sHeEtS "), Ok("sheet-2".to_owned()));
+        assert_eq!(type_slug(TYPES, "  sHeEtS "), Ok(SHEET_SLUG.to_owned()));
+    }
+
+    #[test]
+    fn a_type_slug_that_is_not_a_uuid_is_type_not_found() {
+        // Le slug entre dans le chemin du POST : une valeur qui n'a pas la forme d'un UUID n'y va jamais.
+        for slug in [
+            "doc-1",
+            "../x",
+            "a/b",
+            "",
+            "9a1c1e0b-7a6f-4e0d-a952-713c1f8e2d4b/../x",
+        ] {
+            let body = format!(r#"{{"types":[{{"slug":"{slug}","title":"Docs"}}]}}"#);
+            assert_eq!(
+                type_slug(&body, "Docs"),
+                Err(CreateError::TypeNotFound),
+                "slug {slug:?}"
+            );
+        }
     }
 
     #[test]
@@ -372,26 +350,6 @@ mod tests {
     }
 
     #[test]
-    fn value_shape_never_echoes_a_plain_value() {
-        let text = |s: &str| value_shape(&Value::String(s.to_owned()));
-        assert_eq!(text("0b9a1c1e-6f7a-4d0e-9a52-3c1f8e2d4b71"), "uuid");
-        assert_eq!(text("7Yq3kPz9TmWx4Ab2NcDe5f"), "base58-22");
-        assert_eq!(text("/artifact/abc123"), "/artifact/<id>");
-        assert_eq!(text("secret-org-name"), "other");
-        assert_eq!(text("sk-ant-sid01-xxx"), "other");
-    }
-
-    #[test]
-    fn value_shape_keeps_only_an_artifact_address() {
-        assert_eq!(
-            value_shape(&Value::String(
-                "https://claude.ai/artifact/AbC123".to_owned()
-            )),
-            "https://claude.ai/artifact/AbC123"
-        );
-    }
-
-    #[test]
     fn artifact_address_reads_a_full_url_or_a_path() {
         assert_eq!(
             artifact_address("https://claude.ai/artifact/AbC123?x=1"),
@@ -403,36 +361,6 @@ mod tests {
         );
         assert_eq!(artifact_address("/artifacts/AbC123"), None);
         assert_eq!(artifact_address("/artifact/"), None);
-    }
-
-    #[test]
-    fn summarize_create_lists_keys_candidates_and_the_uuid() {
-        let body = r#"{"capabilities":[],"contract":"1.0.0","id":"0b9a1c1e-6f7a-4d0e-9a52-3c1f8e2d4b71","history":{"head":"7Yq3kPz9TmWx4Ab2NcDe5f","note":"hello"}}"#;
-        let summary = summarize_create(body);
-        assert_eq!(summary.keys, ["capabilities", "contract", "id", "history"]);
-        assert_eq!(summary.candidates, ["id=uuid", "history.head=base58-22"]);
-        assert_eq!(
-            summary.uuid,
-            Some((
-                "id".to_owned(),
-                "0b9a1c1e-6f7a-4d0e-9a52-3c1f8e2d4b71".to_owned()
-            ))
-        );
-        assert_eq!(summary.address, None);
-    }
-
-    #[test]
-    fn summarize_create_finds_an_address() {
-        let summary = summarize_create(r#"{"url":"https://claude.ai/artifact/AbC123"}"#);
-        assert_eq!(
-            summary.address,
-            Some("https://claude.ai/artifact/AbC123".to_owned())
-        );
-    }
-
-    #[test]
-    fn summarize_create_survives_an_unreadable_body() {
-        assert_eq!(summarize_create("<html>"), CreateSummary::default());
     }
 
     const CREATED: &str = r#"{"capabilities":[],"owner_account_id":"11111111-2222-4333-8444-555555555555","slug":"0b9a1c1e-6f7a-4d0e-9a52-3c1f8e2d4b71","title":"Untitled","type":{"slug":"9a1c1e0b-7a6f-4e0d-a952-713c1f8e2d4b","title":"Docs"}}"#;
@@ -468,7 +396,7 @@ mod tests {
 
     #[test]
     fn created_url_without_the_field_is_unreadable() {
-        let unreadable = Err(CreateError::Api(ApiError::Unreadable));
+        let unreadable = Err(ApiError::Unreadable);
         assert_eq!(created_url(r#"{"title":"Untitled"}"#), unreadable);
         assert_eq!(
             created_url(r#"{"viewerPath":"/elsewhere/abc"}"#),
@@ -538,6 +466,80 @@ mod tests {
     }
 
     #[test]
+    fn an_unopened_artifact_says_it_was_created() {
+        assert_eq!(
+            reason(&CreateError::Unopened(ApiError::Http(500))),
+            "Artifact créé, mais impossible de l'ouvrir : HTTP 500"
+        );
+        assert_eq!(
+            reason(&CreateError::Unopened(ApiError::Unreadable)),
+            "Artifact créé, mais impossible de l'ouvrir : réponse illisible"
+        );
+        assert_eq!(
+            reason(&CreateError::Unopened(ApiError::Unavailable(
+                "x".to_owned()
+            ))),
+            "Artifact créé, mais impossible de l'ouvrir : claude.ai injoignable"
+        );
+        assert_eq!(
+            reason(&CreateError::Unopened(ApiError::SignedOut)),
+            "Artifact créé, mais impossible de l'ouvrir : non connecté"
+        );
+    }
+
+    #[test]
+    fn an_uncertain_creation_asks_to_check_claude_ai_first() {
+        assert_eq!(
+            reason(&CreateError::Uncertain),
+            "Création incertaine : vérifie claude.ai avant de réessayer"
+        );
+    }
+
+    #[test]
+    fn only_an_unreachable_post_leaves_the_creation_uncertain() {
+        // Le POST a pu partir : réponse perdue ou délai, l'artifact existe peut-être.
+        assert_eq!(
+            post_error(ApiError::Unavailable("script call timed out".to_owned())),
+            CreateError::Uncertain
+        );
+        // Une réponse reçue dit clairement que rien n'a été créé.
+        assert_eq!(
+            post_error(ApiError::Http(500)),
+            CreateError::Api(ApiError::Http(500))
+        );
+        assert_eq!(
+            post_error(ApiError::SignedOut),
+            CreateError::Api(ApiError::SignedOut)
+        );
+        assert_eq!(
+            post_error(ApiError::Unreadable),
+            CreateError::Api(ApiError::Unreadable)
+        );
+    }
+
+    #[test]
+    fn unopened_and_uncertain_failures_are_shown_then_cleared() {
+        let mut state = CreateState::Idle;
+        assert!(state.begin(ArtifactKind::Docs));
+        state.finish(&Err(CreateError::Unopened(ApiError::Http(404))));
+        assert_eq!(
+            state,
+            CreateState::Failed("Artifact créé, mais impossible de l'ouvrir : HTTP 404".to_owned())
+        );
+        // L'échec affiché ne bloque pas le clic suivant.
+        assert!(state.begin(ArtifactKind::Docs));
+        state.finish(&Err(CreateError::Uncertain));
+        assert_eq!(
+            state,
+            CreateState::Failed(
+                "Création incertaine : vérifie claude.ai avant de réessayer".to_owned()
+            )
+        );
+        state.clear_failure();
+        assert_eq!(state, CreateState::Idle);
+    }
+
+    #[test]
     fn the_fixture_answers_the_address_or_the_forced_failure() {
         let url = "https://claude.ai/artifact/AbC123";
         assert_eq!(fixture_outcome(url, None), Ok(url.to_owned()));
@@ -571,6 +573,26 @@ mod tests {
         assert_eq!(
             outcome_line("Sheets", &Err(CreateError::Api(ApiError::Http(500)))),
             "artifacts create failed type=Sheets reason=Création impossible : HTTP 500"
+        );
+    }
+
+    #[test]
+    fn the_unopened_line_names_the_artifact_and_a_short_reason() {
+        assert_eq!(
+            unopened_line(
+                "Docs",
+                "0b9a1c1e-6f7a-4d0e-9a52-3c1f8e2d4b71",
+                &ApiError::Http(502)
+            ),
+            "artifacts create unopened type=Docs artifact=0b9a1c1e-6f7a-4d0e-9a52-3c1f8e2d4b71 reason=HTTP 502"
+        );
+        assert_eq!(
+            unopened_line(
+                "Docs",
+                "x",
+                &ApiError::Unavailable("secret detail".to_owned())
+            ),
+            "artifacts create unopened type=Docs artifact=x reason=claude.ai injoignable"
         );
     }
 }
