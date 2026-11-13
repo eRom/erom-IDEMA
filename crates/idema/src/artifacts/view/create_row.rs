@@ -25,12 +25,16 @@ const TILE_GAP: f32 = GRID_GAP;
 const TILE_BLOCK_HEIGHT: f32 = 56.;
 const TILE_GLYPH: f32 = 24.;
 const TILE_NAME_SIZE: f32 = 12.;
-/// Le gabarit serré (colonne à côté du volet Browser) : les six tuiles tiennent encore sur une ligne, bloc de 40, glyphe 20,
-/// nom 11, écart 8.
+/// Le gabarit serré (colonne à côté du volet Browser) : bloc de 40, glyphe 20, nom 10, écart 8. Les six tuiles restent
+/// sur une ligne tant que chacune garde 56 de large (assez pour « Whiteboard » à 10) ; en deçà, trois et trois sur deux
+/// lignes.
 const COMPACT_GAP: f32 = 8.;
 const COMPACT_BLOCK_HEIGHT: f32 = 40.;
 const COMPACT_GLYPH: f32 = 20.;
-const COMPACT_NAME_SIZE: f32 = 11.;
+const COMPACT_NAME_SIZE: f32 = 10.;
+const COMPACT_MIN_WIDTH: f32 = 56.;
+/// Les tuiles par ligne quand le gabarit serré passe sur deux lignes.
+const COMPACT_WRAPPED_PER_LINE: usize = 3;
 /// Les tuiles en attente : la moitié de leur opacité.
 const PENDING_OPACITY: f32 = 0.5;
 /// La ligne d'échec sous la rangée (12), à cet écart des tuiles.
@@ -54,22 +58,36 @@ pub(super) struct TileMetrics {
     pub block_height: f32,
     pub glyph: f32,
     pub label_size: f32,
+    /// Les tuiles par ligne : six, ou trois quand le gabarit serré passe sur deux lignes.
+    pub per_line: usize,
 }
 
-/// Les cotes des tuiles pour `content_width`, la largeur de la zone des cartes. Les six tuiles tiennent toujours sur une
-/// seule ligne : gabarit normal (88 à 160 de large) tant que six tuiles de 88 et leurs écarts tiennent, gabarit serré
-/// dessous, où les tuiles se partagent la ligne. Une largeur pas encore mesurée (zéro) donne le gabarit normal à 88.
+/// Les cotes des tuiles pour `content_width`, la largeur de la zone des cartes. Gabarit normal (88 à 160 de large, six
+/// sur une ligne) tant que six tuiles de 88 et leurs écarts tiennent ; gabarit serré dessous, où les tuiles se
+/// partagent la ligne tant que chacune garde 56 de large, puis passent à trois par ligne. Une largeur pas encore mesurée
+/// (zéro) donne le gabarit normal à 88.
 pub(super) fn create_tile_metrics(content_width: f32) -> TileMetrics {
-    let count = ArtifactKind::CREATABLE.len() as f32;
+    let total = ArtifactKind::CREATABLE.len();
+    let count = total as f32;
     let fits_normal = count * TILE_MIN_WIDTH + (count - 1.) * TILE_GAP;
     if content_width > 0. && content_width < fits_normal {
         let share = (content_width - (count - 1.) * COMPACT_GAP) / count;
+        let (per_line, width) = if share >= COMPACT_MIN_WIDTH {
+            (total, share)
+        } else {
+            let wrapped = COMPACT_WRAPPED_PER_LINE as f32;
+            (
+                COMPACT_WRAPPED_PER_LINE,
+                (content_width - (wrapped - 1.) * COMPACT_GAP) / wrapped,
+            )
+        };
         return TileMetrics {
-            width: share.clamp(0., TILE_MIN_WIDTH),
+            width: width.clamp(0., TILE_MIN_WIDTH),
             gap: COMPACT_GAP,
             block_height: COMPACT_BLOCK_HEIGHT,
             glyph: COMPACT_GLYPH,
             label_size: COMPACT_NAME_SIZE,
+            per_line,
         };
     }
     let width = if content_width > 0. {
@@ -83,11 +101,12 @@ pub(super) fn create_tile_metrics(content_width: f32) -> TileMetrics {
         block_height: TILE_BLOCK_HEIGHT,
         glyph: TILE_GLYPH,
         label_size: TILE_NAME_SIZE,
+        per_line: total,
     }
 }
 
 impl ArtifactsView {
-    /// La rangée : le libellé, les six tuiles sur une seule ligne, alignées à gauche, et sous elles, le cas échéant,
+    /// La rangée : le libellé, les six tuiles (sur une ligne, ou trois et trois), alignées à gauche, et sous elles, le cas échéant,
     /// la ligne qui dit pourquoi la dernière création a échoué.
     pub(super) fn render_create_row(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let running = match &self.creation {
@@ -95,19 +114,28 @@ impl ArtifactsView {
             _ => None,
         };
         let metrics = create_tile_metrics(self.content_width);
-        let tiles = ArtifactKind::CREATABLE
-            .into_iter()
+        // Une ligne de `per_line` tuiles : six d'un trait, ou trois et trois quand la colonne est très étroite.
+        let lines = ArtifactKind::CREATABLE
+            .chunks(metrics.per_line)
             .enumerate()
-            .map(|(index, kind)| {
-                let on_press = cx.listener(move |this, _, _, cx| this.start_create(kind, cx));
-                let tile = tile(index, kind, running, metrics, theme);
-                match running {
-                    // En attente : plus de main, plus de clic ; la tuile cliquée reste pleine et respire, les autres
-                    // s'estompent.
-                    Some(active) if active == kind => tile,
-                    Some(_) => tile.opacity(PENDING_OPACITY),
-                    None => tile.cursor_pointer().on_click(on_press),
-                }
+            .map(|(line, kinds)| {
+                let tiles = kinds.iter().enumerate().map(|(column, &kind)| {
+                    let index = line * metrics.per_line + column;
+                    let on_press = cx.listener(move |this, _, _, cx| this.start_create(kind, cx));
+                    let tile = tile(index, kind, running, metrics, theme);
+                    match running {
+                        // En attente : plus de main, plus de clic ; la tuile cliquée reste pleine et respire, les
+                        // autres s'estompent.
+                        Some(active) if active == kind => tile,
+                        Some(_) => tile.opacity(PENDING_OPACITY),
+                        None => tile.cursor_pointer().on_click(on_press),
+                    }
+                });
+                div()
+                    .w_full()
+                    .flex()
+                    .gap(theme.px(metrics.gap))
+                    .children(tiles)
             });
         let failure = match &self.creation {
             CreateState::Failed(reason) => Some(reason.clone()),
@@ -129,8 +157,9 @@ impl ArtifactsView {
                 div()
                     .w_full()
                     .flex()
+                    .flex_col()
                     .gap(theme.px(metrics.gap))
-                    .children(tiles),
+                    .children(lines),
             )
             .children(failure.map(|reason| {
                 div()
@@ -192,8 +221,10 @@ fn tile(
         .child(block)
         .child(
             div()
-                // Jamais d'ellipse ni de retour à la ligne : un nom plus large que sa tuile (serré, « Whiteboard ») déborde
-                // des deux côtés, centré sous son bloc, dans l'écart entre les tuiles.
+                // Jamais d'ellipse ni de retour à la ligne : le nom prend la largeur de sa tuile, centré. Une tuile
+                // serrée garde au moins 56 (assez pour « Whiteboard » à 10), donc le nom ne touche pas son voisin.
+                .w_full()
+                .text_center()
                 .whitespace_nowrap()
                 .text_size(theme.text(metrics.label_size))
                 .text_color(white(TEXT_SECONDARY))
@@ -223,7 +254,8 @@ mod tests {
     }
 
     fn line_width(metrics: TileMetrics) -> f32 {
-        6. * metrics.width + 5. * metrics.gap
+        let per_line = metrics.per_line as f32;
+        per_line * metrics.width + (per_line - 1.) * metrics.gap
     }
 
     #[test]
@@ -234,11 +266,28 @@ mod tests {
                 metrics.block_height,
                 metrics.glyph,
                 metrics.label_size,
-                metrics.gap
+                metrics.gap,
+                metrics.per_line
             ),
-            (40., 20., 11., 8.)
+            (40., 20., 10., 8., 6)
         );
         assert!(line_width(metrics) <= 390., "{metrics:?}");
+        assert!(metrics.width >= 56., "{metrics:?}");
+    }
+
+    #[test]
+    fn a_very_narrow_column_wraps_the_tiles_three_and_three() {
+        let metrics = create_tile_metrics(252.);
+        assert_eq!(metrics.per_line, 3);
+        assert_eq!(metrics.label_size, 10.);
+        assert!(line_width(metrics) <= 252., "{metrics:?}");
+    }
+
+    #[test]
+    fn the_compact_tiles_wrap_exactly_when_six_would_get_narrower_than_56() {
+        // Six tuiles de 56 et cinq écarts de 8 : 376.
+        assert_eq!(create_tile_metrics(376.).per_line, 6);
+        assert_eq!(create_tile_metrics(375.).per_line, 3);
     }
 
     #[test]
@@ -249,9 +298,10 @@ mod tests {
                 metrics.block_height,
                 metrics.glyph,
                 metrics.label_size,
-                metrics.gap
+                metrics.gap,
+                metrics.per_line
             ),
-            (56., 24., 12., 16.)
+            (56., 24., 12., 16., 6)
         );
         assert!((88. ..=160.).contains(&metrics.width), "{metrics:?}");
         assert!(line_width(metrics) <= 990., "{metrics:?}");
@@ -263,23 +313,31 @@ mod tests {
     }
 
     #[test]
-    fn six_tiles_always_fit_on_one_line_whatever_the_width() {
-        // Du plus étroit des volets à une très grande fenêtre, y compris de part et d'autre du seuil des gabarits.
-        let mut width = 120.;
-        while width <= 3000. {
+    fn a_line_of_tiles_always_fits_and_a_tile_never_gets_narrower_than_its_name() {
+        // Du plus étroit des volets à une très grande fenêtre, y compris de part et d'autre des seuils des gabarits.
+        let mut widths: Vec<f32> = (0..)
+            .map(|n| 120. + 7. * n as f32)
+            .take_while(|w| *w <= 3000.)
+            .collect();
+        widths.extend([375., 376., 377., 607., 608., 609.]);
+        for width in widths {
             let metrics = create_tile_metrics(width);
             assert!(line_width(metrics) <= width + 0.001, "{width}: {metrics:?}");
-            width += 7.;
-        }
-        for width in [607., 608., 609.] {
-            let metrics = create_tile_metrics(width);
-            assert!(line_width(metrics) <= width + 0.001, "{width}: {metrics:?}");
+            // Six sur une ligne : chaque tuile garde au moins 56 ; à trois par ligne, c'est le repli de la colonne.
+            assert!(
+                metrics.width >= 56. || metrics.per_line == 3,
+                "{width}: {metrics:?}"
+            );
+            assert!(matches!(metrics.per_line, 3 | 6), "{width}: {metrics:?}");
         }
     }
 
     #[test]
     fn an_unmeasured_width_gives_normal_tiles_at_their_minimum() {
         let metrics = create_tile_metrics(0.);
-        assert_eq!((metrics.width, metrics.block_height), (88., 56.));
+        assert_eq!(
+            (metrics.width, metrics.block_height, metrics.per_line),
+            (88., 56., 6)
+        );
     }
 }
