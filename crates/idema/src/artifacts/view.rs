@@ -51,6 +51,15 @@ const SEARCH_DELAY: Duration = Duration::from_millis(300);
 pub const FIXTURE_ENV: &str = "IDEMA_ARTIFACTS_FIXTURE";
 pub const FIXTURE_STATUS_ENV: &str = "IDEMA_ARTIFACTS_FIXTURE_STATUS";
 
+/// Les variables des tests dans la VM, qui n'a pas de session claude.ai : l'adresse rendue à la place d'une création,
+/// le code HTTP forcé (ou `missing-type`), et le délai de la fausse création en millisecondes.
+#[allow(dead_code)] // branchées par la vue dans la tâche suivante
+pub const CREATE_FIXTURE_ENV: &str = "IDEMA_ARTIFACTS_CREATE_FIXTURE";
+#[allow(dead_code)] // branchées par la vue dans la tâche suivante
+pub const CREATE_FIXTURE_STATUS_ENV: &str = "IDEMA_ARTIFACTS_CREATE_FIXTURE_STATUS";
+#[allow(dead_code)] // branchées par la vue dans la tâche suivante
+pub const CREATE_FIXTURE_DELAY_ENV: &str = "IDEMA_ARTIFACTS_CREATE_FIXTURE_DELAY_MS";
+
 /// Le retrait de chaque côté de l'en-tête et des cartes, en unités de la maquette.
 const SIDE_PADDING: f32 = 22.;
 /// Le retrait de la version serrée (colonne à côté du volet Browser), pour les cartes comme pour l'en-tête.

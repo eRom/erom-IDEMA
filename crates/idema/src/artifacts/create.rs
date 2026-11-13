@@ -8,6 +8,7 @@ use serde_json::Value;
 use url::form_urlencoded;
 
 use super::ApiError;
+use super::model::{ArtifactKind, classify};
 
 /// Pourquoi une création a échoué.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +17,12 @@ pub enum CreateError {
     TypeNotFound,
     /// L'API n'a pas répondu comme attendu.
     Api(ApiError),
+}
+
+impl From<ApiError> for CreateError {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
 }
 
 #[derive(Deserialize)]
@@ -189,6 +196,117 @@ fn visit(path: &str, value: &Value, depth: usize, summary: &mut CreateSummary) {
     }
 }
 
+/// Le `slug` de premier niveau de la réponse de création : l'UUID du nouvel artifact (le `slug` de `type` est celui du
+/// type, on ne le lit pas). Absent ou pas un UUID : réponse illisible.
+pub fn created_slug(create_body: &str) -> Result<String, CreateError> {
+    let unreadable = || CreateError::Api(ApiError::Unreadable);
+    let value: Value = serde_json::from_str(create_body).map_err(|_| unreadable())?;
+    value
+        .get("slug")
+        .and_then(Value::as_str)
+        .filter(|slug| is_uuid(slug))
+        .map(str::to_owned)
+        .ok_or_else(unreadable)
+}
+
+/// L'adresse du nouvel artifact, lue dans la réponse de `GET /api/frame/<slug>` : `viewerPath` (`/artifact/<id>`)
+/// complété par l'hôte, comme l'app web.
+pub fn created_url(frame_body: &str) -> Result<String, CreateError> {
+    let unreadable = || CreateError::Api(ApiError::Unreadable);
+    let value: Value = serde_json::from_str(frame_body).map_err(|_| unreadable())?;
+    value
+        .get("viewerPath")
+        .and_then(Value::as_str)
+        .filter(|path| path.starts_with("/artifact/"))
+        .and_then(artifact_address)
+        .ok_or_else(unreadable)
+}
+
+/// Le motif d'un échec de création, tel que la galerie le dit (spec §3.6).
+pub fn reason(error: &CreateError) -> String {
+    let detail = match error {
+        CreateError::TypeNotFound => "type introuvable".to_owned(),
+        CreateError::Api(ApiError::SignedOut) => "non connecté".to_owned(),
+        CreateError::Api(ApiError::Http(code)) => format!("HTTP {code}"),
+        CreateError::Api(ApiError::Unreadable) => "réponse illisible".to_owned(),
+        CreateError::Api(ApiError::Unavailable(_)) => "claude.ai injoignable".to_owned(),
+    };
+    format!("Création impossible : {detail}")
+}
+
+/// Où en est la création côté galerie : une seule à la fois, l'échec reste affiché jusqu'à ce qu'on l'efface.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(dead_code)] // branché par la vue dans la tâche suivante
+pub enum CreateState {
+    #[default]
+    Idle,
+    Running(ArtifactKind),
+    /// Le motif complet, prêt à afficher (« Création impossible : ... »).
+    Failed(String),
+}
+
+#[allow(dead_code)] // branché par la vue dans la tâche suivante
+impl CreateState {
+    /// Démarre une création. Faux (rien ne change) si une autre tourne ; un échec affiché ne bloque pas.
+    pub fn begin(&mut self, kind: ArtifactKind) -> bool {
+        if matches!(self, Self::Running(_)) {
+            return false;
+        }
+        *self = Self::Running(kind);
+        true
+    }
+
+    /// Clôt la création en cours : retour au repos, ou l'échec à afficher.
+    pub fn finish(&mut self, result: &Result<String, CreateError>) {
+        *self = match result {
+            Ok(_) => Self::Idle,
+            Err(error) => Self::Failed(reason(error)),
+        };
+    }
+
+    /// Efface l'échec affiché ; sans effet sur une création en cours.
+    pub fn clear_failure(&mut self) {
+        if matches!(self, Self::Failed(_)) {
+            *self = Self::Idle;
+        }
+    }
+}
+
+/// Ce que répond la fausse création : `missing-type` pour un type introuvable, un code HTTP pour l'erreur que `classify`
+/// en tire, sinon (rien, 200 ou illisible) l'adresse du fichier de test.
+#[allow(dead_code)] // branchée par la vue dans la tâche suivante
+pub fn fixture_outcome(url: &str, status: Option<&str>) -> Result<String, CreateError> {
+    let status = status.map(str::trim);
+    if status == Some("missing-type") {
+        return Err(CreateError::TypeNotFound);
+    }
+    let code = status.and_then(|status| status.parse::<u16>().ok());
+    match code.and_then(|code| classify(code, false)) {
+        Some(error) => Err(CreateError::Api(error)),
+        None => Ok(url.to_owned()),
+    }
+}
+
+/// Les lignes du journal d'une création : le titre du type et l'issue, jamais un en-tête, un cookie, l'`org` ni la clé
+/// d'idempotence. L'adresse d'un artifact créé peut y figurer.
+pub fn requested_line(title: &str) -> String {
+    format!("artifacts create requested type={title}")
+}
+
+pub fn post_line(title: &str) -> String {
+    format!("artifacts create post type={title}")
+}
+
+pub fn outcome_line(title: &str, result: &Result<String, CreateError>) -> String {
+    match result {
+        Ok(url) => format!("artifacts create ok type={title} url={url}"),
+        Err(error) => format!(
+            "artifacts create failed type={title} reason={}",
+            reason(error)
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +436,144 @@ mod tests {
     #[test]
     fn summarize_create_survives_an_unreadable_body() {
         assert_eq!(summarize_create("<html>"), CreateSummary::default());
+    }
+
+    const CREATED: &str = r#"{"capabilities":[],"owner_account_id":"11111111-2222-4333-8444-555555555555","slug":"0b9a1c1e-6f7a-4d0e-9a52-3c1f8e2d4b71","title":"Untitled","type":{"slug":"9a1c1e0b-7a6f-4e0d-a952-713c1f8e2d4b","title":"Docs"}}"#;
+    const FRAME: &str = r#"{"viewerPath":"/artifact/7BGDZcfPeT4C9VougAt49z","title":"Untitled"}"#;
+
+    #[test]
+    fn created_slug_reads_the_top_level_slug_not_the_type_slug() {
+        assert_eq!(
+            created_slug(CREATED),
+            Ok("0b9a1c1e-6f7a-4d0e-9a52-3c1f8e2d4b71".to_owned())
+        );
+    }
+
+    #[test]
+    fn created_slug_without_a_uuid_slug_is_unreadable() {
+        let unreadable = Err(CreateError::Api(ApiError::Unreadable));
+        assert_eq!(
+            created_slug(r#"{"type":{"slug":"0b9a1c1e-6f7a-4d0e-9a52-3c1f8e2d4b71"}}"#),
+            unreadable
+        );
+        assert_eq!(created_slug(r#"{"slug":"not-a-uuid"}"#), unreadable);
+        assert_eq!(created_slug(r#"{"slug":12}"#), unreadable);
+        assert_eq!(created_slug("<html>"), unreadable);
+    }
+
+    #[test]
+    fn created_url_reads_the_phase0_field() {
+        assert_eq!(
+            created_url(FRAME),
+            Ok("https://claude.ai/artifact/7BGDZcfPeT4C9VougAt49z".to_owned())
+        );
+    }
+
+    #[test]
+    fn created_url_without_the_field_is_unreadable() {
+        let unreadable = Err(CreateError::Api(ApiError::Unreadable));
+        assert_eq!(created_url(r#"{"title":"Untitled"}"#), unreadable);
+        assert_eq!(
+            created_url(r#"{"viewerPath":"/elsewhere/abc"}"#),
+            unreadable
+        );
+        assert_eq!(created_url(r#"{"viewerPath":"/artifact/"}"#), unreadable);
+        assert_eq!(created_url(r#"{"viewerPath":3}"#), unreadable);
+        assert_eq!(created_url("<html>"), unreadable);
+    }
+
+    #[test]
+    fn a_second_create_while_running_is_refused() {
+        let mut state = CreateState::Idle;
+        assert!(state.begin(ArtifactKind::Docs));
+        assert_eq!(state, CreateState::Running(ArtifactKind::Docs));
+        assert!(!state.begin(ArtifactKind::Sheets));
+        assert_eq!(state, CreateState::Running(ArtifactKind::Docs));
+        state.finish(&Ok("https://claude.ai/artifact/abc".to_owned()));
+        assert_eq!(state, CreateState::Idle);
+        assert!(state.begin(ArtifactKind::Sheets));
+    }
+
+    #[test]
+    fn a_failure_is_shown_then_cleared() {
+        let mut state = CreateState::Idle;
+        assert!(state.begin(ArtifactKind::Docs));
+        state.finish(&Err(CreateError::Api(ApiError::Http(500))));
+        assert_eq!(
+            state,
+            CreateState::Failed("Création impossible : HTTP 500".to_owned())
+        );
+        assert!(state.begin(ArtifactKind::Slides));
+        state.finish(&Err(CreateError::TypeNotFound));
+        state.clear_failure();
+        assert_eq!(state, CreateState::Idle);
+    }
+
+    #[test]
+    fn clear_failure_leaves_a_running_create_alone() {
+        let mut state = CreateState::Running(ArtifactKind::Data);
+        state.clear_failure();
+        assert_eq!(state, CreateState::Running(ArtifactKind::Data));
+    }
+
+    #[test]
+    fn create_errors_have_their_reason() {
+        assert_eq!(
+            reason(&CreateError::TypeNotFound),
+            "Création impossible : type introuvable"
+        );
+        assert_eq!(
+            reason(&CreateError::Api(ApiError::SignedOut)),
+            "Création impossible : non connecté"
+        );
+        assert_eq!(
+            reason(&CreateError::Api(ApiError::Unreadable)),
+            "Création impossible : réponse illisible"
+        );
+        assert_eq!(
+            reason(&CreateError::Api(ApiError::Unavailable("x".to_owned()))),
+            "Création impossible : claude.ai injoignable"
+        );
+        assert_eq!(
+            reason(&CreateError::Api(ApiError::Http(404))),
+            "Création impossible : HTTP 404"
+        );
+    }
+
+    #[test]
+    fn the_fixture_answers_the_address_or_the_forced_failure() {
+        let url = "https://claude.ai/artifact/AbC123";
+        assert_eq!(fixture_outcome(url, None), Ok(url.to_owned()));
+        assert_eq!(fixture_outcome(url, Some("200")), Ok(url.to_owned()));
+        assert_eq!(fixture_outcome(url, Some("garbage")), Ok(url.to_owned()));
+        assert_eq!(
+            fixture_outcome(url, Some(" 500 ")),
+            Err(CreateError::Api(ApiError::Http(500)))
+        );
+        assert_eq!(
+            fixture_outcome(url, Some("401")),
+            Err(CreateError::Api(ApiError::SignedOut))
+        );
+        assert_eq!(
+            fixture_outcome(url, Some("missing-type")),
+            Err(CreateError::TypeNotFound)
+        );
+    }
+
+    #[test]
+    fn journal_lines_carry_the_title_and_the_outcome_only() {
+        assert_eq!(
+            requested_line("Docs"),
+            "artifacts create requested type=Docs"
+        );
+        assert_eq!(post_line("Docs"), "artifacts create post type=Docs");
+        assert_eq!(
+            outcome_line("Docs", &Ok("https://claude.ai/artifact/AbC123".to_owned())),
+            "artifacts create ok type=Docs url=https://claude.ai/artifact/AbC123"
+        );
+        assert_eq!(
+            outcome_line("Sheets", &Err(CreateError::Api(ApiError::Http(500)))),
+            "artifacts create failed type=Sheets reason=Création impossible : HTTP 500"
+        );
     }
 }

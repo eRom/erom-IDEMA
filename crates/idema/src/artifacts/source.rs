@@ -15,7 +15,11 @@ use gpui::{AnyWindowHandle, App, AppContext as _, AsyncApp, Context, Task, WeakE
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::model::{PAGE_SIZE, classify, query_string};
+use super::create::{
+    CREATE_BODY, CreateError, create_query, created_slug, created_url, new_idempotency_key,
+    org_query, outcome_line, post_line, requested_line, type_slug,
+};
+use super::model::{ArtifactKind, PAGE_SIZE, classify, query_string};
 use super::{ApiError, ListQuery};
 use crate::browser::webkit::{PageEvent, WebPage};
 use crate::hud;
@@ -161,6 +165,58 @@ impl ArtifactsSource {
         };
         self.session = Some(session.clone());
         Some(session)
+    }
+
+    /// Crée un artifact du genre `kind` et rend son adresse. `done` est rappelé sur le fil principal, une fois. Les trois
+    /// appels (catalogue des types, création, cadre du nouvel artifact) passent par la page cachée ; toute erreur
+    /// l'oublie, comme la liste. Le journal ne reçoit que le titre du type et l'issue.
+    #[allow(dead_code)] // branchée par la vue dans la tâche suivante
+    pub fn create(
+        &mut self,
+        kind: ArtifactKind,
+        done: impl FnOnce(Result<String, CreateError>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            // `Page` n'a pas de titre de type : il n'y a rien à créer.
+            let title = kind.type_title().unwrap_or("Pages");
+            hud::log_event(&requested_line(title));
+            let result = match kind.type_title() {
+                Some(title) => Self::create_artifact(&this, title, cx).await,
+                None => Err(CreateError::TypeNotFound),
+            };
+            hud::log_event(&outcome_line(title, &result));
+            // `call` oublie déjà la page sur une erreur de transport ; un 4xx ou un corps illisible sont jugés ici.
+            if matches!(result, Err(CreateError::Api(_))) {
+                let _ = this.update(cx, |source, _| source.reset());
+            }
+            done(result);
+        })
+        .detach();
+    }
+
+    async fn create_artifact(
+        this: &WeakEntity<Self>,
+        title: &str,
+        cx: &mut AsyncApp,
+    ) -> Result<String, CreateError> {
+        let (_session, org) = Self::ready(this, cx).await?;
+
+        let types_path = format!("/api/frame/types?{}", org_query(&org));
+        let types = Self::call(this, "GET", &types_path, None, cx).await?;
+        let slug = type_slug(&outcome(types)?, title)?;
+
+        let create_path = format!(
+            "/api/frame/types/{slug}/create?{}",
+            create_query(&org, &new_idempotency_key())
+        );
+        hud::log_event(&post_line(title));
+        let created = Self::call(this, "POST", &create_path, Some(CREATE_BODY), cx).await?;
+        let artifact = created_slug(&outcome(created)?)?;
+
+        let frame_path = format!("/api/frame/{artifact}?{}", org_query(&org));
+        let frame = Self::call(this, "GET", &frame_path, None, cx).await?;
+        created_url(&outcome(frame)?)
     }
 
     /// Oublie la page : la prochaine demande en recrée une.
@@ -426,10 +482,7 @@ pub fn run_create_probe(window: AnyWindowHandle, cx: &mut App) {
 }
 
 async fn create_probe(source: &WeakEntity<ArtifactsSource>, cx: &mut AsyncApp) {
-    use super::create::{
-        CREATE_BODY, CreateError, artifact_address, create_query, new_idempotency_key, org_query,
-        summarize_create, type_slug, value_shape,
-    };
+    use super::create::{artifact_address, summarize_create, value_shape};
 
     let (_session, org) = match ArtifactsSource::ready(source, cx).await {
         Ok(ready) => ready,
@@ -488,10 +541,11 @@ async fn create_probe(source: &WeakEntity<ArtifactsSource>, cx: &mut AsyncApp) {
     ));
 
     let mut address = summary.address;
-    // Pas d'adresse dans la réponse : l'app web interroge ensuite `GET /api/frame/<uuid>` et lit `viewerPath`.
+    // Pas d'adresse dans la réponse : l'app web interroge ensuite `GET /api/frame/<slug>` et lit `viewerPath`.
     if address.is_none()
-        && let Some((path, uuid)) = summary.uuid
+        && let Ok(uuid) = created_slug(&created.body)
     {
+        let path = "slug";
         let frame_path = format!("/api/frame/{uuid}?{}", org_query(&org));
         match ArtifactsSource::call(source, "GET", &frame_path, None, cx).await {
             Ok(frame) => {
