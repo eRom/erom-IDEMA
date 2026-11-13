@@ -14,8 +14,10 @@ use super::model::ArtifactKind;
 use crate::assets::Icon;
 use crate::theme::CONTROL_HOVER;
 use crate::theme::{
-    ACTION_HOVER, AGENT_PURPLE, AGENT_PURPLE_TEXT, BADGE_STDIO, FIELD_RING, FOCUS, FOCUS_TEXT,
-    HOVER, HOVER_STRONG, ICON_MUTED, TEXT_MIN, TEXT_PRIMARY, TEXT_SECONDARY, TOGGLE_ACTIVE, Theme,
+    ACTION_HOVER, ARTIFACT_DATA_BG, ARTIFACT_DATA_GLYPH, ARTIFACT_DESIGN_BG, ARTIFACT_DESIGN_GLYPH,
+    ARTIFACT_DOCS_BG, ARTIFACT_DOCS_GLYPH, ARTIFACT_SHEETS_BG, ARTIFACT_SHEETS_GLYPH,
+    ARTIFACT_SLIDES_BG, ARTIFACT_SLIDES_GLYPH, ARTIFACT_WHITEBOARD_BG, ARTIFACT_WHITEBOARD_GLYPH,
+    FIELD_RING, HOVER, HOVER_STRONG, ICON_MUTED, TEXT_MIN, TEXT_PRIMARY, TEXT_SECONDARY, Theme,
     color, white,
 };
 
@@ -64,39 +66,30 @@ pub struct ItemView {
     pub image: Option<Arc<RenderImage>>,
 }
 
-/// L'icône du genre : Docs a celle d'un document, Slides celle d'un diaporama, Pages deux feuilles superposées.
+/// L'icône du genre : un pictogramme Lucide par genre nommé, deux feuilles superposées pour Pages.
 pub fn kind_icon(kind: ArtifactKind) -> Icon {
     match kind {
-        // Provisoire : la tâche 2 donne leurs pictogrammes aux quatre nouveaux genres.
-        ArtifactKind::Docs
-        | ArtifactKind::Sheets
-        | ArtifactKind::Design
-        | ArtifactKind::Data
-        | ArtifactKind::Whiteboard => Icon::Description,
-        ArtifactKind::Slides => Icon::Slideshow,
+        ArtifactKind::Docs => Icon::ArtifactDocs,
+        ArtifactKind::Slides => Icon::ArtifactSlides,
+        ArtifactKind::Sheets => Icon::ArtifactSheets,
+        ArtifactKind::Design => Icon::ArtifactDesign,
+        ArtifactKind::Data => Icon::ArtifactData,
+        ArtifactKind::Whiteboard => Icon::ArtifactWhiteboard,
         ArtifactKind::Page => Icon::FilterNone,
     }
 }
 
-/// `hex` à l'opacité `alpha`.
-fn tint(hex: u32, alpha: f32) -> Rgba {
-    Rgba {
-        a: alpha,
-        ..color(hex)
-    }
-}
-
-/// Le fond et le glyphe de la pastille d'un genre : bleu de l'accent pour Docs, violet des agents pour Slides, gris
-/// neutre pour Pages (la maquette teinte ainsi Docs et Design).
-fn chip_colors(kind: ArtifactKind) -> (Rgba, Rgba) {
+/// Le fond et le glyphe de la pastille d'un genre : une paire sombre et claire de même teinte par genre nommé, le gris
+/// neutre pour Pages.
+pub(crate) fn chip_colors(kind: ArtifactKind) -> (Rgba, Rgba) {
+    let pair = |background, glyph| (color(background), color(glyph));
     match kind {
-        // Provisoire : la tâche 2 donne leurs couleurs aux quatre nouveaux genres.
-        ArtifactKind::Docs
-        | ArtifactKind::Sheets
-        | ArtifactKind::Design
-        | ArtifactKind::Data
-        | ArtifactKind::Whiteboard => (tint(FOCUS, TOGGLE_ACTIVE), color(FOCUS_TEXT)),
-        ArtifactKind::Slides => (tint(AGENT_PURPLE, BADGE_STDIO), color(AGENT_PURPLE_TEXT)),
+        ArtifactKind::Docs => pair(ARTIFACT_DOCS_BG, ARTIFACT_DOCS_GLYPH),
+        ArtifactKind::Slides => pair(ARTIFACT_SLIDES_BG, ARTIFACT_SLIDES_GLYPH),
+        ArtifactKind::Sheets => pair(ARTIFACT_SHEETS_BG, ARTIFACT_SHEETS_GLYPH),
+        ArtifactKind::Design => pair(ARTIFACT_DESIGN_BG, ARTIFACT_DESIGN_GLYPH),
+        ArtifactKind::Data => pair(ARTIFACT_DATA_BG, ARTIFACT_DATA_GLYPH),
+        ArtifactKind::Whiteboard => pair(ARTIFACT_WHITEBOARD_BG, ARTIFACT_WHITEBOARD_GLYPH),
         ArtifactKind::Page => (white(HOVER_STRONG), white(TEXT_SECONDARY)),
     }
 }
@@ -384,13 +377,41 @@ mod tests {
 
     #[test]
     fn every_kind_has_its_own_icon() {
-        let icons = [
-            kind_icon(ArtifactKind::Docs),
-            kind_icon(ArtifactKind::Slides),
-            kind_icon(ArtifactKind::Page),
+        let icons = ArtifactKind::FILTER_ORDER.map(kind_icon);
+        for (i, first) in icons.iter().enumerate() {
+            for second in &icons[i + 1..] {
+                assert_ne!(first, second);
+            }
+        }
+    }
+
+    #[test]
+    fn named_kinds_use_the_spec_colors() {
+        use crate::theme::*;
+        let expected = [
+            (ArtifactKind::Docs, ARTIFACT_DOCS_BG, ARTIFACT_DOCS_GLYPH),
+            (ArtifactKind::Slides, ARTIFACT_SLIDES_BG, ARTIFACT_SLIDES_GLYPH),
+            (ArtifactKind::Sheets, ARTIFACT_SHEETS_BG, ARTIFACT_SHEETS_GLYPH),
+            (ArtifactKind::Design, ARTIFACT_DESIGN_BG, ARTIFACT_DESIGN_GLYPH),
+            (ArtifactKind::Data, ARTIFACT_DATA_BG, ARTIFACT_DATA_GLYPH),
+            (
+                ArtifactKind::Whiteboard,
+                ARTIFACT_WHITEBOARD_BG,
+                ARTIFACT_WHITEBOARD_GLYPH,
+            ),
         ];
-        assert_ne!(icons[0], icons[1]);
-        assert_ne!(icons[1], icons[2]);
-        assert_ne!(icons[0], icons[2]);
+        assert_eq!(expected.len(), ArtifactKind::CREATABLE.len());
+        for (kind, background, glyph) in expected {
+            assert!(ArtifactKind::CREATABLE.contains(&kind));
+            assert_eq!(chip_colors(kind), (color(background), color(glyph)));
+        }
+    }
+
+    #[test]
+    fn pages_keep_the_neutral_chip() {
+        assert_eq!(
+            chip_colors(ArtifactKind::Page),
+            (white(HOVER_STRONG), white(TEXT_SECONDARY))
+        );
     }
 }

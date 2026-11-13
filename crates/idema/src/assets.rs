@@ -82,13 +82,23 @@ pub enum Icon {
     VisibilityOff,
     /// Le bandeau d'information de « Personnaliser » (graisse 300).
     Info,
-    /// La galerie Artifacts : le filtre par type, les deux dispositions, et les trois genres (Slides, Pages ; Docs est
-    /// `Description`) (graisse 300).
+    /// La galerie Artifacts : le filtre par type, les deux dispositions, et le genre Pages (graisse 300).
     FilterList,
     GridView,
     ViewList,
-    Slideshow,
     FilterNone,
+    /// Pictogramme du genre Docs : Lucide `file` (licence ISC), fourni par Romain, trait 1,5.
+    ArtifactDocs,
+    /// Pictogramme du genre Slides : Lucide `presentation` (licence ISC), fourni par Romain, trait 1,5.
+    ArtifactSlides,
+    /// Pictogramme du genre Sheets : Lucide `table` (licence ISC), fourni par Romain, trait 1,5.
+    ArtifactSheets,
+    /// Pictogramme du genre Design : Lucide `palette` (licence ISC), fourni par Romain, trait 1,5.
+    ArtifactDesign,
+    /// Pictogramme du genre Data : Lucide `chart-column-big` (licence ISC), fourni par Romain, trait 1,5.
+    ArtifactData,
+    /// Pictogramme du genre Whiteboard : Lucide `shapes` (licence ISC), fourni par Romain, trait 1,5.
+    ArtifactWhiteboard,
     /// Ligne « Artifacts » de la barre latérale : une pile de pages (graisse 300).
     Stacks,
     /// Bouton de la barre d'outils et en-tête du volet Projet : la roue dentée (graisse 300).
@@ -104,7 +114,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub const ALL: [Icon; 59] = [
+    pub const ALL: [Icon; 64] = [
         Icon::Add,
         Icon::AddBold,
         Icon::Check,
@@ -156,8 +166,13 @@ impl Icon {
         Icon::FilterList,
         Icon::GridView,
         Icon::ViewList,
-        Icon::Slideshow,
         Icon::FilterNone,
+        Icon::ArtifactDocs,
+        Icon::ArtifactSlides,
+        Icon::ArtifactSheets,
+        Icon::ArtifactDesign,
+        Icon::ArtifactData,
+        Icon::ArtifactWhiteboard,
         Icon::Stacks,
         Icon::Settings,
         Icon::Warning,
@@ -221,8 +236,13 @@ impl Icon {
             Self::FilterList => "icons/idema/filter_list.svg",
             Self::GridView => "icons/idema/grid_view.svg",
             Self::ViewList => "icons/idema/view_list.svg",
-            Self::Slideshow => "icons/idema/slideshow.svg",
             Self::FilterNone => "icons/idema/filter_none.svg",
+            Self::ArtifactDocs => "icons/idema/artifact_docs.svg",
+            Self::ArtifactSlides => "icons/idema/artifact_slides.svg",
+            Self::ArtifactSheets => "icons/idema/artifact_sheets.svg",
+            Self::ArtifactDesign => "icons/idema/artifact_design.svg",
+            Self::ArtifactData => "icons/idema/artifact_data.svg",
+            Self::ArtifactWhiteboard => "icons/idema/artifact_whiteboard.svg",
             Self::Stacks => "icons/idema/stacks.svg",
             Self::Settings => "icons/idema/settings.svg",
             Self::Warning => "icons/idema/warning.svg",
@@ -285,8 +305,13 @@ impl Icon {
             Self::FilterList => include_bytes!("../assets/icons/filter_list.svg"),
             Self::GridView => include_bytes!("../assets/icons/grid_view.svg"),
             Self::ViewList => include_bytes!("../assets/icons/view_list.svg"),
-            Self::Slideshow => include_bytes!("../assets/icons/slideshow.svg"),
             Self::FilterNone => include_bytes!("../assets/icons/filter_none.svg"),
+            Self::ArtifactDocs => include_bytes!("../assets/icons/artifact_docs.svg"),
+            Self::ArtifactSlides => include_bytes!("../assets/icons/artifact_slides.svg"),
+            Self::ArtifactSheets => include_bytes!("../assets/icons/artifact_sheets.svg"),
+            Self::ArtifactDesign => include_bytes!("../assets/icons/artifact_design.svg"),
+            Self::ArtifactData => include_bytes!("../assets/icons/artifact_data.svg"),
+            Self::ArtifactWhiteboard => include_bytes!("../assets/icons/artifact_whiteboard.svg"),
             Self::Stacks => include_bytes!("../assets/icons/stacks.svg"),
             Self::Settings => include_bytes!("../assets/icons/settings.svg"),
             Self::Warning => include_bytes!("../assets/icons/warning.svg"),

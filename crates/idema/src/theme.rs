@@ -128,6 +128,21 @@ pub const GLYPH_XML: u32 = 0xFFE566;
 pub const GLYPH_HTML: u32 = 0xC2E89A;
 pub const GLYPH_ENV: u32 = 0xDDB3FF;
 
+/// Les pastilles des genres d'artifact de la galerie : fond sombre et glyphe clair de la même teinte, à raison d'une
+/// paire par genre nommé (Pages garde la pastille neutre).
+pub const ARTIFACT_DOCS_BG: u32 = 0x0D3D7E;
+pub const ARTIFACT_DOCS_GLYPH: u32 = 0x9DC8F7;
+pub const ARTIFACT_SLIDES_BG: u32 = 0x642508;
+pub const ARTIFACT_SLIDES_GLYPH: u32 = 0xF6B293;
+pub const ARTIFACT_SHEETS_BG: u32 = 0x0B4D10;
+pub const ARTIFACT_SHEETS_GLYPH: u32 = 0x91DA8E;
+pub const ARTIFACT_DESIGN_BG: u32 = 0x3A2684;
+pub const ARTIFACT_DESIGN_GLYPH: u32 = 0xC5BDFA;
+pub const ARTIFACT_DATA_BG: u32 = 0x761A1C;
+pub const ARTIFACT_DATA_GLYPH: u32 = 0xF7A6A7;
+pub const ARTIFACT_WHITEBOARD_BG: u32 = 0x651839;
+pub const ARTIFACT_WHITEBOARD_GLYPH: u32 = 0xF7ABC9;
+
 /// Coloration de l'éditeur du volet Fichiers (spec P2, §4.2) : la palette ANSI du handoff (celle du terminal), sauf les
 /// titres Markdown (orange système de macOS). Le commentaire de la maquette (`#5A5A5E`, 2,5:1) est relevé au plus petit
 /// gris qui passe 4,5:1, aussi sur la ligne courante : `#8C8C90` (valeur à ratifier à la porte).

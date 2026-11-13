@@ -177,7 +177,7 @@ fn log_fixture_in_use(status: Option<&str>) {
 }
 
 /// Le titre et la case du filtre pour un genre.
-fn kind_label(kind: ArtifactKind) -> &'static str {
+pub(crate) fn kind_label(kind: ArtifactKind) -> &'static str {
     kind.type_title().unwrap_or("Pages")
 }
 
@@ -637,6 +637,22 @@ mod tests {
         assert_eq!(kind_label(ArtifactKind::Docs), "Docs");
         assert_eq!(kind_label(ArtifactKind::Slides), "Slides");
         assert_eq!(kind_label(ArtifactKind::Page), "Pages");
+    }
+
+    #[test]
+    fn filter_menu_lists_seven_kinds_in_spec_order() {
+        assert_eq!(
+            ArtifactKind::FILTER_ORDER.map(kind_label),
+            [
+                "Docs",
+                "Slides",
+                "Sheets",
+                "Design",
+                "Data",
+                "Whiteboard",
+                "Pages"
+            ]
+        );
     }
 
     #[test]

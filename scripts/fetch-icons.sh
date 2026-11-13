@@ -17,7 +17,7 @@ arrow_back:300:arrow_back arrow_forward:300:arrow_forward refresh:300:refresh lo
 play_arrow:300:play_arrow arrow_outward:300:arrow_outward sticky_note_2:300:sticky_note_2 \
 tune:300:tune smart_toy:300:smart_toy hub:300:hub extension:300:extension storefront:300:storefront \
 delete:300:delete visibility:300:visibility visibility_off:300:visibility_off \
-filter_list:300:filter_list grid_view:300:grid_view view_list:300:view_list slideshow:300:slideshow \
+filter_list:300:filter_list grid_view:300:grid_view view_list:300:view_list \
 filter_none:300:filter_none stacks:300:stacks"
 for spec in $ICONS; do
   IFS=: read -r file weight name <<< "$spec"
