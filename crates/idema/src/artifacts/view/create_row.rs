@@ -192,8 +192,9 @@ fn tile(
         .child(block)
         .child(
             div()
-                .max_w_full()
-                .truncate()
+                // Jamais d'ellipse ni de retour à la ligne : un nom plus large que sa tuile (serré, « Whiteboard ») déborde
+                // des deux côtés, centré sous son bloc, dans l'écart entre les tuiles.
+                .whitespace_nowrap()
                 .text_size(theme.text(metrics.label_size))
                 .text_color(white(TEXT_SECONDARY))
                 .child(super::kind_label(kind)),
