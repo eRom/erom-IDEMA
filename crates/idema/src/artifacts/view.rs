@@ -532,6 +532,25 @@ impl ArtifactsView {
             .collect()
     }
 
+    /// La sonde de largeur : un canevas qui couvre la zone et note sa largeur, retraits ôtés, dans `content_width`.
+    fn width_probe(view: Entity<Self>, side: f32) -> impl IntoElement {
+        canvas(
+            move |bounds, window, cx| {
+                let scale = cx.global::<Theme>().scale;
+                let inner = f32::from(bounds.size.width) / scale - 2. * side;
+                let changed = view.update(cx, |this, _| this.note_width(inner));
+                // Pendant le dessin, `notify` est ignoré : sans cette demande, les colonnes ne suivraient qu'à la
+                // prochaine image venue d'ailleurs.
+                if changed {
+                    window.request_animation_frame();
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .size_full()
+    }
+
     /// La mesure de la zone des cartes, derrière elles : elle dit de quelle largeur la grille dispose. Rend vrai si la
     /// largeur a changé.
     fn note_width(&mut self, width: f32) -> bool {
@@ -581,23 +600,7 @@ impl Render for ArtifactsView {
                         .pt(theme.px(CONTENT_TOP))
                         .pb(theme.px(CONTENT_BOTTOM))
                         // La mesure : la largeur de la zone, retraits ôtés, décide du nombre de colonnes.
-                        .child(
-                            canvas(
-                                move |bounds, window, cx| {
-                                    let scale = cx.global::<Theme>().scale;
-                                    let inner = f32::from(bounds.size.width) / scale - 2. * side;
-                                    let changed = view.update(cx, |this, _| this.note_width(inner));
-                                    // Pendant le dessin, `notify` est ignoré : sans cette demande, les colonnes ne
-                                    // suivraient qu'à la prochaine image venue d'ailleurs.
-                                    if changed {
-                                        window.request_animation_frame();
-                                    }
-                                },
-                                |_, (), _, _| {},
-                            )
-                            .absolute()
-                            .size_full(),
-                        )
+                        .child(Self::width_probe(view, side))
                         .children(create_row)
                         .child(body),
                 )
@@ -612,9 +615,12 @@ impl Render for ArtifactsView {
                 .flex_col()
                 .child(
                     div()
+                        .relative()
                         .flex_none()
                         .px(theme.px(side))
                         .pt(theme.px(CONTENT_TOP))
+                        // La rangée a besoin de la largeur aussi : ici, pas de grille pour la mesurer.
+                        .child(Self::width_probe(view, side))
                         .child(create_row),
                 )
                 .child(body)
