@@ -649,6 +649,29 @@ mod tests {
     }
 
     #[test]
+    fn a_v1_filter_reads_with_new_kinds_shown() {
+        let dir = temp_dir("artifacts-filter-v1");
+        let path = dir.join("state.json");
+        let text = r#"{"version":1,"projects":[],"ui":{"sidebar_visible":true,"expanded":[],"selected_session":null,"artifacts_filter":{"docs":true,"slides":false,"pages":false}}}"#;
+        std::fs::write(&path, text).unwrap();
+        let store = StateStore::load(&path).unwrap();
+        assert_eq!(store.notice, None);
+        assert!(!dir.join("state.json.bak").exists());
+        assert_eq!(
+            store.state.ui.artifacts_filter,
+            KindFilter {
+                docs: true,
+                slides: false,
+                pages: false,
+                sheets: true,
+                design: true,
+                data: true,
+                whiteboard: true,
+            }
+        );
+    }
+
+    #[test]
     fn artifacts_ui_round_trip() {
         let dir = temp_dir("artifacts-round-trip");
         let path = dir.join("state.json");

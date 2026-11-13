@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use super::cards::{GRID_GAP, ItemView, MIN_CARD_WIDTH, grid_columns};
 use super::listing::{Applied, Listing, Status};
-use super::model::{Artifact, ArtifactKind, KindFilter, apply, classify, opened_label};
+use super::model::{Artifact, ArtifactKind, KindFilter, apply, classify, kind_flag, opened_label};
 use super::source::ArtifactsSource;
 use super::thumbnails::{ThumbState, Thumbnails};
 use super::{ApiError, ListQuery};
@@ -178,20 +178,7 @@ fn log_fixture_in_use(status: Option<&str>) {
 
 /// Le titre et la case du filtre pour un genre.
 fn kind_label(kind: ArtifactKind) -> &'static str {
-    match kind {
-        ArtifactKind::Docs => "Docs",
-        ArtifactKind::Slides => "Slides",
-        ArtifactKind::Page => "Pages",
-    }
-}
-
-/// La case d'un genre dans le filtre.
-fn kind_flag(filter: &mut KindFilter, kind: ArtifactKind) -> &mut bool {
-    match kind {
-        ArtifactKind::Docs => &mut filter.docs,
-        ArtifactKind::Slides => &mut filter.slides,
-        ArtifactKind::Page => &mut filter.pages,
-    }
+    kind.type_title().unwrap_or("Pages")
 }
 
 impl ArtifactsView {
@@ -349,7 +336,7 @@ impl ArtifactsView {
             bounds.bottom() + theme.px(4.),
         );
         let view = cx.entity();
-        let entries = [ArtifactKind::Docs, ArtifactKind::Slides, ArtifactKind::Page]
+        let entries = ArtifactKind::FILTER_ORDER
             .into_iter()
             .map(|kind| {
                 let view = view.clone();

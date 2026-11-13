@@ -1,0 +1,100 @@
+{
+  "artifacts": [
+    {
+      "id": "art_0101",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Note de cadrage",
+      "open_url": "https://claude.ai/artifacts/art_0101",
+      "type_title": "Docs",
+      "type_slug": "docs-fixture-slug",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0101_thumb.img?__frame_t=light",
+      "thumbnail_dark_url": "https://fixture.frame.claudeusercontent.com/0101_dark_thumb.img?__frame_t=dark",
+      "last_viewed_at": "2026-11-12T10:00:00Z"
+    },
+    {
+      "id": "art_0102",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Revue trimestrielle",
+      "open_url": "https://claude.ai/artifacts/art_0102",
+      "type_title": "Slides",
+      "type_slug": "slides-fixture-slug",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0102_thumb.img?__frame_t=light",
+      "thumbnail_dark_url": "https://fixture.frame.claudeusercontent.com/0102_dark_thumb.img?__frame_t=dark",
+      "last_viewed_at": "2026-11-11T10:00:00Z"
+    },
+    {
+      "id": "art_0103",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Budget 2027",
+      "open_url": "https://claude.ai/artifacts/art_0103",
+      "type_title": "Sheets",
+      "type_slug": "sheets-fixture-slug",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0103_thumb.img?__frame_t=light",
+      "thumbnail_dark_url": "https://fixture.frame.claudeusercontent.com/0103_dark_thumb.img?__frame_t=dark",
+      "last_viewed_at": "2026-11-10T10:00:00Z"
+    },
+    {
+      "id": "art_0104",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Maquette d'accueil",
+      "open_url": "https://claude.ai/design/p/art_0104",
+      "type_title": "Design",
+      "type_slug": "design-fixture-slug",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0104_thumb.img?__frame_t=light",
+      "thumbnail_dark_url": "https://fixture.frame.claudeusercontent.com/0104_dark_thumb.img?__frame_t=dark",
+      "last_viewed_at": "2026-11-09T10:00:00Z"
+    },
+    {
+      "id": "art_0105",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Tableau des ventes",
+      "open_url": "https://claude.ai/artifacts/art_0105",
+      "type_title": "Data",
+      "type_slug": "data-fixture-slug",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0105_thumb.img?__frame_t=light",
+      "thumbnail_dark_url": "https://fixture.frame.claudeusercontent.com/0105_dark_thumb.img?__frame_t=dark",
+      "last_viewed_at": "2026-11-08T10:00:00Z"
+    },
+    {
+      "id": "art_0106",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Atelier idées",
+      "open_url": "https://claude.ai/artifacts/art_0106",
+      "type_title": "Whiteboard",
+      "type_slug": "whiteboard-fixture-slug",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0106_thumb.img?__frame_t=light",
+      "thumbnail_dark_url": "https://fixture.frame.claudeusercontent.com/0106_dark_thumb.img?__frame_t=dark",
+      "last_viewed_at": "2026-11-07T10:00:00Z"
+    },
+    {
+      "id": "art_0107",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Calculatrice",
+      "open_url": "https://claude.ai/artifacts/art_0107",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0107_thumb.img?__frame_t=light",
+      "thumbnail_dark_url": "https://fixture.frame.claudeusercontent.com/0107_dark_thumb.img?__frame_t=dark",
+      "last_viewed_at": "2026-11-06T10:00:00Z"
+    },
+    {
+      "id": "art_0108",
+      "kind": "artifact",
+      "rel": "mine",
+      "title": "Charte graphique",
+      "open_url": "https://claude.ai/design/p/art_0108",
+      "type_title": "Design System",
+      "type_slug": "design-system-fixture-slug",
+      "thumbnail_url": "https://fixture.frame.claudeusercontent.com/0108_thumb.img?__frame_t=light",
+      "last_viewed_at": "2026-11-05T10:00:00Z"
+    }
+  ],
+  "hosted_total": 8,
+  "empty_total": 0,
+  "sort": "last_viewed"
+}

@@ -17,17 +17,59 @@ pub const PAGE_SIZE: u32 = 48;
 pub enum ArtifactKind {
     Docs,
     Slides,
+    Sheets,
+    Design,
+    Data,
+    Whiteboard,
     /// Un artifact sans `type_title` : une page.
     Page,
 }
 
-/// Le genre d'un `type_title`. `None` : type exclu de la galerie (Design compris).
+impl ArtifactKind {
+    /// Les genres que la galerie sait créer, dans l'ordre des tuiles.
+    pub const CREATABLE: [ArtifactKind; 6] = [
+        ArtifactKind::Docs,
+        ArtifactKind::Slides,
+        ArtifactKind::Sheets,
+        ArtifactKind::Design,
+        ArtifactKind::Data,
+        ArtifactKind::Whiteboard,
+    ];
+
+    /// Tous les genres, dans l'ordre du menu du filtre (les pages en dernier).
+    pub const FILTER_ORDER: [ArtifactKind; 7] = [
+        ArtifactKind::Docs,
+        ArtifactKind::Slides,
+        ArtifactKind::Sheets,
+        ArtifactKind::Design,
+        ArtifactKind::Data,
+        ArtifactKind::Whiteboard,
+        ArtifactKind::Page,
+    ];
+
+    /// Le titre exact que l'API donne au type. `None` pour une page, qui n'en a pas.
+    pub fn type_title(self) -> Option<&'static str> {
+        match self {
+            ArtifactKind::Docs => Some("Docs"),
+            ArtifactKind::Slides => Some("Slides"),
+            ArtifactKind::Sheets => Some("Sheets"),
+            ArtifactKind::Design => Some("Design"),
+            ArtifactKind::Data => Some("Data"),
+            ArtifactKind::Whiteboard => Some("Whiteboard"),
+            ArtifactKind::Page => None,
+        }
+    }
+}
+
+/// Le genre d'un `type_title`, comparé sans casse sur le titre rogné. `None` : type exclu de la galerie (`Design System`
+/// et tout titre inconnu).
 pub fn kind_of(type_title: Option<&str>) -> Option<ArtifactKind> {
     match type_title.map(str::trim) {
         None | Some("") => Some(ArtifactKind::Page),
-        Some(title) if title.eq_ignore_ascii_case("docs") => Some(ArtifactKind::Docs),
-        Some(title) if title.eq_ignore_ascii_case("slides") => Some(ArtifactKind::Slides),
-        Some(_) => None,
+        Some(title) => ArtifactKind::CREATABLE.into_iter().find(|kind| {
+            kind.type_title()
+                .is_some_and(|known| known.eq_ignore_ascii_case(title))
+        }),
     }
 }
 
@@ -96,12 +138,25 @@ pub fn parse_page(body: &str) -> Result<Vec<Artifact>, ApiError> {
         .collect())
 }
 
-/// Les genres affichés. Par défaut, tous.
+/// Les genres affichés. Par défaut, tous. Les quatre genres ajoutés après la v1 sont affichés quand le champ manque :
+/// un `state.json` d'avant ne les masque pas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KindFilter {
     pub docs: bool,
     pub slides: bool,
+    #[serde(default = "shown")]
+    pub sheets: bool,
+    #[serde(default = "shown")]
+    pub design: bool,
+    #[serde(default = "shown")]
+    pub data: bool,
+    #[serde(default = "shown")]
+    pub whiteboard: bool,
     pub pages: bool,
+}
+
+fn shown() -> bool {
+    true
 }
 
 impl Default for KindFilter {
@@ -109,20 +164,34 @@ impl Default for KindFilter {
         Self {
             docs: true,
             slides: true,
+            sheets: true,
+            design: true,
+            data: true,
+            whiteboard: true,
             pages: true,
         }
     }
 }
 
+/// La case d'un genre dans le filtre.
+pub fn kind_flag(filter: &mut KindFilter, kind: ArtifactKind) -> &mut bool {
+    match kind {
+        ArtifactKind::Docs => &mut filter.docs,
+        ArtifactKind::Slides => &mut filter.slides,
+        ArtifactKind::Sheets => &mut filter.sheets,
+        ArtifactKind::Design => &mut filter.design,
+        ArtifactKind::Data => &mut filter.data,
+        ArtifactKind::Whiteboard => &mut filter.whiteboard,
+        ArtifactKind::Page => &mut filter.pages,
+    }
+}
+
 /// Les artifacts dont le genre est affiché, dans l'ordre reçu.
 pub fn apply(items: &[Artifact], filter: &KindFilter) -> Vec<Artifact> {
+    let mut flags = *filter;
     items
         .iter()
-        .filter(|item| match item.kind {
-            ArtifactKind::Docs => filter.docs,
-            ArtifactKind::Slides => filter.slides,
-            ArtifactKind::Page => filter.pages,
-        })
+        .filter(|item| *kind_flag(&mut flags, item.kind))
         .cloned()
         .collect()
 }
@@ -221,20 +290,75 @@ mod tests {
         items.iter().map(|item| item.title.as_str()).collect()
     }
 
+    const ALL_KINDS: &str = include_str!("fixtures/artifacts-all-kinds.json");
+
     #[test]
-    fn parse_keeps_docs_slides_and_pages_only() {
+    fn parse_reads_the_original_fixture_with_design_included() {
         let items = parse_page(FIXTURE).unwrap();
-        assert_eq!(items.len(), 4);
+        assert_eq!(items.len(), 5);
         assert_eq!(
             items.iter().map(|item| item.kind).collect::<Vec<_>>(),
             vec![
                 ArtifactKind::Docs,
                 ArtifactKind::Slides,
                 ArtifactKind::Page,
+                ArtifactKind::Page,
+                ArtifactKind::Design
+            ]
+        );
+        assert!(titles(&items).contains(&"Maquette de la page d'accueil"));
+    }
+
+    #[test]
+    fn parse_keeps_the_six_kinds_and_pages_but_never_design_system() {
+        let items = parse_page(ALL_KINDS).unwrap();
+        assert_eq!(items.len(), 7);
+        assert_eq!(
+            items.iter().map(|item| item.kind).collect::<Vec<_>>(),
+            vec![
+                ArtifactKind::Docs,
+                ArtifactKind::Slides,
+                ArtifactKind::Sheets,
+                ArtifactKind::Design,
+                ArtifactKind::Data,
+                ArtifactKind::Whiteboard,
                 ArtifactKind::Page
             ]
         );
-        assert!(!titles(&items).contains(&"Maquette de la page d'accueil"));
+        assert!(!titles(&items).contains(&"Charte graphique"));
+    }
+
+    #[test]
+    fn type_titles_round_trip_through_kind_of() {
+        for kind in ArtifactKind::CREATABLE {
+            assert_eq!(kind_of(kind.type_title()), Some(kind));
+        }
+        assert_eq!(ArtifactKind::Page.type_title(), None);
+    }
+
+    #[test]
+    fn filter_without_sheets_drops_sheets_only() {
+        let items = parse_page(ALL_KINDS).unwrap();
+        let filter = KindFilter {
+            sheets: false,
+            ..Default::default()
+        };
+        let kept = apply(&items, &filter);
+        assert_eq!(kept.len(), 6);
+        assert!(kept.iter().all(|item| item.kind != ArtifactKind::Sheets));
+        assert_eq!(apply(&items, &KindFilter::default()).len(), 7);
+    }
+
+    #[test]
+    fn kind_flag_reaches_every_kind_of_the_filter_order() {
+        for kind in ArtifactKind::FILTER_ORDER {
+            let mut filter = KindFilter::default();
+            *kind_flag(&mut filter, kind) = false;
+            let items = parse_page(ALL_KINDS).unwrap();
+            let kept = apply(&items, &filter);
+            assert_eq!(kept.len(), 6, "{kind:?}");
+            assert!(kept.iter().all(|item| item.kind != kind), "{kind:?}");
+        }
     }
 
     #[test]
@@ -266,10 +390,11 @@ mod tests {
         // Champs renommés par l'API : tous les éléments échouent, ce n'est pas une galerie vide.
         let renamed = r#"{"artifacts":[{"uuid":"a","url":"u"},{"uuid":"b","url":"v"}]}"#;
         assert_eq!(parse_page(renamed), Err(ApiError::Unreadable));
-        // Une vraie liste vide, ou une liste de seuls Designs, reste une réponse lisible.
+        // Une vraie liste vide, ou une liste de seuls types exclus, reste une réponse lisible.
         assert_eq!(parse_page(r#"{"artifacts":[]}"#), Ok(vec![]));
-        let only_design = r#"{"artifacts":[{"id":"a","open_url":"u","type_title":"Design"}]}"#;
-        assert_eq!(parse_page(only_design), Ok(vec![]));
+        let only_excluded =
+            r#"{"artifacts":[{"id":"a","open_url":"u","type_title":"Design System"}]}"#;
+        assert_eq!(parse_page(only_excluded), Ok(vec![]));
     }
 
     #[test]
@@ -279,11 +404,16 @@ mod tests {
     }
 
     #[test]
-    fn kind_of_excludes_design_and_unknown_types() {
+    fn kind_of_matches_titles_without_case_or_padding() {
         assert_eq!(kind_of(Some("Docs")), Some(ArtifactKind::Docs));
         assert_eq!(kind_of(Some("Slides")), Some(ArtifactKind::Slides));
+        assert_eq!(kind_of(Some(" sheets ")), Some(ArtifactKind::Sheets));
+        assert_eq!(kind_of(Some("DATA")), Some(ArtifactKind::Data));
+        assert_eq!(kind_of(Some("Design")), Some(ArtifactKind::Design));
+        assert_eq!(kind_of(Some("whiteboard")), Some(ArtifactKind::Whiteboard));
         assert_eq!(kind_of(None), Some(ArtifactKind::Page));
-        assert_eq!(kind_of(Some("Design")), None);
+        assert_eq!(kind_of(Some("Design System")), None);
+        assert_eq!(kind_of(Some("Dashboard")), None);
         assert_eq!(kind_of(Some("Quelque chose")), None);
     }
 
@@ -295,9 +425,9 @@ mod tests {
             ..Default::default()
         };
         let kept = apply(&items, &filter);
-        assert_eq!(kept.len(), 2);
+        assert_eq!(kept.len(), 3);
         assert!(kept.iter().all(|item| item.kind != ArtifactKind::Page));
-        assert_eq!(apply(&items, &KindFilter::default()).len(), 4);
+        assert_eq!(apply(&items, &KindFilter::default()).len(), 5);
     }
 
     #[test]

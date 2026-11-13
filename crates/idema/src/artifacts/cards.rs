@@ -67,7 +67,12 @@ pub struct ItemView {
 /// L'icône du genre : Docs a celle d'un document, Slides celle d'un diaporama, Pages deux feuilles superposées.
 pub fn kind_icon(kind: ArtifactKind) -> Icon {
     match kind {
-        ArtifactKind::Docs => Icon::Description,
+        // Provisoire : la tâche 2 donne leurs pictogrammes aux quatre nouveaux genres.
+        ArtifactKind::Docs
+        | ArtifactKind::Sheets
+        | ArtifactKind::Design
+        | ArtifactKind::Data
+        | ArtifactKind::Whiteboard => Icon::Description,
         ArtifactKind::Slides => Icon::Slideshow,
         ArtifactKind::Page => Icon::FilterNone,
     }
@@ -85,7 +90,12 @@ fn tint(hex: u32, alpha: f32) -> Rgba {
 /// neutre pour Pages (la maquette teinte ainsi Docs et Design).
 fn chip_colors(kind: ArtifactKind) -> (Rgba, Rgba) {
     match kind {
-        ArtifactKind::Docs => (tint(FOCUS, TOGGLE_ACTIVE), color(FOCUS_TEXT)),
+        // Provisoire : la tâche 2 donne leurs couleurs aux quatre nouveaux genres.
+        ArtifactKind::Docs
+        | ArtifactKind::Sheets
+        | ArtifactKind::Design
+        | ArtifactKind::Data
+        | ArtifactKind::Whiteboard => (tint(FOCUS, TOGGLE_ACTIVE), color(FOCUS_TEXT)),
         ArtifactKind::Slides => (tint(AGENT_PURPLE, BADGE_STDIO), color(AGENT_PURPLE_TEXT)),
         ArtifactKind::Page => (white(HOVER_STRONG), white(TEXT_SECONDARY)),
     }
