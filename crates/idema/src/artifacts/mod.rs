@@ -2,6 +2,7 @@
 //! page cachée qui rejoue la requête de l'app (même magasin de cookies que le volet Browser).
 
 pub(crate) mod cards;
+pub(crate) mod create;
 pub(crate) mod listing;
 pub(crate) mod model;
 pub(crate) mod source;

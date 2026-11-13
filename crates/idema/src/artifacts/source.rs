@@ -46,6 +46,21 @@ let landedOnLogin = false;
 try { landedOnLogin = new URL(response.url, location.href).pathname.startsWith('/login'); } catch (error) {}
 return JSON.stringify({ status: response.status, body: body, headers: Object.keys(captured.headers), org_present: !!captured.org, landed_on_login: landedOnLogin });";
 
+/// Rejoue une requête quelconque (création) avec les en-têtes retenus. Arguments nommés : `method`, `path` (chemin et
+/// chaîne de requête, commence par `/`), `body` (chaîne vide : pas de corps ; sinon JSON, avec `content-type`). Même
+/// garde et même forme de réponse que `REPLAY_BODY` : `status` 0 si la capture a disparu.
+const CALL_BODY: &str = "\
+const captured = window.__idemaArtifacts;
+if (!captured) { return JSON.stringify({ status: 0, body: '', headers: [], org_present: false, landed_on_login: false }); }
+const headers = Object.assign({}, captured.headers);
+const init = { method: method, headers: headers, credentials: 'include' };
+if (body !== '') { headers['content-type'] = 'application/json'; init.body = body; }
+const response = await window.fetch(path, init);
+const text = await response.text();
+let landedOnLogin = false;
+try { landedOnLogin = new URL(response.url, location.href).pathname.startsWith('/login'); } catch (error) {}
+return JSON.stringify({ status: response.status, body: text, headers: Object.keys(headers), org_present: !!captured.org, landed_on_login: landedOnLogin });";
+
 #[derive(Deserialize)]
 struct PageState {
     ready: bool,
@@ -170,12 +185,11 @@ impl ArtifactsSource {
         result
     }
 
-    async fn request_once(
+    /// Crée la page si besoin et attend la capture des en-têtes. Rend la page et le paramètre `org` capturé.
+    async fn ready(
         this: &WeakEntity<Self>,
-        search: Option<String>,
-        offset: Option<u32>,
         cx: &mut AsyncApp,
-    ) -> Result<RawResponse, ApiError> {
+    ) -> Result<(Session, String), ApiError> {
         let released = || ApiError::Unavailable("source released".to_owned());
         let window = this
             .read_with(cx, |source, _| source.window)
@@ -224,6 +238,55 @@ impl ArtifactsSource {
             }
             cx.background_executor().timer(POLL_INTERVAL).await;
         }
+        Ok((session, org))
+    }
+
+    /// Rejoue une requête quelconque avec les en-têtes capturés (même garde et même forme de réponse que la liste).
+    /// `path_and_query` commence par `/` ; `body` à `None` n'envoie aucun corps. Toute erreur oublie la page cachée.
+    async fn call(
+        this: &WeakEntity<Self>,
+        method: &str,
+        path_and_query: &str,
+        body: Option<&str>,
+        cx: &mut AsyncApp,
+    ) -> Result<RawResponse, ApiError> {
+        let result = Self::call_once(this, method, path_and_query, body, cx).await;
+        if should_reset(&result) {
+            let _ = this.update(cx, |source, _| source.reset());
+        }
+        result
+    }
+
+    async fn call_once(
+        this: &WeakEntity<Self>,
+        method: &str,
+        path_and_query: &str,
+        body: Option<&str>,
+        cx: &mut AsyncApp,
+    ) -> Result<RawResponse, ApiError> {
+        let (session, _org) = Self::ready(this, cx).await?;
+        let arguments = vec![
+            ("method".to_owned(), method.to_owned()),
+            ("path".to_owned(), path_and_query.to_owned()),
+            ("body".to_owned(), body.unwrap_or_default().to_owned()),
+        ];
+        let json = evaluate_within(cx, &session.page, CALL_BODY, arguments, CAPTURE_TIMEOUT)
+            .await
+            .map_err(ApiError::Unavailable)?;
+        let raw: RawResponse = serde_json::from_str(&json).map_err(|_| ApiError::Unreadable)?;
+        if raw.status == 0 {
+            return Err(ApiError::Unavailable("capture lost".to_owned()));
+        }
+        Ok(raw)
+    }
+
+    async fn request_once(
+        this: &WeakEntity<Self>,
+        search: Option<String>,
+        offset: Option<u32>,
+        cx: &mut AsyncApp,
+    ) -> Result<RawResponse, ApiError> {
+        let (session, org) = Self::ready(this, cx).await?;
 
         // `offset` ne sert qu'à la sonde (l'API l'ignore) : il se greffe après la requête de la liste.
         let mut query = query_string(&ListQuery { search }, &org);
@@ -344,6 +407,112 @@ async fn probe(source: &WeakEntity<ArtifactsSource>, cx: &mut AsyncApp) {
         Err(error) => hud::log_event(&format!(
             "artifacts probe offset={PAGE_SIZE} error={error:?}"
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// La sonde de la création (`IDEMA_ARTIFACTS_CREATE_PROBE=1`) : crée UN Doc vide sur le compte, par la page cachée.
+
+/// Lance la sonde de création. Le résultat va au journal, lignes `artifacts create probe ...` : jamais une valeur
+/// d'en-tête, de cookie ou d'`org`, seulement des noms de clés et des formes de valeurs (hors adresse d'artifact).
+pub fn run_create_probe(window: AnyWindowHandle, cx: &mut App) {
+    let source = cx.new(|_| ArtifactsSource::new(window));
+    cx.spawn(async move |cx| {
+        let weak = source.downgrade();
+        create_probe(&weak, cx).await;
+        drop(source);
+    })
+    .detach();
+}
+
+async fn create_probe(source: &WeakEntity<ArtifactsSource>, cx: &mut AsyncApp) {
+    use super::create::{
+        CREATE_BODY, CreateError, artifact_address, create_query, new_idempotency_key, org_query,
+        summarize_create, type_slug, value_shape,
+    };
+
+    let (_session, org) = match ArtifactsSource::ready(source, cx).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            hud::log_event(&format!("artifacts create probe error={error:?}"));
+            return;
+        }
+    };
+
+    let types_path = format!("/api/frame/types?{}", org_query(&org));
+    let types = match ArtifactsSource::call(source, "GET", &types_path, None, cx).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            hud::log_event(&format!("artifacts create probe types_error={error:?}"));
+            return;
+        }
+    };
+    let slug = match type_slug(&types.body, "Docs") {
+        Ok(slug) => slug,
+        Err(error) => {
+            let reason = match error {
+                CreateError::TypeNotFound => "type_not_found",
+                CreateError::Api(_) => "types_unreadable",
+            };
+            hud::log_event(&format!(
+                "artifacts create probe types_status={} error={reason}",
+                types.status
+            ));
+            return;
+        }
+    };
+
+    let create_path = format!(
+        "/api/frame/types/{slug}/create?{}",
+        create_query(&org, &new_idempotency_key())
+    );
+    let created =
+        match ArtifactsSource::call(source, "POST", &create_path, Some(CREATE_BODY), cx).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                hud::log_event(&format!(
+                    "artifacts create probe types_status={} create_error={error:?}",
+                    types.status
+                ));
+                return;
+            }
+        };
+    let summary = summarize_create(&created.body);
+    hud::log_event(&format!(
+        "artifacts create probe types_status={} create_status={} keys={} candidates={} headers={}",
+        types.status,
+        created.status,
+        summary.keys.join(","),
+        summary.candidates.join(","),
+        created.headers.join(","),
+    ));
+
+    let mut address = summary.address;
+    // Pas d'adresse dans la réponse : l'app web interroge ensuite `GET /api/frame/<uuid>` et lit `viewerPath`.
+    if address.is_none()
+        && let Some((path, uuid)) = summary.uuid
+    {
+        let frame_path = format!("/api/frame/{uuid}?{}", org_query(&org));
+        match ArtifactsSource::call(source, "GET", &frame_path, None, cx).await {
+            Ok(frame) => {
+                let value = serde_json::from_str::<Value>(&frame.body).ok();
+                let viewer_path = value.as_ref().and_then(|v| v.get("viewerPath"));
+                hud::log_event(&format!(
+                    "artifacts create probe frame_from={path} frame_status={} viewer_path={}",
+                    frame.status,
+                    viewer_path.map_or_else(|| "absent".to_owned(), value_shape),
+                ));
+                address = viewer_path
+                    .and_then(Value::as_str)
+                    .and_then(artifact_address);
+            }
+            Err(error) => hud::log_event(&format!(
+                "artifacts create probe frame_from={path} frame_error={error:?}"
+            )),
+        }
+    }
+    if let Some(address) = address {
+        hud::log_event(&format!("artifacts create probe url={address}"));
     }
 }
 

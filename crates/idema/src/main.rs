@@ -245,6 +245,10 @@ fn main() {
         if std::env::var_os("IDEMA_ARTIFACTS_PROBE").is_some_and(|value| value == "1") {
             artifacts::source::run_probe(workspace.into(), cx);
         }
+        // Sonde de la création : crée UN Doc vide sur le compte claude.ai (lignes `artifacts create probe`).
+        if std::env::var_os("IDEMA_ARTIFACTS_CREATE_PROBE").is_some_and(|value| value == "1") {
+            artifacts::source::run_create_probe(workspace.into(), cx);
+        }
         cx.activate(true);
         cx.spawn(async move |cx| {
             while let Some(urls) = open_requests.next().await {
