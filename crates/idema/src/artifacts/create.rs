@@ -236,7 +236,6 @@ pub fn reason(error: &CreateError) -> String {
 
 /// Où en est la création côté galerie : une seule à la fois, l'échec reste affiché jusqu'à ce qu'on l'efface.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[allow(dead_code)] // branché par la vue dans la tâche suivante
 pub enum CreateState {
     #[default]
     Idle,
@@ -245,7 +244,6 @@ pub enum CreateState {
     Failed(String),
 }
 
-#[allow(dead_code)] // branché par la vue dans la tâche suivante
 impl CreateState {
     /// Démarre une création. Faux (rien ne change) si une autre tourne ; un échec affiché ne bloque pas.
     pub fn begin(&mut self, kind: ArtifactKind) -> bool {
@@ -274,7 +272,6 @@ impl CreateState {
 
 /// Ce que répond la fausse création : `missing-type` pour un type introuvable, un code HTTP pour l'erreur que `classify`
 /// en tire, sinon (rien, 200 ou illisible) l'adresse du fichier de test.
-#[allow(dead_code)] // branchée par la vue dans la tâche suivante
 pub fn fixture_outcome(url: &str, status: Option<&str>) -> Result<String, CreateError> {
     let status = status.map(str::trim);
     if status == Some("missing-type") {

@@ -20,7 +20,9 @@ use gpui::{
 use gpui_component::input::{InputEvent, InputState};
 use serde::{Deserialize, Serialize};
 
+use self::create_row::create_row_visible;
 use super::cards::{GRID_GAP, ItemView, MIN_CARD_WIDTH, grid_columns};
+use super::create::{CreateError, CreateState, fixture_outcome, outcome_line, requested_line};
 use super::listing::{Applied, Listing, Status};
 use super::model::{Artifact, ArtifactKind, KindFilter, apply, classify, kind_flag, opened_label};
 use super::source::ArtifactsSource;
@@ -53,11 +55,8 @@ pub const FIXTURE_STATUS_ENV: &str = "IDEMA_ARTIFACTS_FIXTURE_STATUS";
 
 /// Les variables des tests dans la VM, qui n'a pas de session claude.ai : l'adresse rendue à la place d'une création,
 /// le code HTTP forcé (ou `missing-type`), et le délai de la fausse création en millisecondes.
-#[allow(dead_code)] // branchées par la vue dans la tâche suivante
 pub const CREATE_FIXTURE_ENV: &str = "IDEMA_ARTIFACTS_CREATE_FIXTURE";
-#[allow(dead_code)] // branchées par la vue dans la tâche suivante
 pub const CREATE_FIXTURE_STATUS_ENV: &str = "IDEMA_ARTIFACTS_CREATE_FIXTURE_STATUS";
-#[allow(dead_code)] // branchées par la vue dans la tâche suivante
 pub const CREATE_FIXTURE_DELAY_ENV: &str = "IDEMA_ARTIFACTS_CREATE_FIXTURE_DELAY_MS";
 
 /// Le retrait de chaque côté de l'en-tête et des cartes, en unités de la maquette.
@@ -68,6 +67,7 @@ const COMPACT_SIDE_PADDING: f32 = 8.;
 const CONTENT_TOP: f32 = 16.;
 const CONTENT_BOTTOM: f32 = 24.;
 
+mod create_row;
 mod header;
 mod states;
 
@@ -122,6 +122,8 @@ pub struct ArtifactsView {
     /// La recherche partie au serveur (rognée) ; vide : pas de `q`.
     applied_query: String,
     search: Option<SearchField>,
+    /// Où en est la création d'un artifact par la rangée « Créer » : une seule à la fois, l'échec reste affiché.
+    creation: CreateState,
     /// La frappe en attente de son délai : la remplacer annule la précédente.
     debounce: Option<Task<()>>,
     /// La largeur de la zone des cartes, en unités de la maquette, mesurée au dessin ; zéro tant qu'elle ne l'est pas.
@@ -210,6 +212,7 @@ impl ArtifactsView {
             listing: Listing::default(),
             applied_query: String::new(),
             search: None,
+            creation: CreateState::default(),
             debounce: None,
             content_width: 0.,
             filter_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -228,7 +231,69 @@ impl ArtifactsView {
         if let Some(text) = self.typed_text(cx) {
             self.applied_query = text;
         }
+        // L'échec d'une création disparaît au rechargement (spec §3.4) ; une création en cours continue.
+        self.creation.clear_failure();
         self.request(cx);
+    }
+
+    /// Crée un artifact du genre `kind` et ouvre son adresse. Une création court déjà : rien ne se passe. Sous la variable
+    /// de test, une fausse issue arrive après le délai demandé et la source n'est pas sollicitée. Aucune nouvelle
+    /// tentative : un échec s'affiche sous la rangée, le clic suivant relance.
+    fn start_create(&mut self, kind: ArtifactKind, cx: &mut Context<Self>) {
+        if !self.creation.begin(kind) {
+            return;
+        }
+        let (sender, receiver) = oneshot::channel();
+        match std::env::var(CREATE_FIXTURE_ENV) {
+            Ok(url) if !url.is_empty() => {
+                let title = kind_label(kind);
+                let status = std::env::var(CREATE_FIXTURE_STATUS_ENV).ok();
+                let delay = std::env::var(CREATE_FIXTURE_DELAY_ENV)
+                    .ok()
+                    .and_then(|delay| delay.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                hud::log_event(&requested_line(title));
+                cx.spawn(async move |_, cx| {
+                    if delay > 0 {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(delay))
+                            .await;
+                    }
+                    let result = fixture_outcome(&url, status.as_deref());
+                    hud::log_event(&outcome_line(title, &result));
+                    let _ = sender.send(result);
+                })
+                .detach();
+            }
+            _ => self.source.update(cx, |source, cx| {
+                source.create(
+                    kind,
+                    move |result| {
+                        let _ = sender.send(result);
+                    },
+                    cx,
+                );
+            }),
+        }
+        cx.spawn(async move |this, cx| {
+            let result = receiver.await.unwrap_or_else(|_| {
+                Err(CreateError::Api(ApiError::Unavailable(
+                    "request dropped".to_owned(),
+                )))
+            });
+            let _ = this.update(cx, |view, cx| view.finish_create(result, cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// L'issue de la création : retour au repos ou échec à afficher ; en cas de succès, l'adresse s'ouvre (un onglet neuf).
+    fn finish_create(&mut self, result: Result<String, CreateError>, cx: &mut Context<Self>) {
+        self.creation.finish(&result);
+        if let Ok(url) = result {
+            cx.emit(ArtifactsEvent::Open(url));
+        }
+        cx.notify();
     }
 
     /// Le retrait gauche de l'en-tête : `Some` quand la barre latérale est repliée et que la bande doit laisser la place aux
@@ -499,6 +564,9 @@ impl Render for ArtifactsView {
         let scrolling = matches!(status, Status::Loading | Status::Loaded)
             && !(status == Status::Loaded && self.visible().is_empty());
         let view = cx.entity();
+        let search_text = self.typed_text(cx).unwrap_or_default();
+        let create_row =
+            create_row_visible(&status, &search_text).then(|| self.render_create_row(&theme, cx));
         let content = if scrolling {
             div()
                 .id("artifacts-scroll")
@@ -530,8 +598,26 @@ impl Render for ArtifactsView {
                             .absolute()
                             .size_full(),
                         )
+                        .children(create_row)
                         .child(body),
                 )
+                .into_any_element()
+        } else if let Some(create_row) = create_row {
+            // « Aucun artifact » et « Aucun résultat » : la rangée se place au-dessus du message, qui garde le reste de la
+            // zone pour se centrer.
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex_none()
+                        .px(theme.px(side))
+                        .pt(theme.px(CONTENT_TOP))
+                        .child(create_row),
+                )
+                .child(body)
                 .into_any_element()
         } else {
             body

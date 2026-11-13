@@ -170,7 +170,6 @@ impl ArtifactsSource {
     /// Crée un artifact du genre `kind` et rend son adresse. `done` est rappelé sur le fil principal, une fois. Les trois
     /// appels (catalogue des types, création, cadre du nouvel artifact) passent par la page cachée ; toute erreur
     /// l'oublie, comme la liste. Le journal ne reçoit que le titre du type et l'issue.
-    #[allow(dead_code)] // branchée par la vue dans la tâche suivante
     pub fn create(
         &mut self,
         kind: ArtifactKind,

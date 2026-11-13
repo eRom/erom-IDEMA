@@ -30,7 +30,7 @@ pub const GRID_GAP: f32 = 16.;
 /// Le rapport largeur sur hauteur de la vignette : celui de la maquette (327 sur 163) et des aperçus de l'API (1200 sur 630).
 const THUMB_ASPECT: f32 = 2.;
 /// La carte : rayon des fenêtres du design system.
-const CARD_RADIUS: f32 = 12.;
+pub(crate) const CARD_RADIUS: f32 = 12.;
 /// La bande sous la vignette : retrait de 12, pastille de 32 (rayon 8) et écart de 12 avec le texte.
 const CARD_PADDING: f32 = 12.;
 const CHIP_SIZE: f32 = 32.;
@@ -271,7 +271,7 @@ fn bone(width: gpui::Length, height: f32, radius: f32, theme: &Theme) -> Div {
 }
 
 /// Le souffle d'un squelette : l'opacité va et vient. Sans lui, le chargement ressemblerait à une page figée.
-fn breathing(skeleton: Stateful<Div>, index: usize) -> impl IntoElement {
+pub(crate) fn breathing(skeleton: Stateful<Div>, index: usize) -> impl IntoElement {
     skeleton.with_animation(
         ("artifact-skeleton", index),
         Animation::new(SKELETON_PERIOD)
